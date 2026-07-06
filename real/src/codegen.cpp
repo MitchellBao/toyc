@@ -32,6 +32,7 @@ struct Symbol {
     std::string label;
     int offset = 0;
     int savedReg = 0;
+    bool isDead = false;
 };
 
 struct FunctionLayout {
@@ -39,6 +40,7 @@ struct FunctionLayout {
     int paramSlots = 0;
     int frameSize = 0;
     int savedRegs = 0;
+    bool savesRa = true;
 };
 
 int alignTo(int value, int alignment)
@@ -652,10 +654,11 @@ private:
     void emitFunction(const FuncDef& func)
     {
         currentFunction_ = &func;
+        prepareRegisterPlan(func);
         currentLayout_ = buildLayout(func);
         localScopes_.clear();
         nextLocalOffset_ = -12 - currentLayout_.savedRegs * 4;
-        nextSavedReg_ = 1;
+        nextLocalSlot_ = 0;
         evalStackBytes_ = 0;
         returnLabel_ = newLabel(".L_return_");
         functionBodyLabel_ = newLabel(".L_body_");
@@ -665,7 +668,9 @@ private:
         out_ << "\n.globl " << func.name << "\n";
         out_ << func.name << ":\n";
         out_ << "  addi sp, sp, -" << currentLayout_.frameSize << "\n";
-        out_ << "  sw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
+        if (currentLayout_.savesRa) {
+            out_ << "  sw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
+        }
         out_ << "  sw s0, " << currentLayout_.frameSize - 8 << "(sp)\n";
         for (int i = 1; i <= currentLayout_.savedRegs; ++i) {
             out_ << "  sw " << savedRegName(i) << ", " << currentLayout_.frameSize - 8 - i * 4 << "(sp)\n";
@@ -675,6 +680,9 @@ private:
         pushScope();
         for (std::size_t i = 0; i < func.params.size(); ++i) {
             const Symbol& param = allocateLocal(func.params[i].name, false);
+            if (options_.optimize && param.isDead) {
+                continue;
+            }
             if (i < 8) {
                 storeRegisterOrStack(param, std::string("a") + std::to_string(i));
             } else {
@@ -685,15 +693,17 @@ private:
         }
 
         out_ << functionBodyLabel_ << ":\n";
-        emitBlock(*func.body, false);
-        if (func.returnType == Type::Void) {
+        const bool bodyTerminal = emitBlock(*func.body, false);
+        if (func.returnType == Type::Void && !bodyTerminal && !options_.optimize) {
             out_ << "  li a0, 0\n";
         }
         out_ << returnLabel_ << ":\n";
         for (int i = 1; i <= currentLayout_.savedRegs; ++i) {
             out_ << "  lw " << savedRegName(i) << ", " << currentLayout_.frameSize - 8 - i * 4 << "(sp)\n";
         }
-        out_ << "  lw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
+        if (currentLayout_.savesRa) {
+            out_ << "  lw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
+        }
         out_ << "  lw s0, " << currentLayout_.frameSize - 8 << "(sp)\n";
         out_ << "  addi sp, sp, " << currentLayout_.frameSize << "\n";
         out_ << "  ret\n";
@@ -705,9 +715,10 @@ private:
     {
         const int paramSlots = static_cast<int>(func.params.size());
         const int localSlots = countDecls(*func.body);
-        const int savedRegs = options_.optimize ? std::min(11, paramSlots + localSlots) : 0;
+        const int savedRegs = options_.optimize ? plannedSavedRegs_ : 0;
         const int frameBytes = alignTo(16 + savedRegs * 4 + (paramSlots + localSlots) * 4, 16);
-        return FunctionLayout{localSlots, paramSlots, std::max(frameBytes, 16), savedRegs};
+        const bool savesRa = !options_.optimize || containsCall(*func.body);
+        return FunctionLayout{localSlots, paramSlots, std::max(frameBytes, 16), savedRegs, savesRa};
     }
 
     int countDecls(const Stmt& stmt) const
@@ -731,6 +742,225 @@ private:
         return 0;
     }
 
+    void prepareRegisterPlan(const FuncDef& func)
+    {
+        const int slotCount = static_cast<int>(func.params.size()) + countDecls(*func.body);
+        registerForSlot_.assign(slotCount, 0);
+        slotReadCount_.assign(slotCount, 0);
+        plannedSavedRegs_ = 0;
+        if (!options_.optimize || slotCount == 0) {
+            return;
+        }
+
+        std::vector<int> weights(slotCount, 0);
+        std::vector<bool> canUseRegister(slotCount, false);
+        std::vector<std::unordered_map<std::string, int>> scopes;
+        scopes.emplace_back();
+
+        int nextSlot = 0;
+        for (const Param& param : func.params) {
+            scopes.back().emplace(param.name, nextSlot);
+            canUseRegister[nextSlot] = true;
+            ++nextSlot;
+        }
+        scoreBlock(*func.body, scopes, false, 0, nextSlot, weights, canUseRegister);
+
+        struct Candidate {
+            int slot = 0;
+            int weight = 0;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(slotCount);
+        for (int slot = 0; slot < slotCount; ++slot) {
+            if (canUseRegister[slot] && weights[slot] > 0) {
+                candidates.push_back(Candidate{slot, weights[slot]});
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const Candidate& lhs, const Candidate& rhs) {
+            if (lhs.weight != rhs.weight) {
+                return lhs.weight > rhs.weight;
+            }
+            return lhs.slot < rhs.slot;
+        });
+
+        plannedSavedRegs_ = std::min(11, static_cast<int>(candidates.size()));
+        for (int i = 0; i < plannedSavedRegs_; ++i) {
+            registerForSlot_[candidates[i].slot] = i + 1;
+        }
+    }
+
+    void scoreBlock(const BlockStmt& block,
+        std::vector<std::unordered_map<std::string, int>>& scopes,
+        bool createsScope,
+        int loopDepth,
+        int& nextSlot,
+        std::vector<int>& weights,
+        std::vector<bool>& canUseRegister)
+    {
+        if (createsScope) {
+            scopes.emplace_back();
+        }
+        for (const auto& stmt : block.statements) {
+            scoreStmt(*stmt, scopes, loopDepth, nextSlot, weights, canUseRegister);
+        }
+        if (createsScope) {
+            scopes.pop_back();
+        }
+    }
+
+    void scoreStmt(const Stmt& stmt,
+        std::vector<std::unordered_map<std::string, int>>& scopes,
+        int loopDepth,
+        int& nextSlot,
+        std::vector<int>& weights,
+        std::vector<bool>& canUseRegister)
+    {
+        if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
+            scoreExpr(*exprStmt->expr, scopes, loopDepth, weights, canUseRegister);
+            return;
+        }
+        if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            scoreName(assign->name, scopes, loopDepth, 4, false, weights, canUseRegister);
+            scoreExpr(*assign->value, scopes, loopDepth, weights, canUseRegister);
+            return;
+        }
+        if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
+            scoreExpr(*declStmt->decl->init, scopes, loopDepth, weights, canUseRegister);
+            const int slot = nextSlot++;
+            scopes.back().emplace(declStmt->decl->name, slot);
+            canUseRegister[slot] = !declStmt->decl->isConst;
+            return;
+        }
+        if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
+            scoreBlock(*block, scopes, true, loopDepth, nextSlot, weights, canUseRegister);
+            return;
+        }
+        if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            scoreExpr(*ifStmt->cond, scopes, loopDepth, weights, canUseRegister);
+            auto thenScopes = scopes;
+            scoreStmt(*ifStmt->thenBranch, thenScopes, loopDepth, nextSlot, weights, canUseRegister);
+            if (ifStmt->elseBranch != nullptr) {
+                auto elseScopes = scopes;
+                scoreStmt(*ifStmt->elseBranch, elseScopes, loopDepth, nextSlot, weights, canUseRegister);
+            }
+            return;
+        }
+        if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            scoreExpr(*whileStmt->cond, scopes, loopDepth + 1, weights, canUseRegister);
+            auto bodyScopes = scopes;
+            scoreStmt(*whileStmt->body, bodyScopes, loopDepth + 1, nextSlot, weights, canUseRegister);
+            return;
+        }
+        if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
+            if (ret->value != nullptr) {
+                scoreExpr(*ret->value, scopes, loopDepth, weights, canUseRegister);
+            }
+        }
+    }
+
+    void scoreExpr(const Expr& expr,
+        const std::vector<std::unordered_map<std::string, int>>& scopes,
+        int loopDepth,
+        std::vector<int>& weights,
+        const std::vector<bool>& canUseRegister)
+    {
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            scoreName(name->name, scopes, loopDepth, 1, true, weights, canUseRegister);
+            return;
+        }
+        if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+            for (const auto& arg : call->args) {
+                scoreExpr(*arg, scopes, loopDepth, weights, canUseRegister);
+            }
+            return;
+        }
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            scoreExpr(*unary->operand, scopes, loopDepth, weights, canUseRegister);
+            return;
+        }
+        if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+            scoreExpr(*binary->lhs, scopes, loopDepth, weights, canUseRegister);
+            scoreExpr(*binary->rhs, scopes, loopDepth, weights, canUseRegister);
+        }
+    }
+
+    void scoreName(const std::string& name,
+        const std::vector<std::unordered_map<std::string, int>>& scopes,
+        int loopDepth,
+        int multiplier,
+        bool isRead,
+        std::vector<int>& weights,
+        const std::vector<bool>& canUseRegister)
+    {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            const auto found = it->find(name);
+            if (found != it->end()) {
+                if (found->second >= 0 && found->second < static_cast<int>(weights.size()) && canUseRegister[found->second]) {
+                    weights[found->second] += multiplier * loopWeight(loopDepth);
+                }
+                if (isRead && found->second >= 0 && found->second < static_cast<int>(slotReadCount_.size())) {
+                    ++slotReadCount_[found->second];
+                }
+                return;
+            }
+        }
+    }
+
+    int loopWeight(int loopDepth) const
+    {
+        int weight = 1;
+        for (int i = 0; i < loopDepth && i < 6; ++i) {
+            weight *= 8;
+        }
+        return weight;
+    }
+
+    bool containsCall(const Stmt& stmt) const
+    {
+        if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
+            return containsCall(*exprStmt->expr);
+        }
+        if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            return containsCall(*assign->value);
+        }
+        if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
+            return containsCall(*declStmt->decl->init);
+        }
+        if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
+            for (const auto& child : block->statements) {
+                if (containsCall(*child)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            return containsCall(*ifStmt->cond) || containsCall(*ifStmt->thenBranch)
+                || (ifStmt->elseBranch != nullptr && containsCall(*ifStmt->elseBranch));
+        }
+        if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            return containsCall(*whileStmt->cond) || containsCall(*whileStmt->body);
+        }
+        if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
+            return ret->value != nullptr && containsCall(*ret->value);
+        }
+        return false;
+    }
+
+    bool containsCall(const Expr& expr) const
+    {
+        if (dynamic_cast<const CallExpr*>(&expr) != nullptr) {
+            return true;
+        }
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            return containsCall(*unary->operand);
+        }
+        if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+            return containsCall(*binary->lhs) || containsCall(*binary->rhs);
+        }
+        return false;
+    }
+
     void pushScope()
     {
         localScopes_.emplace_back();
@@ -746,10 +976,13 @@ private:
         const int offset = nextLocalOffset_;
         nextLocalOffset_ -= 4;
         int savedReg = 0;
-        if (options_.optimize && !(isConst && constValue.has_value()) && nextSavedReg_ <= currentLayout_.savedRegs) {
-            savedReg = nextSavedReg_++;
+        const int slot = nextLocalSlot_++;
+        bool isDead = false;
+        if (options_.optimize && !(isConst && constValue.has_value()) && slot >= 0 && slot < static_cast<int>(registerForSlot_.size())) {
+            savedReg = registerForSlot_[slot];
+            isDead = slot < static_cast<int>(slotReadCount_.size()) && slotReadCount_[slot] == 0;
         }
-        auto [it, inserted] = localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset, savedReg});
+        auto [it, inserted] = localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset, savedReg, isDead});
         (void)inserted;
         return it->second;
     }
@@ -817,6 +1050,13 @@ private:
         if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
             const auto knownValue = options_.optimize ? tryEvalConst(*assign->value) : std::optional<std::int32_t>{};
             const std::string copyOf = options_.optimize ? copySourceName(*assign->value) : std::string{};
+            const Symbol& target = lookup(assign->name);
+            if (options_.optimize && target.isDead) {
+                if (!isPure(*assign->value)) {
+                    emitExpr(*assign->value);
+                }
+                return false;
+            }
             if (options_.optimize && emitOptimizedAssignment(*assign)) {
                 updateKnownValue(assign->name, knownValue, copyOf);
                 return false;
@@ -840,6 +1080,12 @@ private:
                 copyOf = copySourceName(*decl.init);
             }
             const Symbol& symbol = allocateLocal(decl.name, decl.isConst, constValue, copyOf);
+            if (options_.optimize && symbol.isDead) {
+                if (!isPure(*decl.init)) {
+                    emitExpr(*decl.init);
+                }
+                return false;
+            }
             if (options_.optimize && constValue.has_value()) {
                 if (!decl.isConst) {
                     emitExpr(*decl.init);
@@ -871,7 +1117,9 @@ private:
             emitBranchIfZero(*ifStmt->cond, elseLabel);
             const auto scopesBeforeBranches = localScopes_;
             const bool thenTerminal = emitStmt(*ifStmt->thenBranch);
-            out_ << "  j " << endLabel << "\n";
+            if (!thenTerminal) {
+                out_ << "  j " << endLabel << "\n";
+            }
             out_ << elseLabel << ":\n";
             localScopes_ = scopesBeforeBranches;
             bool elseTerminal = false;
@@ -896,8 +1144,10 @@ private:
             breakLabels_.push_back(endLabel);
             out_ << condLabel << ":\n";
             emitBranchIfZero(*whileStmt->cond, endLabel);
-            emitStmt(*whileStmt->body);
-            out_ << "  j " << condLabel << "\n";
+            const bool bodyTerminal = emitStmt(*whileStmt->body);
+            if (!bodyTerminal) {
+                out_ << "  j " << condLabel << "\n";
+            }
             out_ << endLabel << ":\n";
             continueLabels_.pop_back();
             breakLabels_.pop_back();
@@ -924,7 +1174,7 @@ private:
                     }
                 }
                 emitExpr(*ret->value);
-            } else {
+            } else if (!options_.optimize || currentFunction_ == nullptr || currentFunction_->returnType != Type::Void) {
                 out_ << "  li a0, 0\n";
             }
             out_ << "  j " << returnLabel_ << "\n";
@@ -1137,8 +1387,12 @@ private:
         if (!isSimpleValue(*binary.rhs)) {
             return false;
         }
-        emitExpr(*binary.lhs);
-        out_ << "  mv t0, a0\n";
+        if (isSimpleValue(*binary.lhs)) {
+            emitSimpleToRegister(*binary.lhs, "t0");
+        } else {
+            emitExpr(*binary.lhs);
+            out_ << "  mv t0, a0\n";
+        }
         emitSimpleToRegister(*binary.rhs, "a0");
         emitBinaryOperation(binary.op);
         return true;
@@ -1283,6 +1537,9 @@ private:
             out_ << "  " << (jumpOnZero ? "beqz" : "bnez") << " a0, " << label << "\n";
             return true;
         }
+        if (emitImmediateRelationalBranch(binary, label, branchWhenTrue)) {
+            return true;
+        }
 
         emitExpr(*binary.lhs);
         if (isSimpleValue(*binary.rhs)) {
@@ -1356,6 +1613,64 @@ private:
         return false;
     }
 
+    bool emitImmediateRelationalBranch(const BinaryExpr& binary, const std::string& label, bool branchWhenTrue)
+    {
+        const auto rhsConst = tryEvalConst(*binary.rhs);
+        if (!rhsConst.has_value()) {
+            return false;
+        }
+
+        auto emitBooleanBranch = [&](bool trueWhenNonZero) {
+            out_ << "  " << ((branchWhenTrue == trueWhenNonZero) ? "bnez" : "beqz") << " t0, " << label << "\n";
+        };
+
+        switch (binary.op) {
+        case BinaryOp::Less:
+            if (fitsSigned12(*rhsConst)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti t0, a0, " << *rhsConst << "\n";
+                emitBooleanBranch(true);
+                return true;
+            }
+            break;
+        case BinaryOp::LessEqual:
+            if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti t0, a0, " << (*rhsConst + 1) << "\n";
+                emitBooleanBranch(true);
+                return true;
+            }
+            break;
+        case BinaryOp::Greater:
+            if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti t0, a0, " << (*rhsConst + 1) << "\n";
+                emitBooleanBranch(false);
+                return true;
+            }
+            break;
+        case BinaryOp::GreaterEqual:
+            if (fitsSigned12(*rhsConst)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti t0, a0, " << *rhsConst << "\n";
+                emitBooleanBranch(false);
+                return true;
+            }
+            break;
+        case BinaryOp::Equal:
+        case BinaryOp::NotEqual:
+        case BinaryOp::LogicalOr:
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::Add:
+        case BinaryOp::Sub:
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod:
+            break;
+        }
+        return false;
+    }
+
     bool isSimpleValue(const Expr& expr)
     {
         if (tryEvalConst(expr).has_value()) {
@@ -1398,6 +1713,13 @@ private:
 
     void emitCall(const CallExpr& call)
     {
+        if (options_.optimize && emitSimpleCall(call)) {
+            return;
+        }
+        if (options_.optimize && emitNoNestedCall(call)) {
+            return;
+        }
+
         int callReserve = 0;
         if (call.args.size() > 8) {
             callReserve += alignTo(static_cast<int>(call.args.size() - 8) * 4, 16);
@@ -1417,9 +1739,11 @@ private:
         for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
             popTo("a0");
             if (i < 8) {
-                out_ << "  mv a" << i << ", a0\n";
+                if (i != 0) {
+                    out_ << "  mv a" << i << ", a0\n";
+                }
             } else {
-                out_ << "  sw a0, " << (i * 4 + (i - 8) * 4) << "(sp)\n";
+                out_ << "  sw a0, " << ((i - 8) * 4) << "(sp)\n";
             }
         }
         out_ << "  call " << call.callee << "\n";
@@ -1428,6 +1752,81 @@ private:
             out_ << "  addi sp, sp, " << callReserve << "\n";
             evalStackBytes_ -= callReserve;
         }
+    }
+
+    bool emitSimpleCall(const CallExpr& call)
+    {
+        for (const auto& arg : call.args) {
+            if (!isSimpleValue(*arg)) {
+                return false;
+            }
+        }
+
+        int callReserve = 0;
+        if (call.args.size() > 8) {
+            callReserve += alignTo(static_cast<int>(call.args.size() - 8) * 4, 16);
+        }
+        const int alignPad = (16 - ((evalStackBytes_ + callReserve) % 16)) % 16;
+        callReserve += alignPad;
+        if (callReserve > 0) {
+            out_ << "  addi sp, sp, -" << callReserve << "\n";
+            evalStackBytes_ += callReserve;
+        }
+
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            if (i < 8) {
+                const std::string reg = "a" + std::to_string(i);
+                emitSimpleToRegister(*call.args[i], reg.c_str());
+            } else {
+                emitSimpleToRegister(*call.args[i], "t0");
+                out_ << "  sw t0, " << static_cast<int>((i - 8) * 4) << "(sp)\n";
+            }
+        }
+        out_ << "  call " << call.callee << "\n";
+
+        if (callReserve > 0) {
+            out_ << "  addi sp, sp, " << callReserve << "\n";
+            evalStackBytes_ -= callReserve;
+        }
+        return true;
+    }
+
+    bool emitNoNestedCall(const CallExpr& call)
+    {
+        for (const auto& arg : call.args) {
+            if (containsCall(*arg)) {
+                return false;
+            }
+        }
+
+        int callReserve = 0;
+        if (call.args.size() > 8) {
+            callReserve += alignTo(static_cast<int>(call.args.size() - 8) * 4, 16);
+        }
+        const int alignPad = (16 - ((evalStackBytes_ + callReserve) % 16)) % 16;
+        callReserve += alignPad;
+        if (callReserve > 0) {
+            out_ << "  addi sp, sp, -" << callReserve << "\n";
+            evalStackBytes_ += callReserve;
+        }
+
+        for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+            emitExpr(*call.args[static_cast<std::size_t>(i)]);
+            if (i < 8) {
+                if (i != 0) {
+                    out_ << "  mv a" << i << ", a0\n";
+                }
+            } else {
+                out_ << "  sw a0, " << static_cast<int>((i - 8) * 4) << "(sp)\n";
+            }
+        }
+        out_ << "  call " << call.callee << "\n";
+
+        if (callReserve > 0) {
+            out_ << "  addi sp, sp, " << callReserve << "\n";
+            evalStackBytes_ -= callReserve;
+        }
+        return true;
     }
 
     void pushA0()
@@ -1485,6 +1884,10 @@ private:
 
     bool emitOptimizedAssignment(const AssignStmt& assign)
     {
+        if (isName(*assign.value, assign.name)) {
+            return true;
+        }
+
         const Symbol& target = lookup(assign.name);
         if (target.savedReg == 0) {
             return false;
@@ -1695,6 +2098,11 @@ private:
 
         switch (binary.op) {
         case BinaryOp::Add:
+            if (lhsConst.has_value() && *lhsConst != 0 && fitsSigned12(*lhsConst)) {
+                emitExpr(*binary.rhs);
+                out_ << "  addi a0, a0, " << *lhsConst << "\n";
+                return true;
+            }
             if (rhsConst.has_value() && *rhsConst == 0) {
                 emitExpr(*binary.lhs);
                 return true;
@@ -1987,13 +2395,16 @@ private:
     const FuncDef* currentFunction_ = nullptr;
     FunctionLayout currentLayout_;
     int nextLocalOffset_ = -8;
-    int nextSavedReg_ = 1;
+    int nextLocalSlot_ = 0;
+    int plannedSavedRegs_ = 0;
     int evalStackBytes_ = 0;
     int nextLabel_ = 0;
     std::string returnLabel_;
     std::string functionBodyLabel_;
     std::vector<std::string> breakLabels_;
     std::vector<std::string> continueLabels_;
+    std::vector<int> registerForSlot_;
+    std::vector<int> slotReadCount_;
 };
 
 } // namespace
