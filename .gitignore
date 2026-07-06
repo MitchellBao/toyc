@@ -1,3 +1,5 @@
 build/
 real/build/
 real/tests/*.s
+compiler
+compiler.exe

@@ -1,5 +1,5 @@
 param(
-    [string]$Compiler = "..\..\build\real\toyc.exe"
+    [string]$Compiler = "..\..\compiler.exe"
 )
 
 $ErrorActionPreference = "Stop"
