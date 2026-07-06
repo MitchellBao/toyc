@@ -24,6 +24,9 @@ private:
     std::vector<std::unique_ptr<IrPass>> passes_;
 };
 
+std::unique_ptr<IrPass> createLocalSimplifyPass();
+std::unique_ptr<IrPass> createDeadInstructionPass();
+
 PassManager buildDefaultPassPipeline(bool optimize);
 
 } // namespace toyc
