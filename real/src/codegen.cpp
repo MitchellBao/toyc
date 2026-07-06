@@ -26,6 +26,8 @@ struct Symbol {
     bool isConst = false;
     bool hasConstValue = false;
     std::int32_t constValue = 0;
+    bool hasCopy = false;
+    std::string copyOf;
     std::string label;
     int offset = 0;
 };
@@ -81,7 +83,7 @@ private:
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 const auto& decl = *declItem->decl;
                 const std::string label = "g_" + sanitizeLabel(decl.name);
-                auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, label, 0});
+                auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, false, {}, label, 0});
                 (void)inserted;
                 if (decl.isConst) {
                     it->second.constValue = requireConst(*decl.init);
@@ -114,6 +116,7 @@ private:
         nextLocalOffset_ = -12;
         evalStackBytes_ = 0;
         returnLabel_ = newLabel(".L_return_");
+        functionBodyLabel_ = newLabel(".L_body_");
         breakLabels_.clear();
         continueLabels_.clear();
 
@@ -136,6 +139,7 @@ private:
             }
         }
 
+        out_ << functionBodyLabel_ << ":\n";
         emitBlock(*func.body, false);
         if (func.returnType == Type::Void) {
             out_ << "  li a0, 0\n";
@@ -188,11 +192,11 @@ private:
         localScopes_.pop_back();
     }
 
-    int allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt)
+    int allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt, std::string copyOf = {})
     {
         const int offset = nextLocalOffset_;
         nextLocalOffset_ -= 4;
-        localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), {}, offset});
+        localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset});
         return offset;
     }
 
@@ -211,66 +215,121 @@ private:
         throw CodegenError("unknown symbol in codegen: " + name);
     }
 
-    void emitBlock(const BlockStmt& block, bool createsScope)
+    Symbol& lookupMutable(const std::string& name)
+    {
+        for (auto it = localScopes_.rbegin(); it != localScopes_.rend(); ++it) {
+            const auto found = it->find(name);
+            if (found != it->end()) {
+                return found->second;
+            }
+        }
+        const auto global = globalSymbols_.find(name);
+        if (global != globalSymbols_.end()) {
+            return global->second;
+        }
+        throw CodegenError("unknown symbol in codegen: " + name);
+    }
+
+    bool emitBlock(const BlockStmt& block, bool createsScope)
     {
         if (createsScope) {
             pushScope();
         }
+        bool terminal = false;
         for (const auto& stmt : block.statements) {
-            emitStmt(*stmt);
+            terminal = emitStmt(*stmt);
+            if (options_.optimize && terminal) {
+                break;
+            }
         }
         if (createsScope) {
             popScope();
         }
+        return terminal;
     }
 
-    void emitStmt(const Stmt& stmt)
+    bool emitStmt(const Stmt& stmt)
     {
         if (dynamic_cast<const EmptyStmt*>(&stmt) != nullptr) {
-            return;
+            return false;
         }
         if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
             emitExpr(*exprStmt->expr);
-            return;
+            return false;
         }
         if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            const auto knownValue = options_.optimize ? tryEvalConst(*assign->value) : std::optional<std::int32_t>{};
+            const std::string copyOf = options_.optimize ? copySourceName(*assign->value) : std::string{};
             emitExpr(*assign->value);
             storeSymbol(assign->name);
-            return;
+            if (options_.optimize) {
+                updateKnownValue(assign->name, knownValue, copyOf);
+            }
+            return false;
         }
         if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
             const auto& decl = *declStmt->decl;
             std::optional<std::int32_t> constValue;
+            std::string copyOf;
             if (options_.optimize && decl.isConst) {
                 constValue = tryEvalConst(*decl.init);
             }
-            const int offset = allocateLocal(decl.name, decl.isConst, constValue);
+            if (options_.optimize && !constValue.has_value()) {
+                constValue = tryEvalConst(*decl.init);
+                copyOf = copySourceName(*decl.init);
+            }
+            const int offset = allocateLocal(decl.name, decl.isConst, constValue, copyOf);
             if (options_.optimize && constValue.has_value()) {
-                return;
+                if (!decl.isConst) {
+                    emitExpr(*decl.init);
+                    out_ << "  sw a0, " << offset << "(s0)\n";
+                }
+                return false;
             }
             emitExpr(*decl.init);
             out_ << "  sw a0, " << offset << "(s0)\n";
-            return;
+            return false;
         }
         if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
-            emitBlock(*block, true);
-            return;
+            return emitBlock(*block, true);
         }
         if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            if (options_.optimize) {
+                if (const auto cond = tryEvalConst(*ifStmt->cond)) {
+                    if (*cond != 0) {
+                        return emitStmt(*ifStmt->thenBranch);
+                    }
+                    if (ifStmt->elseBranch != nullptr) {
+                        return emitStmt(*ifStmt->elseBranch);
+                    }
+                    return false;
+                }
+            }
             const std::string elseLabel = newLabel(".L_else_");
             const std::string endLabel = newLabel(".L_endif_");
             emitExpr(*ifStmt->cond);
             out_ << "  beqz a0, " << elseLabel << "\n";
-            emitStmt(*ifStmt->thenBranch);
+            const auto scopesBeforeBranches = localScopes_;
+            const bool thenTerminal = emitStmt(*ifStmt->thenBranch);
             out_ << "  j " << endLabel << "\n";
             out_ << elseLabel << ":\n";
+            localScopes_ = scopesBeforeBranches;
+            bool elseTerminal = false;
             if (ifStmt->elseBranch != nullptr) {
-                emitStmt(*ifStmt->elseBranch);
+                elseTerminal = emitStmt(*ifStmt->elseBranch);
             }
             out_ << endLabel << ":\n";
-            return;
+            localScopes_ = scopesBeforeBranches;
+            clearMutableKnowledge();
+            return ifStmt->elseBranch != nullptr && thenTerminal && elseTerminal;
         }
         if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            if (options_.optimize) {
+                if (const auto cond = tryEvalConst(*whileStmt->cond); cond.has_value() && *cond == 0) {
+                    return false;
+                }
+                clearMutableKnowledge();
+            }
             const std::string condLabel = newLabel(".L_while_cond_");
             const std::string endLabel = newLabel(".L_while_end_");
             continueLabels_.push_back(condLabel);
@@ -283,24 +342,34 @@ private:
             out_ << endLabel << ":\n";
             continueLabels_.pop_back();
             breakLabels_.pop_back();
-            return;
+            if (options_.optimize) {
+                clearMutableKnowledge();
+            }
+            return false;
         }
         if (dynamic_cast<const BreakStmt*>(&stmt) != nullptr) {
             out_ << "  j " << breakLabels_.back() << "\n";
-            return;
+            return true;
         }
         if (dynamic_cast<const ContinueStmt*>(&stmt) != nullptr) {
             out_ << "  j " << continueLabels_.back() << "\n";
-            return;
+            return true;
         }
         if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
             if (ret->value != nullptr) {
+                if (options_.optimize) {
+                    if (const auto* call = dynamic_cast<const CallExpr*>(ret->value.get())) {
+                        if (emitTailCall(*call)) {
+                            return true;
+                        }
+                    }
+                }
                 emitExpr(*ret->value);
             } else {
                 out_ << "  li a0, 0\n";
             }
             out_ << "  j " << returnLabel_ << "\n";
-            return;
+            return true;
         }
         throw CodegenError("unknown statement in codegen");
     }
@@ -348,6 +417,9 @@ private:
 
     void emitBinary(const BinaryExpr& binary)
     {
+        if (options_.optimize && emitSimplifiedBinary(binary)) {
+            return;
+        }
         if (binary.op == BinaryOp::LogicalOr) {
             const std::string trueLabel = newLabel(".L_or_true_");
             const std::string endLabel = newLabel(".L_or_end_");
@@ -447,7 +519,7 @@ private:
             if (i < 8) {
                 out_ << "  mv a" << i << ", a0\n";
             } else {
-                out_ << "  sw a0, " << (i - 8) * 4 << "(sp)\n";
+                out_ << "  sw a0, " << (i * 4 + (i - 8) * 4) << "(sp)\n";
             }
         }
         out_ << "  call " << call.callee << "\n";
@@ -475,6 +547,10 @@ private:
     void loadSymbol(const std::string& name)
     {
         const Symbol& symbol = lookup(name);
+        if (options_.optimize && !symbol.hasConstValue && symbol.hasCopy) {
+            loadSymbol(symbol.copyOf);
+            return;
+        }
         if (symbol.isGlobal) {
             out_ << "  la t0, " << symbol.label << "\n";
             out_ << "  lw a0, 0(t0)\n";
@@ -492,6 +568,261 @@ private:
         } else {
             out_ << "  sw a0, " << symbol.offset << "(s0)\n";
         }
+    }
+
+    std::string copySourceName(const Expr& expr) const
+    {
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            const Symbol& symbol = lookup(name->name);
+            if (!symbol.isGlobal) {
+                return name->name;
+            }
+        }
+        return {};
+    }
+
+    void updateKnownValue(const std::string& name, std::optional<std::int32_t> value, const std::string& copyOf)
+    {
+        Symbol& symbol = lookupMutable(name);
+        if (!symbol.isGlobal) {
+            symbol.hasConstValue = value.has_value();
+            symbol.constValue = value.value_or(0);
+            symbol.hasCopy = !copyOf.empty();
+            symbol.copyOf = copyOf;
+        }
+        invalidateCopiesOf(name);
+    }
+
+    void invalidateCopiesOf(const std::string& name)
+    {
+        for (auto& scope : localScopes_) {
+            for (auto& [symbolName, symbol] : scope) {
+                if (symbolName != name && symbol.hasCopy && symbol.copyOf == name) {
+                    symbol.hasCopy = false;
+                    symbol.copyOf.clear();
+                }
+            }
+        }
+    }
+
+    void clearMutableKnowledge()
+    {
+        for (auto& scope : localScopes_) {
+            for (auto& [name, symbol] : scope) {
+                (void)name;
+                if (!symbol.isConst) {
+                    symbol.hasConstValue = false;
+                    symbol.constValue = 0;
+                    symbol.hasCopy = false;
+                    symbol.copyOf.clear();
+                }
+            }
+        }
+    }
+
+    bool emitTailCall(const CallExpr& call)
+    {
+        if (currentFunction_ == nullptr || call.callee != currentFunction_->name || call.args.size() != currentFunction_->params.size()) {
+            return false;
+        }
+        for (const auto& arg : call.args) {
+            emitExpr(*arg);
+            pushA0();
+        }
+        for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+            popTo("a0");
+            const Symbol& param = lookup(currentFunction_->params[static_cast<std::size_t>(i)].name);
+            out_ << "  sw a0, " << param.offset << "(s0)\n";
+        }
+        out_ << "  j " << functionBodyLabel_ << "\n";
+        return true;
+    }
+
+    static const IntExpr* asInt(const Expr& expr)
+    {
+        return dynamic_cast<const IntExpr*>(&expr);
+    }
+
+    bool isPure(const Expr& expr) const
+    {
+        if (dynamic_cast<const IntExpr*>(&expr) != nullptr || dynamic_cast<const NameExpr*>(&expr) != nullptr) {
+            return true;
+        }
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            return isPure(*unary->operand);
+        }
+        if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+            return isPure(*binary->lhs) && isPure(*binary->rhs);
+        }
+        return false;
+    }
+
+    bool sameExpr(const Expr& lhs, const Expr& rhs) const
+    {
+        if (const auto* left = dynamic_cast<const IntExpr*>(&lhs)) {
+            const auto* right = dynamic_cast<const IntExpr*>(&rhs);
+            return right != nullptr && left->value == right->value;
+        }
+        if (const auto* left = dynamic_cast<const NameExpr*>(&lhs)) {
+            const auto* right = dynamic_cast<const NameExpr*>(&rhs);
+            return right != nullptr && left->name == right->name;
+        }
+        if (const auto* left = dynamic_cast<const UnaryExpr*>(&lhs)) {
+            const auto* right = dynamic_cast<const UnaryExpr*>(&rhs);
+            return right != nullptr && left->op == right->op && sameExpr(*left->operand, *right->operand);
+        }
+        if (const auto* left = dynamic_cast<const BinaryExpr*>(&lhs)) {
+            const auto* right = dynamic_cast<const BinaryExpr*>(&rhs);
+            return right != nullptr && left->op == right->op && sameExpr(*left->lhs, *right->lhs) && sameExpr(*left->rhs, *right->rhs);
+        }
+        return false;
+    }
+
+    bool emitSimplifiedBinary(const BinaryExpr& binary)
+    {
+        const IntExpr* lhsInt = asInt(*binary.lhs);
+        const IntExpr* rhsInt = asInt(*binary.rhs);
+        const auto lhsConst = tryEvalConst(*binary.lhs);
+
+        switch (binary.op) {
+        case BinaryOp::Add:
+            if (rhsInt != nullptr && rhsInt->value == 0) {
+                emitExpr(*binary.lhs);
+                return true;
+            }
+            if (lhsInt != nullptr && lhsInt->value == 0) {
+                emitExpr(*binary.rhs);
+                return true;
+            }
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slli a0, a0, 1\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Sub:
+            if (rhsInt != nullptr && rhsInt->value == 0) {
+                emitExpr(*binary.lhs);
+                return true;
+            }
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Mul:
+            if (rhsInt != nullptr && rhsInt->value == 1) {
+                emitExpr(*binary.lhs);
+                return true;
+            }
+            if (lhsInt != nullptr && lhsInt->value == 1) {
+                emitExpr(*binary.rhs);
+                return true;
+            }
+            if (rhsInt != nullptr && rhsInt->value == 0 && isPure(*binary.lhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            if (lhsInt != nullptr && lhsInt->value == 0 && isPure(*binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            if (rhsInt != nullptr && rhsInt->value > 0 && (rhsInt->value & (rhsInt->value - 1)) == 0) {
+                emitExpr(*binary.lhs);
+                out_ << "  slli a0, a0, " << trailingZeroBits(rhsInt->value) << "\n";
+                return true;
+            }
+            if (lhsInt != nullptr && lhsInt->value > 0 && (lhsInt->value & (lhsInt->value - 1)) == 0) {
+                emitExpr(*binary.rhs);
+                out_ << "  slli a0, a0, " << trailingZeroBits(lhsInt->value) << "\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Div:
+            if (rhsInt != nullptr && rhsInt->value == 1) {
+                emitExpr(*binary.lhs);
+                return true;
+            }
+            break;
+        case BinaryOp::Mod:
+            if (rhsInt != nullptr && rhsInt->value == 1) {
+                if (!isPure(*binary.lhs)) {
+                    emitExpr(*binary.lhs);
+                }
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::LogicalOr:
+            if (lhsConst.has_value()) {
+                if (*lhsConst != 0) {
+                    out_ << "  li a0, 1\n";
+                } else {
+                    emitExpr(*binary.rhs);
+                    out_ << "  snez a0, a0\n";
+                }
+                return true;
+            }
+            break;
+        case BinaryOp::LogicalAnd:
+            if (lhsConst.has_value()) {
+                if (*lhsConst == 0) {
+                    out_ << "  li a0, 0\n";
+                } else {
+                    emitExpr(*binary.rhs);
+                    out_ << "  snez a0, a0\n";
+                }
+                return true;
+            }
+            break;
+        case BinaryOp::Equal:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 1\n";
+                return true;
+            }
+            break;
+        case BinaryOp::NotEqual:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Less:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::LessEqual:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 1\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Greater:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::GreaterEqual:
+            if (isPure(*binary.lhs) && sameExpr(*binary.lhs, *binary.rhs)) {
+                out_ << "  li a0, 1\n";
+                return true;
+            }
+            break;
+        }
+        return false;
+    }
+
+    int trailingZeroBits(std::int32_t value) const
+    {
+        int count = 0;
+        while ((value & 1) == 0) {
+            ++count;
+            value >>= 1;
+        }
+        return count;
     }
 
     std::int32_t requireConst(const Expr& expr)
@@ -564,8 +895,11 @@ private:
         }
         if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
             const Symbol& symbol = lookup(name->name);
-            if (symbol.isConst && symbol.hasConstValue) {
+            if (symbol.hasConstValue && (!symbol.isGlobal || symbol.isConst)) {
                 return symbol.constValue;
+            }
+            if (symbol.hasCopy) {
+                return tryEvalConst(NameExpr(symbol.copyOf));
             }
         }
         return std::nullopt;
@@ -587,6 +921,7 @@ private:
     int evalStackBytes_ = 0;
     int nextLabel_ = 0;
     std::string returnLabel_;
+    std::string functionBodyLabel_;
     std::vector<std::string> breakLabels_;
     std::vector<std::string> continueLabels_;
 };
