@@ -33,6 +33,7 @@ struct Symbol {
     int offset = 0;
     int savedReg = 0;
     bool isDead = false;
+    int argReg = -1;
 };
 
 struct FunctionLayout {
@@ -679,8 +680,12 @@ private:
 
         pushScope();
         for (std::size_t i = 0; i < func.params.size(); ++i) {
-            const Symbol& param = allocateLocal(func.params[i].name, false);
+            const int argReg = directParamArgReg(i);
+            const Symbol& param = allocateLocal(func.params[i].name, false, std::nullopt, {}, argReg);
             if (options_.optimize && param.isDead) {
+                continue;
+            }
+            if (param.argReg >= 0) {
                 continue;
             }
             if (i < 8) {
@@ -758,9 +763,11 @@ private:
         scopes.emplace_back();
 
         int nextSlot = 0;
-        for (const Param& param : func.params) {
+        const bool leafCanUseArgRegs = !containsCall(*func.body);
+        for (std::size_t i = 0; i < func.params.size(); ++i) {
+            const Param& param = func.params[i];
             scopes.back().emplace(param.name, nextSlot);
-            canUseRegister[nextSlot] = true;
+            canUseRegister[nextSlot] = !(leafCanUseArgRegs && i > 0 && i < 8);
             ++nextSlot;
         }
         scoreBlock(*func.body, scopes, false, 0, nextSlot, weights, canUseRegister);
@@ -973,6 +980,11 @@ private:
 
     const Symbol& allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt, std::string copyOf = {})
     {
+        return allocateLocal(name, isConst, constValue, std::move(copyOf), -1);
+    }
+
+    const Symbol& allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue, std::string copyOf, int argReg)
+    {
         const int offset = nextLocalOffset_;
         nextLocalOffset_ -= 4;
         int savedReg = 0;
@@ -982,9 +994,20 @@ private:
             savedReg = registerForSlot_[slot];
             isDead = slot < static_cast<int>(slotReadCount_.size()) && slotReadCount_[slot] == 0;
         }
-        auto [it, inserted] = localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset, savedReg, isDead});
+        if (argReg >= 0) {
+            savedReg = 0;
+        }
+        auto [it, inserted] = localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset, savedReg, isDead, argReg});
         (void)inserted;
         return it->second;
+    }
+
+    int directParamArgReg(std::size_t index) const
+    {
+        if (!options_.optimize || currentLayout_.savesRa || index == 0 || index >= 8) {
+            return -1;
+        }
+        return static_cast<int>(index);
     }
 
     const Symbol& lookup(const std::string& name) const
@@ -1057,6 +1080,11 @@ private:
                 }
                 return false;
             }
+            if (options_.optimize && knownValue.has_value()) {
+                storeImmediate(target, *knownValue);
+                updateKnownValue(assign->name, knownValue, copyOf);
+                return false;
+            }
             if (options_.optimize && emitOptimizedAssignment(*assign)) {
                 updateKnownValue(assign->name, knownValue, copyOf);
                 return false;
@@ -1088,8 +1116,7 @@ private:
             }
             if (options_.optimize && constValue.has_value()) {
                 if (!decl.isConst) {
-                    emitExpr(*decl.init);
-                    storeRegisterOrStack(symbol, "a0");
+                    storeImmediate(symbol, *constValue);
                 }
                 return false;
             }
@@ -1532,9 +1559,9 @@ private:
 
         if (const auto rhsConst = tryEvalConst(*binary.rhs);
             rhsConst.has_value() && *rhsConst == 0 && (binary.op == BinaryOp::Equal || binary.op == BinaryOp::NotEqual)) {
-            emitExpr(*binary.lhs);
+            const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
             const bool jumpOnZero = (binary.op == BinaryOp::Equal) == branchWhenTrue;
-            out_ << "  " << (jumpOnZero ? "beqz" : "bnez") << " a0, " << label << "\n";
+            out_ << "  " << (jumpOnZero ? "beqz" : "bnez") << " " << lhsReg << ", " << label << "\n";
             return true;
         }
         if (emitImmediateRelationalBranch(binary, label, branchWhenTrue)) {
@@ -1625,40 +1652,49 @@ private:
         };
 
         switch (binary.op) {
+        case BinaryOp::Equal:
+        case BinaryOp::NotEqual:
+            if (*rhsConst != std::numeric_limits<std::int32_t>::min()
+                && fitsSigned12(static_cast<std::int32_t>(-*rhsConst))) {
+                const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
+                out_ << "  addi t0, " << lhsReg << ", " << static_cast<std::int32_t>(-*rhsConst) << "\n";
+                const bool nonZeroMeansTrue = binary.op == BinaryOp::NotEqual;
+                emitBooleanBranch(nonZeroMeansTrue);
+                return true;
+            }
+            break;
         case BinaryOp::Less:
             if (fitsSigned12(*rhsConst)) {
-                emitExpr(*binary.lhs);
-                out_ << "  slti t0, a0, " << *rhsConst << "\n";
+                const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
+                out_ << "  slti t0, " << lhsReg << ", " << *rhsConst << "\n";
                 emitBooleanBranch(true);
                 return true;
             }
             break;
         case BinaryOp::LessEqual:
             if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
-                emitExpr(*binary.lhs);
-                out_ << "  slti t0, a0, " << (*rhsConst + 1) << "\n";
+                const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
+                out_ << "  slti t0, " << lhsReg << ", " << (*rhsConst + 1) << "\n";
                 emitBooleanBranch(true);
                 return true;
             }
             break;
         case BinaryOp::Greater:
             if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
-                emitExpr(*binary.lhs);
-                out_ << "  slti t0, a0, " << (*rhsConst + 1) << "\n";
+                const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
+                out_ << "  slti t0, " << lhsReg << ", " << (*rhsConst + 1) << "\n";
                 emitBooleanBranch(false);
                 return true;
             }
             break;
         case BinaryOp::GreaterEqual:
             if (fitsSigned12(*rhsConst)) {
-                emitExpr(*binary.lhs);
-                out_ << "  slti t0, a0, " << *rhsConst << "\n";
+                const std::string lhsReg = simpleOperandRegister(*binary.lhs, "a0");
+                out_ << "  slti t0, " << lhsReg << ", " << *rhsConst << "\n";
                 emitBooleanBranch(false);
                 return true;
             }
             break;
-        case BinaryOp::Equal:
-        case BinaryOp::NotEqual:
         case BinaryOp::LogicalOr:
         case BinaryOp::LogicalAnd:
         case BinaryOp::Add:
@@ -1698,6 +1734,11 @@ private:
             if (symbol.isGlobal) {
                 out_ << "  la t1, " << symbol.label << "\n";
                 out_ << "  lw " << reg << ", 0(t1)\n";
+            } else if (symbol.argReg >= 0) {
+                const std::string source = "a" + std::to_string(symbol.argReg);
+                if (source != reg) {
+                    out_ << "  mv " << reg << ", " << source << "\n";
+                }
             } else if (symbol.savedReg != 0) {
                 out_ << "  mv " << reg << ", " << savedRegName(symbol.savedReg) << "\n";
             } else {
@@ -1743,7 +1784,7 @@ private:
                     out_ << "  mv a" << i << ", a0\n";
                 }
             } else {
-                out_ << "  sw a0, " << ((i - 8) * 4) << "(sp)\n";
+                out_ << "  sw a0, " << (i * 4 + (i - 8) * 4) << "(sp)\n";
             }
         }
         out_ << "  call " << call.callee << "\n";
@@ -1853,6 +1894,10 @@ private:
         if (symbol.isGlobal) {
             out_ << "  la t0, " << symbol.label << "\n";
             out_ << "  lw a0, 0(t0)\n";
+        } else if (symbol.argReg >= 0) {
+            if (symbol.argReg != 0) {
+                out_ << "  mv a0, a" << symbol.argReg << "\n";
+            }
         } else if (symbol.savedReg != 0) {
             out_ << "  mv a0, " << savedRegName(symbol.savedReg) << "\n";
         } else {
@@ -1866,6 +1911,10 @@ private:
         if (symbol.isGlobal) {
             out_ << "  la t0, " << symbol.label << "\n";
             out_ << "  sw a0, 0(t0)\n";
+        } else if (symbol.argReg >= 0) {
+            if (symbol.argReg != 0) {
+                out_ << "  mv a" << symbol.argReg << ", a0\n";
+            }
         } else if (symbol.savedReg != 0) {
             out_ << "  mv " << savedRegName(symbol.savedReg) << ", a0\n";
         } else {
@@ -1877,9 +1926,52 @@ private:
     {
         if (symbol.savedReg != 0) {
             out_ << "  mv " << savedRegName(symbol.savedReg) << ", " << sourceReg << "\n";
+        } else if (symbol.argReg >= 0) {
+            const std::string target = "a" + std::to_string(symbol.argReg);
+            if (target != sourceReg) {
+                out_ << "  mv " << target << ", " << sourceReg << "\n";
+            }
         } else {
             out_ << "  sw " << sourceReg << ", " << symbol.offset << "(s0)\n";
         }
+    }
+
+    void storeImmediate(const Symbol& symbol, std::int32_t value)
+    {
+        if (symbol.isGlobal) {
+            out_ << "  la t0, " << symbol.label << "\n";
+            out_ << "  li t1, " << value << "\n";
+            out_ << "  sw t1, 0(t0)\n";
+        } else if (symbol.argReg >= 0) {
+            out_ << "  li a" << symbol.argReg << ", " << value << "\n";
+        } else if (symbol.savedReg != 0) {
+            out_ << "  li " << savedRegName(symbol.savedReg) << ", " << value << "\n";
+        } else {
+            out_ << "  li t0, " << value << "\n";
+            out_ << "  sw t0, " << symbol.offset << "(s0)\n";
+        }
+    }
+
+    std::string simpleOperandRegister(const Expr& expr, const char* scratch)
+    {
+        if (const auto value = tryEvalConst(expr)) {
+            out_ << "  li " << scratch << ", " << *value << "\n";
+            return scratch;
+        }
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            const Symbol& symbol = lookup(name->name);
+            if (options_.optimize && !symbol.hasConstValue && symbol.hasCopy) {
+                return simpleOperandRegister(NameExpr(symbol.copyOf), scratch);
+            }
+            if (!symbol.isGlobal && symbol.savedReg != 0) {
+                return savedRegName(symbol.savedReg);
+            }
+            if (!symbol.isGlobal && symbol.argReg >= 0) {
+                return std::string("a") + std::to_string(symbol.argReg);
+            }
+        }
+        emitSimpleToRegister(expr, scratch);
+        return scratch;
     }
 
     bool emitOptimizedAssignment(const AssignStmt& assign)
@@ -2037,11 +2129,19 @@ private:
         if (currentFunction_ == nullptr || call.callee != currentFunction_->name || call.args.size() != currentFunction_->params.size()) {
             return false;
         }
-        for (const auto& arg : call.args) {
-            emitExpr(*arg);
+        if (call.args.empty()) {
+            out_ << "  j " << functionBodyLabel_ << "\n";
+            return true;
+        }
+
+        const int last = static_cast<int>(call.args.size()) - 1;
+        for (int i = 0; i < last; ++i) {
+            emitExpr(*call.args[static_cast<std::size_t>(i)]);
             pushA0();
         }
-        for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
+        emitExpr(*call.args[static_cast<std::size_t>(last)]);
+        storeSymbol(currentFunction_->params[static_cast<std::size_t>(last)].name);
+        for (int i = last - 1; i >= 0; --i) {
             popTo("a0");
             storeSymbol(currentFunction_->params[static_cast<std::size_t>(i)].name);
         }
