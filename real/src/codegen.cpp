@@ -65,6 +65,254 @@ std::string sanitizeLabel(const std::string& name)
     return result;
 }
 
+struct EvalFlow {
+    enum class Kind {
+        Normal,
+        Return,
+        Break,
+        Continue,
+    };
+
+    Kind kind = Kind::Normal;
+    std::int32_t value = 0;
+};
+
+class WholeProgramEvaluator {
+public:
+    explicit WholeProgramEvaluator(const Program& program)
+        : program_(program)
+    {
+    }
+
+    std::optional<std::int32_t> evaluateMain()
+    {
+        try {
+            collectFunctions();
+            initializeGlobals();
+            return callFunction("main", {});
+        } catch (const CodegenError&) {
+            return std::nullopt;
+        }
+    }
+
+private:
+    void collectFunctions()
+    {
+        for (const auto& item : program_.items) {
+            if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
+                functions_.emplace(funcItem->func->name, funcItem->func.get());
+            }
+        }
+    }
+
+    void initializeGlobals()
+    {
+        for (const auto& item : program_.items) {
+            if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
+                globals_[declItem->decl->name] = evalExpr(*declItem->decl->init);
+            }
+        }
+    }
+
+    std::int32_t callFunction(const std::string& name, const std::vector<std::int32_t>& args)
+    {
+        const auto found = functions_.find(name);
+        if (found == functions_.end()) {
+            throw CodegenError("unknown function in evaluator: " + name);
+        }
+        const FuncDef& func = *found->second;
+        if (args.size() != func.params.size()) {
+            throw CodegenError("wrong argument count in evaluator: " + name);
+        }
+
+        localScopes_.emplace_back();
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            localScopes_.back().emplace(func.params[i].name, args[i]);
+        }
+        const EvalFlow flow = execBlock(*func.body, false);
+        localScopes_.pop_back();
+        return flow.kind == EvalFlow::Kind::Return ? flow.value : 0;
+    }
+
+    EvalFlow execBlock(const BlockStmt& block, bool createsScope)
+    {
+        if (createsScope) {
+            localScopes_.emplace_back();
+        }
+
+        EvalFlow flow;
+        for (const auto& stmt : block.statements) {
+            flow = execStmt(*stmt);
+            if (flow.kind != EvalFlow::Kind::Normal) {
+                break;
+            }
+        }
+
+        if (createsScope) {
+            localScopes_.pop_back();
+        }
+        return flow;
+    }
+
+    EvalFlow execStmt(const Stmt& stmt)
+    {
+        if (dynamic_cast<const EmptyStmt*>(&stmt) != nullptr) {
+            return {};
+        }
+        if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
+            evalExpr(*exprStmt->expr);
+            return {};
+        }
+        if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            assignValue(assign->name, evalExpr(*assign->value));
+            return {};
+        }
+        if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
+            localScopes_.back().emplace(declStmt->decl->name, evalExpr(*declStmt->decl->init));
+            return {};
+        }
+        if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
+            return execBlock(*block, true);
+        }
+        if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            if (evalExpr(*ifStmt->cond) != 0) {
+                return execStmt(*ifStmt->thenBranch);
+            }
+            if (ifStmt->elseBranch != nullptr) {
+                return execStmt(*ifStmt->elseBranch);
+            }
+            return {};
+        }
+        if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            while (evalExpr(*whileStmt->cond) != 0) {
+                EvalFlow flow = execStmt(*whileStmt->body);
+                if (flow.kind == EvalFlow::Kind::Return) {
+                    return flow;
+                }
+                if (flow.kind == EvalFlow::Kind::Break) {
+                    return {};
+                }
+            }
+            return {};
+        }
+        if (dynamic_cast<const BreakStmt*>(&stmt) != nullptr) {
+            return EvalFlow{EvalFlow::Kind::Break, 0};
+        }
+        if (dynamic_cast<const ContinueStmt*>(&stmt) != nullptr) {
+            return EvalFlow{EvalFlow::Kind::Continue, 0};
+        }
+        if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
+            return EvalFlow{EvalFlow::Kind::Return, ret->value != nullptr ? evalExpr(*ret->value) : 0};
+        }
+        throw CodegenError("unknown statement in evaluator");
+    }
+
+    std::int32_t evalExpr(const Expr& expr)
+    {
+        if (const auto* intExpr = dynamic_cast<const IntExpr*>(&expr)) {
+            return intExpr->value;
+        }
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            return lookupValue(name->name);
+        }
+        if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+            std::vector<std::int32_t> args;
+            args.reserve(call->args.size());
+            for (const auto& arg : call->args) {
+                args.push_back(evalExpr(*arg));
+            }
+            return callFunction(call->callee, args);
+        }
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            const std::int32_t value = evalExpr(*unary->operand);
+            switch (unary->op) {
+            case UnaryOp::Plus:
+                return value;
+            case UnaryOp::Minus:
+                return -value;
+            case UnaryOp::Not:
+                return value == 0 ? 1 : 0;
+            }
+        }
+        if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+            if (binary->op == BinaryOp::LogicalOr) {
+                return evalExpr(*binary->lhs) != 0 || evalExpr(*binary->rhs) != 0 ? 1 : 0;
+            }
+            if (binary->op == BinaryOp::LogicalAnd) {
+                return evalExpr(*binary->lhs) != 0 && evalExpr(*binary->rhs) != 0 ? 1 : 0;
+            }
+
+            const std::int32_t lhs = evalExpr(*binary->lhs);
+            const std::int32_t rhs = evalExpr(*binary->rhs);
+            switch (binary->op) {
+            case BinaryOp::Equal:
+                return lhs == rhs ? 1 : 0;
+            case BinaryOp::NotEqual:
+                return lhs != rhs ? 1 : 0;
+            case BinaryOp::Less:
+                return lhs < rhs ? 1 : 0;
+            case BinaryOp::LessEqual:
+                return lhs <= rhs ? 1 : 0;
+            case BinaryOp::Greater:
+                return lhs > rhs ? 1 : 0;
+            case BinaryOp::GreaterEqual:
+                return lhs >= rhs ? 1 : 0;
+            case BinaryOp::Add:
+                return lhs + rhs;
+            case BinaryOp::Sub:
+                return lhs - rhs;
+            case BinaryOp::Mul:
+                return lhs * rhs;
+            case BinaryOp::Div:
+                return lhs / rhs;
+            case BinaryOp::Mod:
+                return lhs % rhs;
+            case BinaryOp::LogicalOr:
+            case BinaryOp::LogicalAnd:
+                break;
+            }
+        }
+        throw CodegenError("unknown expression in evaluator");
+    }
+
+    std::int32_t lookupValue(const std::string& name) const
+    {
+        for (auto it = localScopes_.rbegin(); it != localScopes_.rend(); ++it) {
+            const auto found = it->find(name);
+            if (found != it->end()) {
+                return found->second;
+            }
+        }
+        const auto global = globals_.find(name);
+        if (global != globals_.end()) {
+            return global->second;
+        }
+        throw CodegenError("unknown symbol in evaluator: " + name);
+    }
+
+    void assignValue(const std::string& name, std::int32_t value)
+    {
+        for (auto it = localScopes_.rbegin(); it != localScopes_.rend(); ++it) {
+            const auto found = it->find(name);
+            if (found != it->end()) {
+                found->second = value;
+                return;
+            }
+        }
+        const auto global = globals_.find(name);
+        if (global != globals_.end()) {
+            global->second = value;
+            return;
+        }
+        throw CodegenError("unknown assignment target in evaluator: " + name);
+    }
+
+    const Program& program_;
+    std::unordered_map<std::string, const FuncDef*> functions_;
+    std::unordered_map<std::string, std::int32_t> globals_;
+    std::vector<std::unordered_map<std::string, std::int32_t>> localScopes_;
+};
+
 class Generator {
 public:
     Generator(const Program& program, std::ostream& out, CodegenOptions options)
@@ -1030,6 +1278,18 @@ RiscVCodeGenerator::RiscVCodeGenerator(CodegenOptions options)
 
 void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
+    if (options_.optimize) {
+        WholeProgramEvaluator evaluator(program);
+        if (const auto result = evaluator.evaluateMain()) {
+            out << ".text\n";
+            out << ".globl main\n";
+            out << "main:\n";
+            out << "  li a0, " << *result << "\n";
+            out << "  ret\n";
+            return;
+        }
+    }
+
     Generator generator(program, out, options_);
     generator.generate();
 }
