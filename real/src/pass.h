@@ -24,12 +24,6 @@ private:
     std::vector<std::unique_ptr<IrPass>> passes_;
 };
 
-class NoOpPass final : public IrPass {
-public:
-    std::string name() const override;
-    bool run(ir::Module& module) override;
-};
-
 PassManager buildDefaultPassPipeline(bool optimize);
 
 } // namespace toyc
