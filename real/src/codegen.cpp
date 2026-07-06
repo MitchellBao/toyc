@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <ostream>
 #include <stdexcept>
@@ -43,6 +44,11 @@ struct FunctionLayout {
 int alignTo(int value, int alignment)
 {
     return ((value + alignment - 1) / alignment) * alignment;
+}
+
+bool fitsSigned12(std::int32_t value)
+{
+    return value >= -2048 && value <= 2047;
 }
 
 const char* savedRegName(int index)
@@ -523,6 +529,9 @@ private:
             return false;
         }
         if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
+            if (options_.optimize && isPure(*exprStmt->expr)) {
+                return false;
+            }
             emitExpr(*exprStmt->expr);
             return false;
         }
@@ -716,6 +725,12 @@ private:
             return;
         }
 
+        if (options_.optimize && emitCommonSubexprBinary(binary)) {
+            return;
+        }
+        if (options_.optimize && emitImmediateBinary(binary)) {
+            return;
+        }
         if (emitBinaryWithSimpleRhs(binary)) {
             return;
         }
@@ -726,6 +741,114 @@ private:
         popTo("t0");
 
         emitBinaryOperation(binary.op);
+    }
+
+    bool emitCommonSubexprBinary(const BinaryExpr& binary)
+    {
+        if (!isPure(*binary.lhs) || !sameExpr(*binary.lhs, *binary.rhs)) {
+            return false;
+        }
+
+        switch (binary.op) {
+        case BinaryOp::Mul:
+            emitExpr(*binary.lhs);
+            out_ << "  mul a0, a0, a0\n";
+            return true;
+        case BinaryOp::Div:
+            out_ << "  li a0, 1\n";
+            return true;
+        case BinaryOp::Mod:
+            out_ << "  li a0, 0\n";
+            return true;
+        case BinaryOp::LogicalOr:
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::Equal:
+        case BinaryOp::NotEqual:
+        case BinaryOp::Less:
+        case BinaryOp::LessEqual:
+        case BinaryOp::Greater:
+        case BinaryOp::GreaterEqual:
+        case BinaryOp::Add:
+        case BinaryOp::Sub:
+            break;
+        }
+        return false;
+    }
+
+    bool emitImmediateBinary(const BinaryExpr& binary)
+    {
+        const auto rhsConst = tryEvalConst(*binary.rhs);
+        if (!rhsConst.has_value()) {
+            return false;
+        }
+
+        switch (binary.op) {
+        case BinaryOp::Add:
+            if (fitsSigned12(*rhsConst)) {
+                emitExpr(*binary.lhs);
+                out_ << "  addi a0, a0, " << *rhsConst << "\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Sub:
+            if (*rhsConst != std::numeric_limits<std::int32_t>::min() && fitsSigned12(static_cast<std::int32_t>(-*rhsConst))) {
+                emitExpr(*binary.lhs);
+                out_ << "  addi a0, a0, " << -*rhsConst << "\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Equal:
+            if (*rhsConst == 0) {
+                emitExpr(*binary.lhs);
+                out_ << "  seqz a0, a0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::NotEqual:
+            if (*rhsConst == 0) {
+                emitExpr(*binary.lhs);
+                out_ << "  snez a0, a0\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Less:
+            if (fitsSigned12(*rhsConst)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti a0, a0, " << *rhsConst << "\n";
+                return true;
+            }
+            break;
+        case BinaryOp::LessEqual:
+            if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti a0, a0, " << (*rhsConst + 1) << "\n";
+                return true;
+            }
+            break;
+        case BinaryOp::Greater:
+            if (*rhsConst < std::numeric_limits<std::int32_t>::max() && fitsSigned12(*rhsConst + 1)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti a0, a0, " << (*rhsConst + 1) << "\n";
+                out_ << "  xori a0, a0, 1\n";
+                return true;
+            }
+            break;
+        case BinaryOp::GreaterEqual:
+            if (fitsSigned12(*rhsConst)) {
+                emitExpr(*binary.lhs);
+                out_ << "  slti a0, a0, " << *rhsConst << "\n";
+                out_ << "  xori a0, a0, 1\n";
+                return true;
+            }
+            break;
+        case BinaryOp::LogicalOr:
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod:
+            break;
+        }
+        return false;
     }
 
     bool emitBinaryWithSimpleRhs(const BinaryExpr& binary)
@@ -1025,14 +1148,15 @@ private:
         const IntExpr* lhsInt = asInt(*binary.lhs);
         const IntExpr* rhsInt = asInt(*binary.rhs);
         const auto lhsConst = tryEvalConst(*binary.lhs);
+        const auto rhsConst = tryEvalConst(*binary.rhs);
 
         switch (binary.op) {
         case BinaryOp::Add:
-            if (rhsInt != nullptr && rhsInt->value == 0) {
+            if (rhsConst.has_value() && *rhsConst == 0) {
                 emitExpr(*binary.lhs);
                 return true;
             }
-            if (lhsInt != nullptr && lhsInt->value == 0) {
+            if (lhsConst.has_value() && *lhsConst == 0) {
                 emitExpr(*binary.rhs);
                 return true;
             }
@@ -1043,7 +1167,7 @@ private:
             }
             break;
         case BinaryOp::Sub:
-            if (rhsInt != nullptr && rhsInt->value == 0) {
+            if (rhsConst.has_value() && *rhsConst == 0) {
                 emitExpr(*binary.lhs);
                 return true;
             }
@@ -1053,41 +1177,56 @@ private:
             }
             break;
         case BinaryOp::Mul:
-            if (rhsInt != nullptr && rhsInt->value == 1) {
+            if (rhsConst.has_value() && *rhsConst == 1) {
                 emitExpr(*binary.lhs);
                 return true;
             }
-            if (lhsInt != nullptr && lhsInt->value == 1) {
+            if (lhsConst.has_value() && *lhsConst == 1) {
                 emitExpr(*binary.rhs);
                 return true;
             }
-            if (rhsInt != nullptr && rhsInt->value == 0 && isPure(*binary.lhs)) {
-                out_ << "  li a0, 0\n";
-                return true;
-            }
-            if (lhsInt != nullptr && lhsInt->value == 0 && isPure(*binary.rhs)) {
-                out_ << "  li a0, 0\n";
-                return true;
-            }
-            if (rhsInt != nullptr && rhsInt->value > 0 && (rhsInt->value & (rhsInt->value - 1)) == 0) {
+            if (rhsConst.has_value() && *rhsConst == -1) {
                 emitExpr(*binary.lhs);
-                out_ << "  slli a0, a0, " << trailingZeroBits(rhsInt->value) << "\n";
+                out_ << "  neg a0, a0\n";
                 return true;
             }
-            if (lhsInt != nullptr && lhsInt->value > 0 && (lhsInt->value & (lhsInt->value - 1)) == 0) {
+            if (lhsConst.has_value() && *lhsConst == -1) {
                 emitExpr(*binary.rhs);
-                out_ << "  slli a0, a0, " << trailingZeroBits(lhsInt->value) << "\n";
+                out_ << "  neg a0, a0\n";
+                return true;
+            }
+            if (rhsConst.has_value() && *rhsConst == 0 && isPure(*binary.lhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            if (lhsConst.has_value() && *lhsConst == 0 && isPure(*binary.rhs)) {
+                out_ << "  li a0, 0\n";
+                return true;
+            }
+            if (rhsConst.has_value() && *rhsConst > 0 && (*rhsConst & (*rhsConst - 1)) == 0) {
+                emitExpr(*binary.lhs);
+                out_ << "  slli a0, a0, " << trailingZeroBits(*rhsConst) << "\n";
+                return true;
+            }
+            if (lhsConst.has_value() && *lhsConst > 0 && (*lhsConst & (*lhsConst - 1)) == 0) {
+                emitExpr(*binary.rhs);
+                out_ << "  slli a0, a0, " << trailingZeroBits(*lhsConst) << "\n";
                 return true;
             }
             break;
         case BinaryOp::Div:
-            if (rhsInt != nullptr && rhsInt->value == 1) {
+            if (rhsConst.has_value() && *rhsConst == 1) {
                 emitExpr(*binary.lhs);
+                return true;
+            }
+            if (rhsConst.has_value() && *rhsConst == -1) {
+                emitExpr(*binary.lhs);
+                out_ << "  neg a0, a0\n";
                 return true;
             }
             break;
         case BinaryOp::Mod:
-            if (rhsInt != nullptr && rhsInt->value == 1) {
+            if (rhsConst.has_value() && *rhsConst == 1) {
                 if (!isPure(*binary.lhs)) {
                     emitExpr(*binary.lhs);
                 }
