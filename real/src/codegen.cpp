@@ -2520,7 +2520,7 @@ void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
     if (options_.optimize) {
         IrBuilder irBuilder;
-        ir::Module module = irBuilder.buildSkeleton(program);
+        ir::Module module = irBuilder.build(program);
         PassManager passes = buildDefaultPassPipeline(true);
         passes.run(module);
     }

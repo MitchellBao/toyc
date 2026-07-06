@@ -87,6 +87,7 @@ struct BasicBlock {
     std::string label;
     std::vector<Instruction> instructions;
     Terminator terminator;
+    bool hasTerminator = false;
 };
 
 struct Function {

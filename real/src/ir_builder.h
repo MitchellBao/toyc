@@ -12,6 +12,7 @@ namespace toyc {
 
 class IrBuilder {
 public:
+    ir::Module build(const Program& program);
     ir::Module buildSkeleton(const Program& program);
 
 private:

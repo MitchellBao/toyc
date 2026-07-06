@@ -18,14 +18,14 @@ Lexer/Parser
 
 - `real/src/ast.h`: source-level syntax tree.
 - `real/src/ir.h`: three-address IR data model.
-- `real/src/ir_builder.cpp`: AST-to-IR boundary. It currently builds module shape and constant globals.
+- `real/src/ir_builder.cpp`: AST-to-IR boundary. It lowers globals, function bodies, expressions, and short-circuit control flow into basic-block IR.
 - `real/src/pass.h`, `real/src/pass.cpp`: pass interface and pass manager.
 - `real/src/codegen.cpp`: current production RISC-V backend. It still lowers AST directly while the IR backend is being filled in.
 
 The production path remains conservative to preserve judge correctness:
 
 ```text
-AST -> IR skeleton/pass pipeline -> existing AST backend -> RISC-V
+AST -> IR/pass pipeline -> existing AST backend -> RISC-V
 ```
 
 ## Refactor rules
@@ -37,8 +37,8 @@ AST -> IR skeleton/pass pipeline -> existing AST backend -> RISC-V
 
 ## Next milestones
 
-1. Lower statements and expressions into IR basic blocks.
-2. Add IR constant/copy propagation and algebra simplification.
-3. Add IR DCE using def-use counts.
-4. Add local value numbering for CSE.
+1. Add IR constant/copy propagation and algebra simplification.
+2. Add IR DCE using def-use counts.
+3. Add local value numbering for CSE.
+4. Add loop analysis plus loop-invariant code motion.
 5. Replace heuristic saved-register assignment with live intervals plus linear scan allocation.
