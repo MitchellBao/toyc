@@ -1,0 +1,31 @@
+/* block comments should be ignored */
+const int one = 1;
+int g = 9;
+
+void bump(int v) {
+    int local = v + one;
+    return;
+}
+
+int main() {
+    int x = 0;
+    int i = 0;
+    while (i < 10) {
+        i = i + 1;
+        if (i % 2 == 0) {
+            continue;
+        }
+        if (i > 7) {
+            break;
+        }
+        {
+            int x = i;
+            bump(x);
+        }
+        x = x + i;
+    }
+    if (x == 16 || g == 0) {
+        return g + x;
+    }
+    return 2;
+}
