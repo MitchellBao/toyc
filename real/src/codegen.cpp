@@ -30,17 +30,25 @@ struct Symbol {
     std::string copyOf;
     std::string label;
     int offset = 0;
+    int savedReg = 0;
 };
 
 struct FunctionLayout {
     int localSlots = 0;
     int paramSlots = 0;
     int frameSize = 0;
+    int savedRegs = 0;
 };
 
 int alignTo(int value, int alignment)
 {
     return ((value + alignment - 1) / alignment) * alignment;
+}
+
+const char* savedRegName(int index)
+{
+    static constexpr const char* names[] = {"", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+    return names[index];
 }
 
 std::string sanitizeLabel(const std::string& name)
@@ -83,7 +91,7 @@ private:
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 const auto& decl = *declItem->decl;
                 const std::string label = "g_" + sanitizeLabel(decl.name);
-                auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, false, {}, label, 0});
+                auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, false, {}, label, 0, 0});
                 (void)inserted;
                 if (decl.isConst) {
                     it->second.constValue = requireConst(*decl.init);
@@ -113,7 +121,8 @@ private:
         currentFunction_ = &func;
         currentLayout_ = buildLayout(func);
         localScopes_.clear();
-        nextLocalOffset_ = -12;
+        nextLocalOffset_ = -12 - currentLayout_.savedRegs * 4;
+        nextSavedReg_ = 1;
         evalStackBytes_ = 0;
         returnLabel_ = newLabel(".L_return_");
         functionBodyLabel_ = newLabel(".L_body_");
@@ -125,17 +134,20 @@ private:
         out_ << "  addi sp, sp, -" << currentLayout_.frameSize << "\n";
         out_ << "  sw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
         out_ << "  sw s0, " << currentLayout_.frameSize - 8 << "(sp)\n";
+        for (int i = 1; i <= currentLayout_.savedRegs; ++i) {
+            out_ << "  sw " << savedRegName(i) << ", " << currentLayout_.frameSize - 8 - i * 4 << "(sp)\n";
+        }
         out_ << "  addi s0, sp, " << currentLayout_.frameSize << "\n";
 
         pushScope();
         for (std::size_t i = 0; i < func.params.size(); ++i) {
-            const int offset = allocateLocal(func.params[i].name, false);
+            const Symbol& param = allocateLocal(func.params[i].name, false);
             if (i < 8) {
-                out_ << "  sw a" << i << ", " << offset << "(s0)\n";
+                storeRegisterOrStack(param, std::string("a") + std::to_string(i));
             } else {
                 const int incomingOffset = static_cast<int>((i - 8) * 4);
                 out_ << "  lw t0, " << incomingOffset << "(s0)\n";
-                out_ << "  sw t0, " << offset << "(s0)\n";
+                storeRegisterOrStack(param, "t0");
             }
         }
 
@@ -145,6 +157,9 @@ private:
             out_ << "  li a0, 0\n";
         }
         out_ << returnLabel_ << ":\n";
+        for (int i = 1; i <= currentLayout_.savedRegs; ++i) {
+            out_ << "  lw " << savedRegName(i) << ", " << currentLayout_.frameSize - 8 - i * 4 << "(sp)\n";
+        }
         out_ << "  lw ra, " << currentLayout_.frameSize - 4 << "(sp)\n";
         out_ << "  lw s0, " << currentLayout_.frameSize - 8 << "(sp)\n";
         out_ << "  addi sp, sp, " << currentLayout_.frameSize << "\n";
@@ -157,8 +172,9 @@ private:
     {
         const int paramSlots = static_cast<int>(func.params.size());
         const int localSlots = countDecls(*func.body);
-        const int frameBytes = alignTo(16 + (paramSlots + localSlots) * 4, 16);
-        return FunctionLayout{localSlots, paramSlots, std::max(frameBytes, 16)};
+        const int savedRegs = options_.optimize ? std::min(11, paramSlots + localSlots) : 0;
+        const int frameBytes = alignTo(16 + savedRegs * 4 + (paramSlots + localSlots) * 4, 16);
+        return FunctionLayout{localSlots, paramSlots, std::max(frameBytes, 16), savedRegs};
     }
 
     int countDecls(const Stmt& stmt) const
@@ -192,12 +208,17 @@ private:
         localScopes_.pop_back();
     }
 
-    int allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt, std::string copyOf = {})
+    const Symbol& allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt, std::string copyOf = {})
     {
         const int offset = nextLocalOffset_;
         nextLocalOffset_ -= 4;
-        localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset});
-        return offset;
+        int savedReg = 0;
+        if (options_.optimize && !(isConst && constValue.has_value()) && nextSavedReg_ <= currentLayout_.savedRegs) {
+            savedReg = nextSavedReg_++;
+        }
+        auto [it, inserted] = localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), !copyOf.empty(), std::move(copyOf), {}, offset, savedReg});
+        (void)inserted;
+        return it->second;
     }
 
     const Symbol& lookup(const std::string& name) const
@@ -278,16 +299,16 @@ private:
                 constValue = tryEvalConst(*decl.init);
                 copyOf = copySourceName(*decl.init);
             }
-            const int offset = allocateLocal(decl.name, decl.isConst, constValue, copyOf);
+            const Symbol& symbol = allocateLocal(decl.name, decl.isConst, constValue, copyOf);
             if (options_.optimize && constValue.has_value()) {
                 if (!decl.isConst) {
                     emitExpr(*decl.init);
-                    out_ << "  sw a0, " << offset << "(s0)\n";
+                    storeRegisterOrStack(symbol, "a0");
                 }
                 return false;
             }
             emitExpr(*decl.init);
-            out_ << "  sw a0, " << offset << "(s0)\n";
+            storeRegisterOrStack(symbol, "a0");
             return false;
         }
         if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
@@ -447,12 +468,33 @@ private:
             return;
         }
 
+        if (emitBinaryWithSimpleRhs(binary)) {
+            return;
+        }
+
         emitExpr(*binary.lhs);
         pushA0();
         emitExpr(*binary.rhs);
         popTo("t0");
 
-        switch (binary.op) {
+        emitBinaryOperation(binary.op);
+    }
+
+    bool emitBinaryWithSimpleRhs(const BinaryExpr& binary)
+    {
+        if (!isSimpleValue(*binary.rhs)) {
+            return false;
+        }
+        emitExpr(*binary.lhs);
+        out_ << "  mv t0, a0\n";
+        emitSimpleToRegister(*binary.rhs, "a0");
+        emitBinaryOperation(binary.op);
+        return true;
+    }
+
+    void emitBinaryOperation(BinaryOp op)
+    {
+        switch (op) {
         case BinaryOp::Equal:
             out_ << "  sub a0, t0, a0\n";
             out_ << "  seqz a0, a0\n";
@@ -493,6 +535,46 @@ private:
         case BinaryOp::LogicalOr:
         case BinaryOp::LogicalAnd:
             break;
+        }
+    }
+
+    bool isSimpleValue(const Expr& expr)
+    {
+        if (tryEvalConst(expr).has_value()) {
+            return true;
+        }
+        return dynamic_cast<const IntExpr*>(&expr) != nullptr || dynamic_cast<const NameExpr*>(&expr) != nullptr;
+    }
+
+    void emitSimpleToRegister(const Expr& expr, const char* reg)
+    {
+        if (const auto value = tryEvalConst(expr)) {
+            out_ << "  li " << reg << ", " << *value << "\n";
+            return;
+        }
+        if (const auto* intExpr = dynamic_cast<const IntExpr*>(&expr)) {
+            out_ << "  li " << reg << ", " << intExpr->value << "\n";
+            return;
+        }
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            const Symbol& symbol = lookup(name->name);
+            if (options_.optimize && !symbol.hasConstValue && symbol.hasCopy) {
+                emitSimpleToRegister(NameExpr(symbol.copyOf), reg);
+                return;
+            }
+            if (symbol.isGlobal) {
+                out_ << "  la t1, " << symbol.label << "\n";
+                out_ << "  lw " << reg << ", 0(t1)\n";
+            } else if (symbol.savedReg != 0) {
+                out_ << "  mv " << reg << ", " << savedRegName(symbol.savedReg) << "\n";
+            } else {
+                out_ << "  lw " << reg << ", " << symbol.offset << "(s0)\n";
+            }
+            return;
+        }
+        emitExpr(expr);
+        if (std::string(reg) != "a0") {
+            out_ << "  mv " << reg << ", a0\n";
         }
     }
 
@@ -554,6 +636,8 @@ private:
         if (symbol.isGlobal) {
             out_ << "  la t0, " << symbol.label << "\n";
             out_ << "  lw a0, 0(t0)\n";
+        } else if (symbol.savedReg != 0) {
+            out_ << "  mv a0, " << savedRegName(symbol.savedReg) << "\n";
         } else {
             out_ << "  lw a0, " << symbol.offset << "(s0)\n";
         }
@@ -565,8 +649,19 @@ private:
         if (symbol.isGlobal) {
             out_ << "  la t0, " << symbol.label << "\n";
             out_ << "  sw a0, 0(t0)\n";
+        } else if (symbol.savedReg != 0) {
+            out_ << "  mv " << savedRegName(symbol.savedReg) << ", a0\n";
         } else {
             out_ << "  sw a0, " << symbol.offset << "(s0)\n";
+        }
+    }
+
+    void storeRegisterOrStack(const Symbol& symbol, const std::string& sourceReg)
+    {
+        if (symbol.savedReg != 0) {
+            out_ << "  mv " << savedRegName(symbol.savedReg) << ", " << sourceReg << "\n";
+        } else {
+            out_ << "  sw " << sourceReg << ", " << symbol.offset << "(s0)\n";
         }
     }
 
@@ -631,8 +726,7 @@ private:
         }
         for (int i = static_cast<int>(call.args.size()) - 1; i >= 0; --i) {
             popTo("a0");
-            const Symbol& param = lookup(currentFunction_->params[static_cast<std::size_t>(i)].name);
-            out_ << "  sw a0, " << param.offset << "(s0)\n";
+            storeSymbol(currentFunction_->params[static_cast<std::size_t>(i)].name);
         }
         out_ << "  j " << functionBodyLabel_ << "\n";
         return true;
@@ -918,6 +1012,7 @@ private:
     const FuncDef* currentFunction_ = nullptr;
     FunctionLayout currentLayout_;
     int nextLocalOffset_ = -8;
+    int nextSavedReg_ = 1;
     int evalStackBytes_ = 0;
     int nextLabel_ = 0;
     std::string returnLabel_;
