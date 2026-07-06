@@ -1,0 +1,24 @@
+#pragma once
+
+#include "ast.h"
+#include "ir.h"
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <unordered_map>
+
+namespace toyc {
+
+class IrBuilder {
+public:
+    ir::Module buildSkeleton(const Program& program);
+
+private:
+    std::optional<std::int32_t> evalConst(const Expr& expr) const;
+    ir::Type mapType(Type type) const;
+
+    mutable std::unordered_map<std::string, std::int32_t> constants_;
+};
+
+} // namespace toyc

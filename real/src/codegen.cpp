@@ -1,4 +1,6 @@
 #include "codegen.h"
+#include "ir_builder.h"
+#include "pass.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -522,9 +524,9 @@ private:
     std::vector<const FuncDef*> callStack_;
 };
 
-class Generator {
+class AstRiscVBackend {
 public:
-    Generator(const Program& program, std::ostream& out, CodegenOptions options)
+    AstRiscVBackend(const Program& program, std::ostream& out, CodegenOptions options)
         : program_(program), out_(out), options_(options)
     {
     }
@@ -2516,8 +2518,15 @@ RiscVCodeGenerator::RiscVCodeGenerator(CodegenOptions options)
 
 void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
-    Generator generator(program, out, options_);
-    generator.generate();
+    if (options_.optimize) {
+        IrBuilder irBuilder;
+        ir::Module module = irBuilder.buildSkeleton(program);
+        PassManager passes = buildDefaultPassPipeline(true);
+        passes.run(module);
+    }
+
+    AstRiscVBackend backend(program, out, options_);
+    backend.generate();
 }
 
 } // namespace toyc
