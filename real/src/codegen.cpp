@@ -59,25 +59,7 @@ bool fitsSigned12(std::int32_t value)
 
 const char* savedRegName(int index)
 {
-    static constexpr const char* names[] = {
-        "",
-        "s1",
-        "s2",
-        "s3",
-        "s4",
-        "s5",
-        "s6",
-        "s7",
-        "s8",
-        "s9",
-        "s10",
-        "s11",
-        "t2",
-        "t3",
-        "t4",
-        "t5",
-        "t6",
-    };
+    static constexpr const char* names[] = {"", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
     return names[index];
 }
 
@@ -293,7 +275,7 @@ private:
     {
         const int paramSlots = static_cast<int>(func.params.size());
         const int localSlots = countDecls(*func.body);
-        const int savedRegs = options_.optimize ? plannedCalleeSavedRegs_ : 0;
+        const int savedRegs = options_.optimize ? plannedSavedRegs_ : 0;
         const int frameBytes = alignTo(16 + savedRegs * 4 + (paramSlots + localSlots) * 4, 16);
         const bool savesRa = !options_.optimize || containsCall(*func.body);
         return FunctionLayout{localSlots, paramSlots, std::max(frameBytes, 16), savedRegs, savesRa};
@@ -326,7 +308,6 @@ private:
         registerForSlot_.assign(slotCount, 0);
         slotReadCount_.assign(slotCount, 0);
         plannedSavedRegs_ = 0;
-        plannedCalleeSavedRegs_ = 0;
         if (!options_.optimize || slotCount == 0) {
             return;
         }
@@ -364,9 +345,7 @@ private:
             return lhs.slot < rhs.slot;
         });
 
-        const int availableRegs = leafCanUseArgRegs ? 16 : 11;
-        plannedSavedRegs_ = std::min(availableRegs, static_cast<int>(candidates.size()));
-        plannedCalleeSavedRegs_ = std::min(11, plannedSavedRegs_);
+        plannedSavedRegs_ = std::min(11, static_cast<int>(candidates.size()));
         for (int i = 0; i < plannedSavedRegs_; ++i) {
             registerForSlot_[candidates[i].slot] = i + 1;
         }
@@ -740,24 +719,6 @@ private:
                     return false;
                 }
                 clearMutableKnowledge();
-            }
-            if (options_.optimize) {
-                const std::string bodyLabel = newLabel(".L_while_body_");
-                const std::string condLabel = newLabel(".L_while_cond_");
-                const std::string endLabel = newLabel(".L_while_end_");
-                continueLabels_.push_back(condLabel);
-                breakLabels_.push_back(endLabel);
-                out_ << "  j " << condLabel << "\n";
-                out_ << bodyLabel << ":\n";
-                emitStmt(*whileStmt->body);
-                out_ << condLabel << ":\n";
-                clearMutableKnowledge();
-                emitBranchIfNotZero(*whileStmt->cond, bodyLabel);
-                out_ << endLabel << ":\n";
-                continueLabels_.pop_back();
-                breakLabels_.pop_back();
-                clearMutableKnowledge();
-                return false;
             }
             const std::string condLabel = newLabel(".L_while_cond_");
             const std::string endLabel = newLabel(".L_while_end_");
@@ -2091,7 +2052,6 @@ private:
     int nextLocalOffset_ = -8;
     int nextLocalSlot_ = 0;
     int plannedSavedRegs_ = 0;
-    int plannedCalleeSavedRegs_ = 0;
     int evalStackBytes_ = 0;
     int nextLabel_ = 0;
     std::string returnLabel_;
