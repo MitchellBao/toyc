@@ -1,11 +1,10 @@
 #include "lexer.h"
 
 #include <cctype>
-#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
-#include <unordered_map>
+#include <utility>
 
 namespace toyc {
 namespace {
@@ -20,6 +19,54 @@ bool isIdentBody(char ch)
     return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
 }
 
+TokenKind keywordKind(const std::string& text)
+{
+    switch (text.size()) {
+    case 2:
+        if (text == "if") {
+            return TokenKind::If;
+        }
+        break;
+    case 3:
+        if (text == "int") {
+            return TokenKind::Int;
+        }
+        break;
+    case 4:
+        if (text == "void") {
+            return TokenKind::Void;
+        }
+        if (text == "else") {
+            return TokenKind::Else;
+        }
+        break;
+    case 5:
+        if (text == "const") {
+            return TokenKind::Const;
+        }
+        if (text == "while") {
+            return TokenKind::While;
+        }
+        if (text == "break") {
+            return TokenKind::Break;
+        }
+        break;
+    case 6:
+        if (text == "return") {
+            return TokenKind::Return;
+        }
+        break;
+    case 8:
+        if (text == "continue") {
+            return TokenKind::Continue;
+        }
+        break;
+    default:
+        break;
+    }
+    return TokenKind::Identifier;
+}
+
 } // namespace
 
 Lexer::Lexer(std::istream& input)
@@ -32,6 +79,7 @@ Lexer::Lexer(std::istream& input)
 std::vector<Token> Lexer::tokenize()
 {
     std::vector<Token> tokens;
+    tokens.reserve(source_.size() / 2 + 1);
     while (true) {
         skipWhitespaceAndComments();
         const int tokenLine = line_;
@@ -47,32 +95,22 @@ std::vector<Token> Lexer::tokenize()
             while (isIdentBody(peek())) {
                 text.push_back(advance());
             }
-            static const std::unordered_map<std::string, TokenKind> keywords = {
-                {"const", TokenKind::Const},
-                {"int", TokenKind::Int},
-                {"void", TokenKind::Void},
-                {"return", TokenKind::Return},
-                {"if", TokenKind::If},
-                {"else", TokenKind::Else},
-                {"while", TokenKind::While},
-                {"break", TokenKind::Break},
-                {"continue", TokenKind::Continue},
-            };
-            const auto found = keywords.find(text);
-            tokens.push_back(Token{found == keywords.end() ? TokenKind::Identifier : found->second, text, 0, tokenLine, tokenColumn});
+            tokens.push_back(Token{keywordKind(text), std::move(text), 0, tokenLine, tokenColumn});
             continue;
         }
 
         if (std::isdigit(static_cast<unsigned char>(ch))) {
             std::string text;
+            long long value = 0;
             while (std::isdigit(static_cast<unsigned char>(peek()))) {
-                text.push_back(advance());
+                const char digit = advance();
+                text.push_back(digit);
+                value = value * 10 + (digit - '0');
+                if (value > std::numeric_limits<std::int32_t>::max()) {
+                    throw std::runtime_error("integer literal out of range at line " + std::to_string(tokenLine));
+                }
             }
-            const long long value = std::strtoll(text.c_str(), nullptr, 10);
-            if (value > std::numeric_limits<std::int32_t>::max()) {
-                throw std::runtime_error("integer literal out of range at line " + std::to_string(tokenLine));
-            }
-            tokens.push_back(Token{TokenKind::Number, text, static_cast<std::int32_t>(value), tokenLine, tokenColumn});
+            tokens.push_back(Token{TokenKind::Number, std::move(text), static_cast<std::int32_t>(value), tokenLine, tokenColumn});
             continue;
         }
 

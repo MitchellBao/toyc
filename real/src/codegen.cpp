@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,8 @@ public:
 struct Symbol {
     bool isGlobal = false;
     bool isConst = false;
+    bool hasConstValue = false;
+    std::int32_t constValue = 0;
     std::string label;
     int offset = 0;
 };
@@ -78,7 +81,12 @@ private:
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 const auto& decl = *declItem->decl;
                 const std::string label = "g_" + sanitizeLabel(decl.name);
-                globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, label, 0});
+                auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, label, 0});
+                (void)inserted;
+                if (decl.isConst) {
+                    it->second.constValue = requireConst(*decl.init);
+                    it->second.hasConstValue = true;
+                }
             }
         }
     }
@@ -90,7 +98,7 @@ private:
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 const auto& decl = *declItem->decl;
                 const auto found = globalSymbols_.find(decl.name);
-                const std::int32_t init = evalConst(*decl.init);
+                const std::int32_t init = requireConst(*decl.init);
                 out_ << ".globl " << found->second.label << "\n";
                 out_ << found->second.label << ":\n";
                 out_ << "  .word " << init << "\n";
@@ -180,11 +188,11 @@ private:
         localScopes_.pop_back();
     }
 
-    int allocateLocal(const std::string& name, bool isConst)
+    int allocateLocal(const std::string& name, bool isConst, std::optional<std::int32_t> constValue = std::nullopt)
     {
         const int offset = nextLocalOffset_;
         nextLocalOffset_ -= 4;
-        localScopes_.back().emplace(name, Symbol{false, isConst, {}, offset});
+        localScopes_.back().emplace(name, Symbol{false, isConst, constValue.has_value(), constValue.value_or(0), {}, offset});
         return offset;
     }
 
@@ -232,7 +240,14 @@ private:
         }
         if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
             const auto& decl = *declStmt->decl;
-            const int offset = allocateLocal(decl.name, decl.isConst);
+            std::optional<std::int32_t> constValue;
+            if (options_.optimize && decl.isConst) {
+                constValue = tryEvalConst(*decl.init);
+            }
+            const int offset = allocateLocal(decl.name, decl.isConst, constValue);
+            if (options_.optimize && constValue.has_value()) {
+                return;
+            }
             emitExpr(*decl.init);
             out_ << "  sw a0, " << offset << "(s0)\n";
             return;
@@ -292,6 +307,12 @@ private:
 
     void emitExpr(const Expr& expr)
     {
+        if (options_.optimize) {
+            if (const auto value = tryEvalConst(expr)) {
+                out_ << "  li a0, " << *value << "\n";
+                return;
+            }
+        }
         if (const auto* intExpr = dynamic_cast<const IntExpr*>(&expr)) {
             out_ << "  li a0, " << intExpr->value << "\n";
             return;
@@ -473,67 +494,81 @@ private:
         }
     }
 
-    std::int32_t evalConst(const Expr& expr)
+    std::int32_t requireConst(const Expr& expr)
+    {
+        if (const auto value = tryEvalConst(expr)) {
+            return *value;
+        }
+        throw CodegenError("global initializer is not constant");
+    }
+
+    std::optional<std::int32_t> tryEvalConst(const Expr& expr)
     {
         if (const auto* intExpr = dynamic_cast<const IntExpr*>(&expr)) {
             return intExpr->value;
         }
         if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
-            const std::int32_t value = evalConst(*unary->operand);
+            const auto value = tryEvalConst(*unary->operand);
+            if (!value.has_value()) {
+                return std::nullopt;
+            }
             switch (unary->op) {
             case UnaryOp::Plus:
-                return value;
+                return *value;
             case UnaryOp::Minus:
-                return -value;
+                return -*value;
             case UnaryOp::Not:
-                return value == 0 ? 1 : 0;
+                return *value == 0 ? 1 : 0;
             }
         }
         if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
-            const std::int32_t lhs = evalConst(*binary->lhs);
-            const std::int32_t rhs = evalConst(*binary->rhs);
+            const auto lhs = tryEvalConst(*binary->lhs);
+            const auto rhs = tryEvalConst(*binary->rhs);
+            if (!lhs.has_value() || !rhs.has_value()) {
+                return std::nullopt;
+            }
             switch (binary->op) {
             case BinaryOp::LogicalOr:
-                return (lhs != 0 || rhs != 0) ? 1 : 0;
+                return (*lhs != 0 || *rhs != 0) ? 1 : 0;
             case BinaryOp::LogicalAnd:
-                return (lhs != 0 && rhs != 0) ? 1 : 0;
+                return (*lhs != 0 && *rhs != 0) ? 1 : 0;
             case BinaryOp::Equal:
-                return lhs == rhs ? 1 : 0;
+                return *lhs == *rhs ? 1 : 0;
             case BinaryOp::NotEqual:
-                return lhs != rhs ? 1 : 0;
+                return *lhs != *rhs ? 1 : 0;
             case BinaryOp::Less:
-                return lhs < rhs ? 1 : 0;
+                return *lhs < *rhs ? 1 : 0;
             case BinaryOp::LessEqual:
-                return lhs <= rhs ? 1 : 0;
+                return *lhs <= *rhs ? 1 : 0;
             case BinaryOp::Greater:
-                return lhs > rhs ? 1 : 0;
+                return *lhs > *rhs ? 1 : 0;
             case BinaryOp::GreaterEqual:
-                return lhs >= rhs ? 1 : 0;
+                return *lhs >= *rhs ? 1 : 0;
             case BinaryOp::Add:
-                return lhs + rhs;
+                return *lhs + *rhs;
             case BinaryOp::Sub:
-                return lhs - rhs;
+                return *lhs - *rhs;
             case BinaryOp::Mul:
-                return lhs * rhs;
+                return *lhs * *rhs;
             case BinaryOp::Div:
-                return lhs / rhs;
+                if (*rhs == 0) {
+                    return std::nullopt;
+                }
+                return *lhs / *rhs;
             case BinaryOp::Mod:
-                return lhs % rhs;
+                if (*rhs == 0) {
+                    return std::nullopt;
+                }
+                return *lhs % *rhs;
             }
         }
         if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
             const Symbol& symbol = lookup(name->name);
-            if (symbol.isGlobal) {
-                for (const auto& item : program_.items) {
-                    if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
-                        if (declItem->decl->name == name->name) {
-                            return evalConst(*declItem->decl->init);
-                        }
-                    }
-                }
+            if (symbol.isConst && symbol.hasConstValue) {
+                return symbol.constValue;
             }
         }
-        throw CodegenError("global initializer is not constant");
+        return std::nullopt;
     }
 
     std::string newLabel(const char* prefix)
