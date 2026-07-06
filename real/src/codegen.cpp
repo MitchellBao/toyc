@@ -2005,18 +2005,6 @@ RiscVCodeGenerator::RiscVCodeGenerator(CodegenOptions options)
 
 void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
-    if (options_.optimize) {
-        WholeProgramEvaluator evaluator(program);
-        if (const auto result = evaluator.evaluateMain()) {
-            out << ".text\n";
-            out << ".globl main\n";
-            out << "main:\n";
-            out << "  li a0, " << *result << "\n";
-            out << "  ret\n";
-            return;
-        }
-    }
-
     Generator generator(program, out, options_);
     generator.generate();
 }
