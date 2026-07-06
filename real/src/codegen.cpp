@@ -77,10 +77,12 @@ struct EvalFlow {
         Return,
         Break,
         Continue,
+        TailCall,
     };
 
     Kind kind = Kind::Normal;
     std::int32_t value = 0;
+    std::vector<std::int32_t> tailArgs;
 };
 
 class WholeProgramEvaluator {
@@ -93,7 +95,9 @@ public:
     std::optional<std::int32_t> evaluateMain()
     {
         try {
+            collectGlobalDeclarations();
             collectFunctions();
+            analyzeFunctionPurity();
             initializeGlobals();
             return callFunction("main", {});
         } catch (const CodegenError&) {
@@ -102,17 +106,50 @@ public:
     }
 
 private:
+    void collectGlobalDeclarations()
+    {
+        globalConsts_.reserve(program_.items.size());
+        for (const auto& item : program_.items) {
+            if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
+                globalConsts_[declItem->decl->name] = declItem->decl->isConst;
+            }
+        }
+    }
+
     void collectFunctions()
     {
+        functions_.reserve(program_.items.size());
         for (const auto& item : program_.items) {
             if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
                 functions_.emplace(funcItem->func->name, funcItem->func.get());
+                functionPure_[funcItem->func->name] = true;
+            }
+        }
+    }
+
+    void analyzeFunctionPurity()
+    {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (const auto& [name, func] : functions_) {
+                std::vector<std::vector<std::string>> locals;
+                locals.emplace_back();
+                for (const Param& param : func->params) {
+                    locals.back().push_back(param.name);
+                }
+                const bool pure = isPureStmt(*func->body, locals, false);
+                if (functionPure_[name] != pure) {
+                    functionPure_[name] = pure;
+                    changed = true;
+                }
             }
         }
     }
 
     void initializeGlobals()
     {
+        globals_.reserve(program_.items.size());
         for (const auto& item : program_.items) {
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 globals_[declItem->decl->name] = evalExpr(*declItem->decl->init);
@@ -131,19 +168,41 @@ private:
             throw CodegenError("wrong argument count in evaluator: " + name);
         }
 
-        localScopes_.emplace_back();
-        for (std::size_t i = 0; i < args.size(); ++i) {
-            localScopes_.back().emplace(func.params[i].name, args[i]);
+        const bool memoizable = functionPure_.find(name) != functionPure_.end() && functionPure_.at(name);
+        const std::string memoKey = memoizable ? makeMemoKey(name, args) : std::string{};
+        if (memoizable) {
+            const auto memo = memoizedResults_.find(memoKey);
+            if (memo != memoizedResults_.end()) {
+                return memo->second;
+            }
         }
-        const EvalFlow flow = execBlock(*func.body, false);
-        localScopes_.pop_back();
-        return flow.kind == EvalFlow::Kind::Return ? flow.value : 0;
+
+        std::vector<std::int32_t> currentArgs = args;
+        while (true) {
+            pushScope();
+            for (std::size_t i = 0; i < currentArgs.size(); ++i) {
+                declareLocal(func.params[i].name, currentArgs[i]);
+            }
+            callStack_.push_back(&func);
+            const EvalFlow flow = execBlock(*func.body, false);
+            callStack_.pop_back();
+            popScope();
+            if (flow.kind == EvalFlow::Kind::TailCall) {
+                currentArgs = flow.tailArgs;
+                continue;
+            }
+            const std::int32_t result = flow.kind == EvalFlow::Kind::Return ? flow.value : 0;
+            if (memoizable) {
+                memoizedResults_.emplace(memoKey, result);
+            }
+            return result;
+        }
     }
 
     EvalFlow execBlock(const BlockStmt& block, bool createsScope)
     {
         if (createsScope) {
-            localScopes_.emplace_back();
+            pushScope();
         }
 
         EvalFlow flow;
@@ -155,7 +214,7 @@ private:
         }
 
         if (createsScope) {
-            localScopes_.pop_back();
+            popScope();
         }
         return flow;
     }
@@ -174,7 +233,7 @@ private:
             return {};
         }
         if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
-            localScopes_.back().emplace(declStmt->decl->name, evalExpr(*declStmt->decl->init));
+            declareLocal(declStmt->decl->name, evalExpr(*declStmt->decl->init));
             return {};
         }
         if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
@@ -192,7 +251,7 @@ private:
         if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
             while (evalExpr(*whileStmt->cond) != 0) {
                 EvalFlow flow = execStmt(*whileStmt->body);
-                if (flow.kind == EvalFlow::Kind::Return) {
+                if (flow.kind == EvalFlow::Kind::Return || flow.kind == EvalFlow::Kind::TailCall) {
                     return flow;
                 }
                 if (flow.kind == EvalFlow::Kind::Break) {
@@ -208,6 +267,16 @@ private:
             return EvalFlow{EvalFlow::Kind::Continue, 0};
         }
         if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
+            if (const auto* call = ret->value != nullptr ? dynamic_cast<const CallExpr*>(ret->value.get()) : nullptr) {
+                if (!callStack_.empty() && call->callee == callStack_.back()->name && call->args.size() == callStack_.back()->params.size()) {
+                    std::vector<std::int32_t> args;
+                    args.reserve(call->args.size());
+                    for (const auto& arg : call->args) {
+                        args.push_back(evalExpr(*arg));
+                    }
+                    return EvalFlow{EvalFlow::Kind::TailCall, 0, std::move(args)};
+                }
+            }
             return EvalFlow{EvalFlow::Kind::Return, ret->value != nullptr ? evalExpr(*ret->value) : 0};
         }
         throw CodegenError("unknown statement in evaluator");
@@ -283,11 +352,9 @@ private:
 
     std::int32_t lookupValue(const std::string& name) const
     {
-        for (auto it = localScopes_.rbegin(); it != localScopes_.rend(); ++it) {
-            const auto found = it->find(name);
-            if (found != it->end()) {
-                return found->second;
-            }
+        const auto local = locals_.find(name);
+        if (local != locals_.end() && !local->second.empty()) {
+            return local->second.back();
         }
         const auto global = globals_.find(name);
         if (global != globals_.end()) {
@@ -298,12 +365,10 @@ private:
 
     void assignValue(const std::string& name, std::int32_t value)
     {
-        for (auto it = localScopes_.rbegin(); it != localScopes_.rend(); ++it) {
-            const auto found = it->find(name);
-            if (found != it->end()) {
-                found->second = value;
-                return;
-            }
+        const auto local = locals_.find(name);
+        if (local != locals_.end() && !local->second.empty()) {
+            local->second.back() = value;
+            return;
         }
         const auto global = globals_.find(name);
         if (global != globals_.end()) {
@@ -313,10 +378,145 @@ private:
         throw CodegenError("unknown assignment target in evaluator: " + name);
     }
 
+    void pushScope()
+    {
+        scopeNames_.emplace_back();
+    }
+
+    void popScope()
+    {
+        for (const std::string& name : scopeNames_.back()) {
+            auto found = locals_.find(name);
+            found->second.pop_back();
+            if (found->second.empty()) {
+                locals_.erase(found);
+            }
+        }
+        scopeNames_.pop_back();
+    }
+
+    void declareLocal(const std::string& name, std::int32_t value)
+    {
+        locals_[name].push_back(value);
+        scopeNames_.back().push_back(name);
+    }
+
+    bool isPureStmt(const Stmt& stmt, std::vector<std::vector<std::string>>& locals, bool createsScope) const
+    {
+        if (createsScope) {
+            locals.emplace_back();
+        }
+
+        bool pure = true;
+        if (dynamic_cast<const EmptyStmt*>(&stmt) != nullptr || dynamic_cast<const BreakStmt*>(&stmt) != nullptr
+            || dynamic_cast<const ContinueStmt*>(&stmt) != nullptr) {
+            pure = true;
+        } else if (const auto* exprStmt = dynamic_cast<const ExprStmt*>(&stmt)) {
+            pure = isPureExpr(*exprStmt->expr, locals);
+        } else if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            pure = isLocalName(assign->name, locals) && isPureExpr(*assign->value, locals);
+        } else if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
+            pure = isPureExpr(*declStmt->decl->init, locals);
+            locals.back().push_back(declStmt->decl->name);
+        } else if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
+            pure = isPureBlock(*block, locals, true);
+        } else if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            auto thenLocals = locals;
+            auto elseLocals = locals;
+            pure = isPureExpr(*ifStmt->cond, locals) && isPureStmt(*ifStmt->thenBranch, thenLocals, false)
+                && (ifStmt->elseBranch == nullptr || isPureStmt(*ifStmt->elseBranch, elseLocals, false));
+        } else if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            auto bodyLocals = locals;
+            pure = isPureExpr(*whileStmt->cond, locals) && isPureStmt(*whileStmt->body, bodyLocals, false);
+        } else if (const auto* ret = dynamic_cast<const ReturnStmt*>(&stmt)) {
+            pure = ret->value == nullptr || isPureExpr(*ret->value, locals);
+        } else {
+            pure = false;
+        }
+
+        if (createsScope) {
+            locals.pop_back();
+        }
+        return pure;
+    }
+
+    bool isPureBlock(const BlockStmt& block, std::vector<std::vector<std::string>>& locals, bool createsScope) const
+    {
+        if (createsScope) {
+            locals.emplace_back();
+        }
+        bool pure = true;
+        for (const auto& stmt : block.statements) {
+            pure = isPureStmt(*stmt, locals, false) && pure;
+        }
+        if (createsScope) {
+            locals.pop_back();
+        }
+        return pure;
+    }
+
+    bool isPureExpr(const Expr& expr, std::vector<std::vector<std::string>>& locals) const
+    {
+        if (dynamic_cast<const IntExpr*>(&expr) != nullptr) {
+            return true;
+        }
+        if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+            if (isLocalName(name->name, locals)) {
+                return true;
+            }
+            const auto global = globalConsts_.find(name->name);
+            return global != globalConsts_.end() && global->second;
+        }
+        if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+            const auto pure = functionPure_.find(call->callee);
+            if (pure == functionPure_.end() || !pure->second) {
+                return false;
+            }
+            for (const auto& arg : call->args) {
+                if (!isPureExpr(*arg, locals)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            return isPureExpr(*unary->operand, locals);
+        }
+        if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+            return isPureExpr(*binary->lhs, locals) && isPureExpr(*binary->rhs, locals);
+        }
+        return false;
+    }
+
+    bool isLocalName(const std::string& name, const std::vector<std::vector<std::string>>& locals) const
+    {
+        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+            if (std::find(it->begin(), it->end(), name) != it->end()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string makeMemoKey(const std::string& name, const std::vector<std::int32_t>& args) const
+    {
+        std::string key = name;
+        for (std::int32_t arg : args) {
+            key.push_back('#');
+            key += std::to_string(arg);
+        }
+        return key;
+    }
+
     const Program& program_;
     std::unordered_map<std::string, const FuncDef*> functions_;
     std::unordered_map<std::string, std::int32_t> globals_;
-    std::vector<std::unordered_map<std::string, std::int32_t>> localScopes_;
+    std::unordered_map<std::string, bool> globalConsts_;
+    std::unordered_map<std::string, bool> functionPure_;
+    std::unordered_map<std::string, std::int32_t> memoizedResults_;
+    std::unordered_map<std::string, std::vector<std::int32_t>> locals_;
+    std::vector<std::vector<std::string>> scopeNames_;
+    std::vector<const FuncDef*> callStack_;
 };
 
 class Generator {
@@ -347,12 +547,91 @@ private:
                 const std::string label = "g_" + sanitizeLabel(decl.name);
                 auto [it, inserted] = globalSymbols_.emplace(decl.name, Symbol{true, decl.isConst, false, 0, false, {}, label, 0, 0});
                 (void)inserted;
-                if (decl.isConst) {
-                    it->second.constValue = requireConst(*decl.init);
-                    it->second.hasConstValue = true;
+            }
+        }
+
+        if (options_.optimize) {
+            collectAssignedGlobals();
+        }
+
+        for (const auto& item : program_.items) {
+            if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
+                const auto& decl = *declItem->decl;
+                auto found = globalSymbols_.find(decl.name);
+                if (decl.isConst || (options_.optimize && globalAssigned_.find(decl.name) == globalAssigned_.end())) {
+                    found->second.constValue = requireConst(*decl.init);
+                    found->second.hasConstValue = true;
                 }
             }
         }
+    }
+
+    void collectAssignedGlobals()
+    {
+        for (const auto& item : program_.items) {
+            if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
+                std::vector<std::vector<std::string>> locals;
+                locals.emplace_back();
+                for (const Param& param : funcItem->func->params) {
+                    locals.back().push_back(param.name);
+                }
+                collectAssignedGlobalsInStmt(*funcItem->func->body, locals, true);
+            }
+        }
+    }
+
+    void collectAssignedGlobalsInStmt(const Stmt& stmt, std::vector<std::vector<std::string>>& locals, bool createsScope)
+    {
+        if (createsScope) {
+            locals.emplace_back();
+        }
+
+        if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
+            if (!isLocalName(assign->name, locals) && globalSymbols_.find(assign->name) != globalSymbols_.end()) {
+                globalAssigned_[assign->name] = true;
+            }
+        } else if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
+            locals.back().push_back(declStmt->decl->name);
+        } else if (const auto* block = dynamic_cast<const BlockStmt*>(&stmt)) {
+            collectAssignedGlobalsInBlock(*block, locals, true);
+        } else if (const auto* ifStmt = dynamic_cast<const IfStmt*>(&stmt)) {
+            auto thenLocals = locals;
+            auto elseLocals = locals;
+            collectAssignedGlobalsInStmt(*ifStmt->thenBranch, thenLocals, false);
+            if (ifStmt->elseBranch != nullptr) {
+                collectAssignedGlobalsInStmt(*ifStmt->elseBranch, elseLocals, false);
+            }
+        } else if (const auto* whileStmt = dynamic_cast<const WhileStmt*>(&stmt)) {
+            auto bodyLocals = locals;
+            collectAssignedGlobalsInStmt(*whileStmt->body, bodyLocals, false);
+        }
+
+        if (createsScope) {
+            locals.pop_back();
+        }
+    }
+
+    void collectAssignedGlobalsInBlock(const BlockStmt& block, std::vector<std::vector<std::string>>& locals, bool createsScope)
+    {
+        if (createsScope) {
+            locals.emplace_back();
+        }
+        for (const auto& stmt : block.statements) {
+            collectAssignedGlobalsInStmt(*stmt, locals, false);
+        }
+        if (createsScope) {
+            locals.pop_back();
+        }
+    }
+
+    bool isLocalName(const std::string& name, const std::vector<std::vector<std::string>>& locals) const
+    {
+        for (auto it = locals.rbegin(); it != locals.rend(); ++it) {
+            if (std::find(it->begin(), it->end(), name) != it->end()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void emitData()
@@ -538,6 +817,10 @@ private:
         if (const auto* assign = dynamic_cast<const AssignStmt*>(&stmt)) {
             const auto knownValue = options_.optimize ? tryEvalConst(*assign->value) : std::optional<std::int32_t>{};
             const std::string copyOf = options_.optimize ? copySourceName(*assign->value) : std::string{};
+            if (options_.optimize && emitOptimizedAssignment(*assign)) {
+                updateKnownValue(assign->name, knownValue, copyOf);
+                return false;
+            }
             emitExpr(*assign->value);
             storeSymbol(assign->name);
             if (options_.optimize) {
@@ -585,8 +868,7 @@ private:
             }
             const std::string elseLabel = newLabel(".L_else_");
             const std::string endLabel = newLabel(".L_endif_");
-            emitExpr(*ifStmt->cond);
-            out_ << "  beqz a0, " << elseLabel << "\n";
+            emitBranchIfZero(*ifStmt->cond, elseLabel);
             const auto scopesBeforeBranches = localScopes_;
             const bool thenTerminal = emitStmt(*ifStmt->thenBranch);
             out_ << "  j " << endLabel << "\n";
@@ -613,8 +895,7 @@ private:
             continueLabels_.push_back(condLabel);
             breakLabels_.push_back(endLabel);
             out_ << condLabel << ":\n";
-            emitExpr(*whileStmt->cond);
-            out_ << "  beqz a0, " << endLabel << "\n";
+            emitBranchIfZero(*whileStmt->cond, endLabel);
             emitStmt(*whileStmt->body);
             out_ << "  j " << condLabel << "\n";
             out_ << endLabel << ":\n";
@@ -909,6 +1190,172 @@ private:
         }
     }
 
+    void emitBranchIfZero(const Expr& expr, const std::string& label)
+    {
+        if (options_.optimize && emitOptimizedBranch(expr, label, false)) {
+            return;
+        }
+        emitExpr(expr);
+        out_ << "  beqz a0, " << label << "\n";
+    }
+
+    void emitBranchIfNotZero(const Expr& expr, const std::string& label)
+    {
+        if (options_.optimize && emitOptimizedBranch(expr, label, true)) {
+            return;
+        }
+        emitExpr(expr);
+        out_ << "  bnez a0, " << label << "\n";
+    }
+
+    bool emitOptimizedBranch(const Expr& expr, const std::string& label, bool branchWhenTrue)
+    {
+        if (const auto value = tryEvalConst(expr)) {
+            if ((*value != 0) == branchWhenTrue) {
+                out_ << "  j " << label << "\n";
+            }
+            return true;
+        }
+
+        if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+            if (unary->op == UnaryOp::Not) {
+                return emitOptimizedBranch(*unary->operand, label, !branchWhenTrue);
+            }
+        }
+
+        const auto* binary = dynamic_cast<const BinaryExpr*>(&expr);
+        if (binary == nullptr) {
+            return false;
+        }
+
+        if (binary->op == BinaryOp::LogicalAnd) {
+            if (branchWhenTrue) {
+                const std::string endLabel = newLabel(".L_and_skip_");
+                emitBranchIfZero(*binary->lhs, endLabel);
+                emitBranchIfNotZero(*binary->rhs, label);
+                out_ << endLabel << ":\n";
+            } else {
+                emitBranchIfZero(*binary->lhs, label);
+                emitBranchIfZero(*binary->rhs, label);
+            }
+            return true;
+        }
+        if (binary->op == BinaryOp::LogicalOr) {
+            if (branchWhenTrue) {
+                emitBranchIfNotZero(*binary->lhs, label);
+                emitBranchIfNotZero(*binary->rhs, label);
+            } else {
+                const std::string endLabel = newLabel(".L_or_skip_");
+                emitBranchIfNotZero(*binary->lhs, endLabel);
+                emitBranchIfZero(*binary->rhs, label);
+                out_ << endLabel << ":\n";
+            }
+            return true;
+        }
+
+        return emitRelationalBranch(*binary, label, branchWhenTrue);
+    }
+
+    bool emitRelationalBranch(const BinaryExpr& binary, const std::string& label, bool branchWhenTrue)
+    {
+        switch (binary.op) {
+        case BinaryOp::Equal:
+        case BinaryOp::NotEqual:
+        case BinaryOp::Less:
+        case BinaryOp::LessEqual:
+        case BinaryOp::Greater:
+        case BinaryOp::GreaterEqual:
+            break;
+        case BinaryOp::LogicalOr:
+        case BinaryOp::LogicalAnd:
+        case BinaryOp::Add:
+        case BinaryOp::Sub:
+        case BinaryOp::Mul:
+        case BinaryOp::Div:
+        case BinaryOp::Mod:
+            return false;
+        }
+
+        if (const auto rhsConst = tryEvalConst(*binary.rhs);
+            rhsConst.has_value() && *rhsConst == 0 && (binary.op == BinaryOp::Equal || binary.op == BinaryOp::NotEqual)) {
+            emitExpr(*binary.lhs);
+            const bool jumpOnZero = (binary.op == BinaryOp::Equal) == branchWhenTrue;
+            out_ << "  " << (jumpOnZero ? "beqz" : "bnez") << " a0, " << label << "\n";
+            return true;
+        }
+
+        emitExpr(*binary.lhs);
+        if (isSimpleValue(*binary.rhs)) {
+            out_ << "  mv t0, a0\n";
+            emitSimpleToRegister(*binary.rhs, "a0");
+        } else {
+            pushA0();
+            emitExpr(*binary.rhs);
+            popTo("t0");
+        }
+
+        if (branchWhenTrue) {
+            switch (binary.op) {
+            case BinaryOp::Equal:
+                out_ << "  beq t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::NotEqual:
+                out_ << "  bne t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::Less:
+                out_ << "  blt t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::LessEqual:
+                out_ << "  bge a0, t0, " << label << "\n";
+                return true;
+            case BinaryOp::Greater:
+                out_ << "  blt a0, t0, " << label << "\n";
+                return true;
+            case BinaryOp::GreaterEqual:
+                out_ << "  bge t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::LogicalOr:
+            case BinaryOp::LogicalAnd:
+            case BinaryOp::Add:
+            case BinaryOp::Sub:
+            case BinaryOp::Mul:
+            case BinaryOp::Div:
+            case BinaryOp::Mod:
+                break;
+            }
+        } else {
+            switch (binary.op) {
+            case BinaryOp::Equal:
+                out_ << "  bne t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::NotEqual:
+                out_ << "  beq t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::Less:
+                out_ << "  bge t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::LessEqual:
+                out_ << "  blt a0, t0, " << label << "\n";
+                return true;
+            case BinaryOp::Greater:
+                out_ << "  bge a0, t0, " << label << "\n";
+                return true;
+            case BinaryOp::GreaterEqual:
+                out_ << "  blt t0, a0, " << label << "\n";
+                return true;
+            case BinaryOp::LogicalOr:
+            case BinaryOp::LogicalAnd:
+            case BinaryOp::Add:
+            case BinaryOp::Sub:
+            case BinaryOp::Mul:
+            case BinaryOp::Div:
+            case BinaryOp::Mod:
+                break;
+            }
+        }
+        return false;
+    }
+
     bool isSimpleValue(const Expr& expr)
     {
         if (tryEvalConst(expr).has_value()) {
@@ -1034,6 +1481,102 @@ private:
         } else {
             out_ << "  sw " << sourceReg << ", " << symbol.offset << "(s0)\n";
         }
+    }
+
+    bool emitOptimizedAssignment(const AssignStmt& assign)
+    {
+        const Symbol& target = lookup(assign.name);
+        if (target.savedReg == 0) {
+            return false;
+        }
+
+        const auto* binary = dynamic_cast<const BinaryExpr*>(assign.value.get());
+        if (binary == nullptr) {
+            return false;
+        }
+
+        const char* dst = savedRegName(target.savedReg);
+        if (emitSelfImmediateUpdate(assign.name, *binary, dst)) {
+            return true;
+        }
+        if (emitSelfRegisterUpdate(assign.name, *binary, dst)) {
+            return true;
+        }
+        return false;
+    }
+
+    bool emitSelfImmediateUpdate(const std::string& name, const BinaryExpr& binary, const char* dst)
+    {
+        if (binary.op == BinaryOp::Add || binary.op == BinaryOp::Sub) {
+            if (isName(*binary.lhs, name)) {
+                const auto rhsConst = tryEvalConst(*binary.rhs);
+                if (rhsConst.has_value()) {
+                    if (binary.op == BinaryOp::Sub && *rhsConst == std::numeric_limits<std::int32_t>::min()) {
+                        return false;
+                    }
+                    const std::int32_t delta = binary.op == BinaryOp::Add ? *rhsConst : static_cast<std::int32_t>(-*rhsConst);
+                    if (fitsSigned12(delta)) {
+                        out_ << "  addi " << dst << ", " << dst << ", " << delta << "\n";
+                        return true;
+                    }
+                }
+            }
+            if (binary.op == BinaryOp::Add && isName(*binary.rhs, name)) {
+                const auto lhsConst = tryEvalConst(*binary.lhs);
+                if (lhsConst.has_value() && fitsSigned12(*lhsConst)) {
+                    out_ << "  addi " << dst << ", " << dst << ", " << *lhsConst << "\n";
+                    return true;
+                }
+            }
+        }
+
+        if (binary.op == BinaryOp::Mul) {
+            std::optional<std::int32_t> factor;
+            if (isName(*binary.lhs, name)) {
+                factor = tryEvalConst(*binary.rhs);
+            } else if (isName(*binary.rhs, name)) {
+                factor = tryEvalConst(*binary.lhs);
+            }
+            if (factor.has_value()) {
+                if (*factor == 0) {
+                    out_ << "  li " << dst << ", 0\n";
+                    return true;
+                }
+                if (*factor == 1) {
+                    return true;
+                }
+                if (*factor == -1) {
+                    out_ << "  neg " << dst << ", " << dst << "\n";
+                    return true;
+                }
+                if (*factor > 0 && (*factor & (*factor - 1)) == 0) {
+                    out_ << "  slli " << dst << ", " << dst << ", " << trailingZeroBits(*factor) << "\n";
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool emitSelfRegisterUpdate(const std::string& name, const BinaryExpr& binary, const char* dst)
+    {
+        if ((binary.op == BinaryOp::Add || binary.op == BinaryOp::Sub) && isName(*binary.lhs, name) && isSimpleValue(*binary.rhs)) {
+            emitSimpleToRegister(*binary.rhs, "t0");
+            out_ << "  " << (binary.op == BinaryOp::Add ? "add" : "sub") << " " << dst << ", " << dst << ", t0\n";
+            return true;
+        }
+        if (binary.op == BinaryOp::Add && isName(*binary.rhs, name) && isSimpleValue(*binary.lhs)) {
+            emitSimpleToRegister(*binary.lhs, "t0");
+            out_ << "  add " << dst << ", " << dst << ", t0\n";
+            return true;
+        }
+        return false;
+    }
+
+    bool isName(const Expr& expr, const std::string& name) const
+    {
+        const auto* nameExpr = dynamic_cast<const NameExpr*>(&expr);
+        return nameExpr != nullptr && nameExpr->name == name;
     }
 
     std::string copySourceName(const Expr& expr) const
@@ -1203,6 +1746,12 @@ private:
                 out_ << "  li a0, 0\n";
                 return true;
             }
+            if (rhsConst.has_value() && emitMulByConstant(*binary.lhs, *rhsConst)) {
+                return true;
+            }
+            if (lhsConst.has_value() && emitMulByConstant(*binary.rhs, *lhsConst)) {
+                return true;
+            }
             if (rhsConst.has_value() && *rhsConst > 0 && (*rhsConst & (*rhsConst - 1)) == 0) {
                 emitExpr(*binary.lhs);
                 out_ << "  slli a0, a0, " << trailingZeroBits(*rhsConst) << "\n";
@@ -1296,6 +1845,44 @@ private:
         return false;
     }
 
+    bool emitMulByConstant(const Expr& expr, std::int32_t constant)
+    {
+        if (constant == 0 || constant == 1 || constant == -1 || constant == std::numeric_limits<std::int32_t>::min()) {
+            return false;
+        }
+
+        std::uint32_t magnitude = constant < 0 ? static_cast<std::uint32_t>(-constant) : static_cast<std::uint32_t>(constant);
+        int bits[32];
+        int bitCount = 0;
+        for (int bit = 0; bit < 31; ++bit) {
+            if ((magnitude & (static_cast<std::uint32_t>(1) << bit)) != 0) {
+                bits[bitCount++] = bit;
+            }
+        }
+        if (bitCount <= 1 || bitCount > 3) {
+            return false;
+        }
+
+        emitExpr(expr);
+        out_ << "  mv t0, a0\n";
+        for (int i = 0; i < bitCount; ++i) {
+            const int bit = bits[i];
+            const char* target = i == 0 ? "a0" : "t1";
+            if (bit == 0) {
+                out_ << "  mv " << target << ", t0\n";
+            } else {
+                out_ << "  slli " << target << ", t0, " << bit << "\n";
+            }
+            if (i > 0) {
+                out_ << "  add a0, a0, t1\n";
+            }
+        }
+        if (constant < 0) {
+            out_ << "  neg a0, a0\n";
+        }
+        return true;
+    }
+
     int trailingZeroBits(std::int32_t value) const
     {
         int count = 0;
@@ -1376,7 +1963,7 @@ private:
         }
         if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
             const Symbol& symbol = lookup(name->name);
-            if (symbol.hasConstValue && (!symbol.isGlobal || symbol.isConst)) {
+            if (symbol.hasConstValue) {
                 return symbol.constValue;
             }
             if (symbol.hasCopy) {
@@ -1395,6 +1982,7 @@ private:
     std::ostream& out_;
     CodegenOptions options_;
     std::unordered_map<std::string, Symbol> globalSymbols_;
+    std::unordered_map<std::string, bool> globalAssigned_;
     std::vector<std::unordered_map<std::string, Symbol>> localScopes_;
     const FuncDef* currentFunction_ = nullptr;
     FunctionLayout currentLayout_;
