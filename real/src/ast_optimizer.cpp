@@ -1,5 +1,6 @@
 #include "ast_optimizer.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -23,6 +24,12 @@ struct Binding {
     int id = -1;
     bool isConst = false;
     KnownValue known;
+};
+
+struct InlineSummary {
+    std::vector<std::string> params;
+    ExprPtr body;
+    int cost = 0;
 };
 
 ExprPtr intExpr(std::int32_t value)
@@ -82,6 +89,92 @@ bool isPure(const Expr& expr)
 bool isNoOpStmt(const Stmt& stmt)
 {
     return dynamic_cast<const EmptyStmt*>(&stmt) != nullptr;
+}
+
+bool containsCall(const Expr& expr)
+{
+    if (dynamic_cast<const CallExpr*>(&expr) != nullptr) {
+        return true;
+    }
+    if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+        return containsCall(*unary->operand);
+    }
+    if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+        return containsCall(*binary->lhs) || containsCall(*binary->rhs);
+    }
+    return false;
+}
+
+int expressionCost(const Expr& expr)
+{
+    if (dynamic_cast<const IntExpr*>(&expr) != nullptr || dynamic_cast<const NameExpr*>(&expr) != nullptr) {
+        return 1;
+    }
+    if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+        return 1 + expressionCost(*unary->operand);
+    }
+    if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+        return 1 + expressionCost(*binary->lhs) + expressionCost(*binary->rhs);
+    }
+    if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+        int total = 8;
+        for (const ExprPtr& arg : call->args) {
+            total += expressionCost(*arg);
+        }
+        return total;
+    }
+    return 1000;
+}
+
+void countNameUses(const Expr& expr, std::unordered_map<std::string, int>& uses)
+{
+    if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+        ++uses[name->name];
+        return;
+    }
+    if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+        for (const ExprPtr& arg : call->args) {
+            countNameUses(*arg, uses);
+        }
+        return;
+    }
+    if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+        countNameUses(*unary->operand, uses);
+        return;
+    }
+    if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+        countNameUses(*binary->lhs, uses);
+        countNameUses(*binary->rhs, uses);
+    }
+}
+
+ExprPtr substituteExpr(const Expr& expr, const std::unordered_map<std::string, const Expr*>& replacements)
+{
+    if (const auto* intValue = dynamic_cast<const IntExpr*>(&expr)) {
+        return intExpr(intValue->value);
+    }
+    if (const auto* name = dynamic_cast<const NameExpr*>(&expr)) {
+        const auto found = replacements.find(name->name);
+        if (found != replacements.end()) {
+            return cloneExpr(*found->second);
+        }
+        return nameExpr(name->name);
+    }
+    if (const auto* call = dynamic_cast<const CallExpr*>(&expr)) {
+        std::vector<ExprPtr> args;
+        args.reserve(call->args.size());
+        for (const ExprPtr& arg : call->args) {
+            args.push_back(substituteExpr(*arg, replacements));
+        }
+        return std::make_unique<CallExpr>(call->callee, std::move(args));
+    }
+    if (const auto* unary = dynamic_cast<const UnaryExpr*>(&expr)) {
+        return std::make_unique<UnaryExpr>(unary->op, substituteExpr(*unary->operand, replacements));
+    }
+    if (const auto* binary = dynamic_cast<const BinaryExpr*>(&expr)) {
+        return std::make_unique<BinaryExpr>(binary->op, substituteExpr(*binary->lhs, replacements), substituteExpr(*binary->rhs, replacements));
+    }
+    return intExpr(0);
 }
 
 bool sameExpr(const Expr& lhs, const Expr& rhs)
@@ -307,7 +400,9 @@ public:
             if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
                 result.items.push_back(std::make_unique<TopDecl>(optimizeGlobalDecl(*declItem->decl)));
             } else if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
-                result.items.push_back(std::make_unique<TopFunc>(optimizeFunction(*funcItem->func)));
+                FuncPtr optimized = optimizeFunction(*funcItem->func);
+                recordInlineSummary(*optimized);
+                result.items.push_back(std::make_unique<TopFunc>(std::move(optimized)));
             }
         }
         return result;
@@ -421,6 +516,79 @@ private:
             return std::make_unique<VarDecl>(decl.isConst, decl.name, intExpr(found->second));
         }
         return cloneDecl(decl);
+    }
+
+    void recordInlineSummary(const FuncDef& func)
+    {
+        if (func.returnType != Type::Int) {
+            return;
+        }
+        if (func.body->statements.size() != 1) {
+            return;
+        }
+        const auto* ret = dynamic_cast<const ReturnStmt*>(func.body->statements.front().get());
+        if (ret == nullptr || ret->value == nullptr) {
+            return;
+        }
+        if (!isPure(*ret->value) || containsCall(*ret->value)) {
+            return;
+        }
+
+        const int cost = expressionCost(*ret->value);
+        if (cost > 48) {
+            return;
+        }
+
+        InlineSummary summary;
+        summary.params.reserve(func.params.size());
+        std::unordered_set<std::string> paramNames;
+        for (const Param& param : func.params) {
+            summary.params.push_back(param.name);
+            paramNames.insert(param.name);
+        }
+
+        std::unordered_map<std::string, int> nameUses;
+        countNameUses(*ret->value, nameUses);
+        for (const auto& [name, count] : nameUses) {
+            (void)count;
+            if (!paramNames.contains(name)) {
+                return;
+            }
+        }
+        summary.body = cloneExpr(*ret->value);
+        summary.cost = cost;
+        inlineSummaries_.insert_or_assign(func.name, std::move(summary));
+    }
+
+    bool canInline(const CallExpr& call, const std::vector<ExprPtr>& args) const
+    {
+        const auto found = inlineSummaries_.find(call.callee);
+        if (found == inlineSummaries_.end()) {
+            return false;
+        }
+        const InlineSummary& summary = found->second;
+        if (summary.params.size() != args.size()) {
+            return false;
+        }
+        int argCost = 0;
+        for (const ExprPtr& arg : args) {
+            if (!isPure(*arg) || containsCall(*arg)) {
+                return false;
+            }
+            argCost += expressionCost(*arg);
+        }
+
+        std::unordered_map<std::string, int> uses;
+        countNameUses(*summary.body, uses);
+        int duplicatedArgCost = 0;
+        for (std::size_t i = 0; i < summary.params.size(); ++i) {
+            const int useCount = uses[summary.params[i]];
+            if (useCount > 1) {
+                duplicatedArgCost += (useCount - 1) * expressionCost(*args[i]);
+            }
+        }
+
+        return summary.cost + argCost + duplicatedArgCost <= 96;
     }
 
     FuncPtr optimizeFunction(const FuncDef& func)
@@ -586,6 +754,16 @@ private:
             args.reserve(call->args.size());
             for (const ExprPtr& arg : call->args) {
                 args.push_back(optimizeExpr(*arg));
+            }
+            if (canInline(*call, args)) {
+                const InlineSummary& summary = inlineSummaries_.at(call->callee);
+                std::unordered_map<std::string, const Expr*> replacements;
+                replacements.reserve(summary.params.size());
+                for (std::size_t i = 0; i < summary.params.size(); ++i) {
+                    replacements.emplace(summary.params[i], args[i].get());
+                }
+                ExprPtr inlined = substituteExpr(*summary.body, replacements);
+                return optimizeExpr(*inlined);
             }
             return std::make_unique<CallExpr>(call->callee, std::move(args));
         }
@@ -853,6 +1031,7 @@ private:
 
     std::unordered_map<std::string, std::int32_t> globalInitializers_;
     std::unordered_map<std::string, std::int32_t> globalValues_;
+    std::unordered_map<std::string, InlineSummary> inlineSummaries_;
     std::vector<std::unordered_map<std::string, Binding>> scopes_;
     int nextBindingId_ = 0;
 };
