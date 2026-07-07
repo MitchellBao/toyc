@@ -150,6 +150,31 @@ private:
             usedSavedRegs_.push_back(i);
         }
 
+        std::vector<std::pair<int, int>> hotValues;
+        hotValues.reserve(valueUseCounts_.size());
+        for (const auto& [value, count] : valueUseCounts_) {
+            if (count > 1) {
+                hotValues.push_back({value, count});
+            }
+        }
+        std::sort(hotValues.begin(), hotValues.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first;
+        });
+
+        int nextValueReg = regBudget;
+        for (const auto& [value, count] : hotValues) {
+            (void)count;
+            if (nextValueReg >= 11) {
+                break;
+            }
+            valueRegs_[value] = nextValueReg;
+            usedSavedRegs_.push_back(nextValueReg);
+            ++nextValueReg;
+        }
+
         savedAreaBytes_ = 4; // s0
         if (savesRa_) {
             savedAreaBytes_ += 4;
@@ -167,6 +192,9 @@ private:
 
         valueOffsets_.assign(static_cast<std::size_t>(maxValue + 1), 0);
         for (int value = 0; value <= maxValue; ++value) {
+            if (valueRegs_.contains(value)) {
+                continue;
+            }
             ++localStackSlots;
             valueOffsets_[static_cast<std::size_t>(value)] = -(savedAreaBytes_ + 4 * localStackSlots);
         }
@@ -249,6 +277,7 @@ private:
 
     void emitInstruction(const ir::Instruction& inst)
     {
+        validateInstruction(inst);
         switch (inst.kind) {
         case ir::InstructionKind::Const:
             aliasImmediate(inst.dst, inst.operands.at(0).immediate);
@@ -285,6 +314,24 @@ private:
             emitCall(inst);
             storeValue(inst.dst, "a0");
             break;
+        }
+    }
+
+    void validateInstruction(const ir::Instruction& inst) const
+    {
+        const bool needsOne = inst.kind == ir::InstructionKind::Const
+            || inst.kind == ir::InstructionKind::Copy
+            || inst.kind == ir::InstructionKind::Unary
+            || inst.kind == ir::InstructionKind::StoreGlobal
+            || inst.kind == ir::InstructionKind::StoreLocal;
+        if (needsOne && inst.operands.empty()) {
+            throw IrCodegenError(std::string("IR instruction missing operand: ")
+                + ir::instructionKindName(inst.kind)
+                + " "
+                + inst.symbol);
+        }
+        if (inst.kind == ir::InstructionKind::Binary && inst.operands.size() < 2) {
+            throw IrCodegenError("IR binary instruction missing operand");
         }
     }
 
@@ -487,6 +534,15 @@ private:
         if (value.id < 0 || value.id >= static_cast<int>(valueOffsets_.size())) {
             throw IrCodegenError("invalid IR value");
         }
+        const auto valueReg = valueRegs_.find(value.id);
+        if (valueReg != valueRegs_.end()) {
+            const std::string source = savedRegName(valueReg->second);
+            if (source != reg) {
+                clobberRegisterAliases(reg);
+                out_ << "  mv " << reg << ", " << source << "\n";
+            }
+            return;
+        }
         if (depth < 16) {
             const auto alias = valueAliases_.find(value.id);
             if (alias != valueAliases_.end()) {
@@ -507,6 +563,12 @@ private:
             throw IrCodegenError("invalid IR destination");
         }
         if (valueUseCount(value) == 0) {
+            return;
+        }
+        const auto valueReg = valueRegs_.find(value.id);
+        if (valueReg != valueRegs_.end()) {
+            valueAliases_.erase(value.id);
+            out_ << "  mv " << savedRegName(valueReg->second) << ", " << reg << "\n";
             return;
         }
         if (valueUseCount(value) == 1) {
@@ -654,6 +716,7 @@ private:
     std::vector<int> valueOffsets_;
     std::unordered_map<int, int> valueUseCounts_;
     std::unordered_map<int, int> remainingValueUses_;
+    std::unordered_map<int, int> valueRegs_;
     std::unordered_map<int, ValueAlias> valueAliases_;
     std::vector<int> usedSavedRegs_;
     std::unordered_map<int, int> savedRegOffsets_;

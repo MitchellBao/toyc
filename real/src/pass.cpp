@@ -23,11 +23,21 @@ PassManager buildDefaultPassPipeline(bool optimize)
 {
     PassManager manager;
     if (optimize) {
+        manager.add(createTailRecursionPass());
+        manager.add(createLocalValuePropagationPass());
         manager.add(createLocalSimplifyPass());
         manager.add(createLocalCsePass());
+        manager.add(createLoopInvariantCodeMotionPass());
         manager.add(createDeadInstructionPass());
+        manager.add(createDeadStorePass());
+        manager.add(createLocalValuePropagationPass());
         manager.add(createLocalSimplifyPass());
         manager.add(createLocalCsePass());
+        manager.add(createLoopInvariantCodeMotionPass());
+        manager.add(createDeadInstructionPass());
+        manager.add(createDeadStorePass());
+        manager.add(createLocalValuePropagationPass());
+        manager.add(createLocalSimplifyPass());
         manager.add(createDeadInstructionPass());
     }
     return manager;

@@ -11,9 +11,11 @@ SOURCES := \
 	real/src/ir.cpp \
 	real/src/ir_builder.cpp \
 	real/src/pass.cpp \
-	real/src/pass_simplify.cpp \
-	real/src/pass_cse.cpp \
-	real/src/pass_dce.cpp \
+    real/src/pass_simplify.cpp \
+    real/src/pass_cse.cpp \
+    real/src/pass_local.cpp \
+    real/src/pass_loop.cpp \
+    real/src/pass_dce.cpp \
 	real/src/ir_codegen.cpp \
 	real/src/codegen.cpp
 

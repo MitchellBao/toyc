@@ -27,6 +27,10 @@ private:
 std::unique_ptr<IrPass> createLocalSimplifyPass();
 std::unique_ptr<IrPass> createLocalCsePass();
 std::unique_ptr<IrPass> createDeadInstructionPass();
+std::unique_ptr<IrPass> createDeadStorePass();
+std::unique_ptr<IrPass> createLocalValuePropagationPass();
+std::unique_ptr<IrPass> createLoopInvariantCodeMotionPass();
+std::unique_ptr<IrPass> createTailRecursionPass();
 
 PassManager buildDefaultPassPipeline(bool optimize);
 
