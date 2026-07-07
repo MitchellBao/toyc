@@ -367,6 +367,54 @@ function Assert-NoBranchOverJumpToNextLabel {
     }
 }
 
+function Get-HottestLoopBody {
+    param(
+        [string]$Asm
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    $bestBody = @()
+    for ($i = 0; $i -lt $lines.Count; ++$i) {
+        if ($lines[$i] -notmatch '^(\.L_\S+):$') {
+            continue
+        }
+        $label = $Matches[1]
+        for ($j = $i + 1; $j -lt $lines.Count; ++$j) {
+            if ($lines[$j] -match '^j\s+' + [regex]::Escape($label) + '$') {
+                $body = @($lines[($i + 1)..$j] | Where-Object { $_ -notmatch '^(\.L_\S+):$' -and $_ -notmatch '^\.' })
+                if ($body.Count -gt $bestBody.Count) {
+                    $bestBody = $body
+                }
+                break
+            }
+            if ($lines[$j] -match '^\S+:$' -and $lines[$j] -notmatch '^\.L_') {
+                break
+            }
+        }
+    }
+    return $bestBody
+}
+
+function Assert-LoopOpcodeAtMost {
+    param(
+        [string]$Name,
+        [string]$Asm,
+        [string]$Opcode,
+        [int]$MaxCount
+    )
+
+    $body = @(Get-HottestLoopBody $Asm)
+    $count = 0
+    foreach ($line in $body) {
+        if ($line -match "^\s*$([regex]::Escape($Opcode))(\s|$)") {
+            ++$count
+        }
+    }
+    if ($count -gt $MaxCount) {
+        throw "$Name loop body has $count $Opcode instructions, expected at most $MaxCount"
+    }
+}
+
 Assert-BackendsAgree "backend_simple_call_args" @'
 int add(int a, int b) {
     return a + b;
@@ -444,6 +492,19 @@ int main() {
 }
 '@ -Optimize
 Assert-NoBranchOverJumpToNextLabel "backend_branch_peephole" $branchPeepholeAsm
+
+$loopRegisterAsm = Compile-Source "backend_loop_registers" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000000) {
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+'@ -Optimize
+Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "mv" 2
 
 $smallCallAsm = Compile-Source "backend_small_call_traffic" @'
 int add(int a, int b) {

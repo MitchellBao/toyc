@@ -110,6 +110,51 @@ bool parseLi(const std::string& line, std::string& reg, std::string& imm)
     return parseRegisterPair(line, "li", reg, imm);
 }
 
+bool parseThreeRegister(const std::string& line, const std::string& opcode, std::string& dst, std::string& lhs, std::string& rhs)
+{
+    const std::string prefix = opcode + " ";
+    if (!startsWith(line, prefix)) {
+        return false;
+    }
+    const std::size_t firstComma = line.find(',', prefix.size());
+    if (firstComma == std::string::npos) {
+        return false;
+    }
+    const std::size_t secondComma = line.find(',', firstComma + 1);
+    if (secondComma == std::string::npos) {
+        return false;
+    }
+    dst = trim(line.substr(prefix.size(), firstComma - prefix.size()));
+    lhs = trim(line.substr(firstComma + 1, secondComma - firstComma - 1));
+    rhs = trim(line.substr(secondComma + 1));
+    return !dst.empty() && !lhs.empty() && !rhs.empty();
+}
+
+bool parseImmediateBinary(const std::string& line, const std::string& opcode, std::string& dst, std::string& src, std::string& imm)
+{
+    const std::string prefix = opcode + " ";
+    if (!startsWith(line, prefix)) {
+        return false;
+    }
+    const std::size_t firstComma = line.find(',', prefix.size());
+    if (firstComma == std::string::npos) {
+        return false;
+    }
+    const std::size_t secondComma = line.find(',', firstComma + 1);
+    if (secondComma == std::string::npos) {
+        return false;
+    }
+    dst = trim(line.substr(prefix.size(), firstComma - prefix.size()));
+    src = trim(line.substr(firstComma + 1, secondComma - firstComma - 1));
+    imm = trim(line.substr(secondComma + 1));
+    return !dst.empty() && !src.empty() && !imm.empty();
+}
+
+bool parseStoreWord(const std::string& line, std::string& src, std::string& address)
+{
+    return parseRegisterPair(line, "sw", src, address);
+}
+
 bool parseBranchZero(const std::string& line, std::string& opcode, std::string& reg, std::string& label)
 {
     if (!startsWith(line, "beqz ") && !startsWith(line, "bnez ")) {
@@ -124,6 +169,66 @@ bool parseBranchZero(const std::string& line, std::string& opcode, std::string& 
     reg = trim(line.substr(space + 1, comma - space - 1));
     label = trim(line.substr(comma + 1));
     return !reg.empty() && !label.empty();
+}
+
+bool parseRegisterBranch(const std::string& line, std::string& opcode, std::string& lhs, std::string& rhs, std::string& label)
+{
+    if (!startsWith(line, "blt ") && !startsWith(line, "bge ") && !startsWith(line, "beq ") && !startsWith(line, "bne ")) {
+        return false;
+    }
+    const std::size_t space = line.find(' ');
+    const std::size_t firstComma = line.find(',', space + 1);
+    if (space == std::string::npos || firstComma == std::string::npos) {
+        return false;
+    }
+    const std::size_t secondComma = line.find(',', firstComma + 1);
+    if (secondComma == std::string::npos) {
+        return false;
+    }
+    opcode = line.substr(0, space);
+    lhs = trim(line.substr(space + 1, firstComma - space - 1));
+    rhs = trim(line.substr(firstComma + 1, secondComma - firstComma - 1));
+    label = trim(line.substr(secondComma + 1));
+    return !lhs.empty() && !rhs.empty() && !label.empty();
+}
+
+std::string invertRegisterBranch(const std::string& opcode)
+{
+    if (opcode == "blt") {
+        return "bge";
+    }
+    if (opcode == "bge") {
+        return "blt";
+    }
+    if (opcode == "beq") {
+        return "bne";
+    }
+    if (opcode == "bne") {
+        return "beq";
+    }
+    return {};
+}
+
+bool isSavedRegister(const std::string& reg)
+{
+    if (reg.size() < 2 || reg[0] != 's') {
+        return false;
+    }
+    if (reg == "s0") {
+        return false;
+    }
+    for (std::size_t i = 1; i < reg.size(); ++i) {
+        if (reg[i] < '0' || reg[i] > '9') {
+            return false;
+        }
+    }
+    const int index = std::stoi(reg.substr(1));
+    return index >= 1 && index <= 11;
+}
+
+bool isFoldableSourceRegister(const std::string& reg)
+{
+    return isSavedRegister(reg) || reg == "zero";
 }
 
 std::vector<std::string> splitLines(const std::string& text)
@@ -208,10 +313,142 @@ std::string peepholeRiscV(const std::string& assembly)
     output.reserve(kept.size());
     for (std::size_t i = 0; i < kept.size(); ++i) {
         const std::string line = trim(kept[i]);
+
+        std::string moveDst;
+        std::string moveSrc;
+        std::string secondMoveDst;
+        std::string secondMoveSrc;
+        std::string opDst;
+        std::string opLhs;
+        std::string opRhs;
+        bool foldedRegisterBinary = false;
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 3 < kept.size()
+            && moveDst == "t0" && isFoldableSourceRegister(moveSrc)
+            && parseRegisterPair(trim(kept[i + 1]), "mv", secondMoveDst, secondMoveSrc)
+            && secondMoveDst == "a0" && isFoldableSourceRegister(secondMoveSrc)) {
+            static const char* ops[] = {"add", "sub", "mul", "div", "rem", "and", "or"};
+            for (const char* op : ops) {
+                std::string resultDst;
+                std::string resultSrc;
+                if (parseThreeRegister(trim(kept[i + 2]), op, opDst, opLhs, opRhs)
+                    && opDst == "a0" && opLhs == "t0" && opRhs == "a0"
+                    && parseRegisterPair(trim(kept[i + 3]), "mv", resultDst, resultSrc)
+                    && resultSrc == "a0" && isSavedRegister(resultDst)) {
+                    output.push_back("  " + std::string(op) + " " + resultDst + ", " + moveSrc + ", " + secondMoveSrc);
+                    i += 3;
+                    foldedRegisterBinary = true;
+                    break;
+                }
+            }
+            if (foldedRegisterBinary) {
+                continue;
+            }
+        }
+
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 6 < kept.size()
+            && moveDst == "t0" && isSavedRegister(moveSrc)
+            && parseRegisterPair(trim(kept[i + 1]), "mv", secondMoveDst, secondMoveSrc)
+            && secondMoveDst == "a0" && isFoldableSourceRegister(secondMoveSrc)
+            && parseThreeRegister(trim(kept[i + 2]), "add", opDst, opLhs, opRhs)
+            && opDst == "a0" && opLhs == "t0" && opRhs == "a0") {
+            std::string middleMoveDst;
+            std::string middleMoveSrc;
+            std::string thirdMoveDst;
+            std::string thirdMoveSrc;
+            std::string resultDst;
+            std::string resultSrc;
+            if (parseRegisterPair(trim(kept[i + 3]), "mv", middleMoveDst, middleMoveSrc)
+                && middleMoveDst == "t0" && middleMoveSrc == "a0"
+                && parseRegisterPair(trim(kept[i + 4]), "mv", thirdMoveDst, thirdMoveSrc)
+                && thirdMoveDst == "a0" && isFoldableSourceRegister(thirdMoveSrc)
+                && parseThreeRegister(trim(kept[i + 5]), "add", opDst, opLhs, opRhs)
+                && opDst == "a0" && opLhs == "t0" && opRhs == "a0"
+                && parseRegisterPair(trim(kept[i + 6]), "mv", resultDst, resultSrc)
+                && resultSrc == "a0" && isSavedRegister(resultDst)) {
+                output.push_back("  add " + resultDst + ", " + moveSrc + ", " + secondMoveSrc);
+                output.push_back("  add " + resultDst + ", " + resultDst + ", " + thirdMoveSrc);
+                i += 6;
+                continue;
+            }
+        }
+
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 2 < kept.size()
+            && moveDst == "t0" && isFoldableSourceRegister(moveSrc)
+            && parseImmediateBinary(trim(kept[i + 1]), "addi", opDst, opLhs, opRhs)
+            && opDst == "a0" && opLhs == "t0"
+            && parseRegisterPair(trim(kept[i + 2]), "mv", secondMoveDst, secondMoveSrc)
+            && secondMoveSrc == "a0" && isSavedRegister(secondMoveDst)) {
+            output.push_back("  addi " + secondMoveDst + ", " + moveSrc + ", " + opRhs);
+            i += 2;
+            continue;
+        }
+
+        if (parseLi(line, moveDst, moveSrc) && i + 1 < kept.size()
+            && moveDst == "a0"
+            && parseRegisterPair(trim(kept[i + 1]), "mv", secondMoveDst, secondMoveSrc)
+            && secondMoveSrc == "a0" && isSavedRegister(secondMoveDst)) {
+            output.push_back("  li " + secondMoveDst + ", " + moveSrc);
+            ++i;
+            continue;
+        }
+
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 1 < kept.size()
+            && moveDst == "a0" && isFoldableSourceRegister(moveSrc)) {
+            std::string storeSrc;
+            std::string storeAddress;
+            if (parseStoreWord(trim(kept[i + 1]), storeSrc, storeAddress) && storeSrc == "a0") {
+                output.push_back("  sw " + moveSrc + ", " + storeAddress);
+                ++i;
+                continue;
+            }
+        }
+
+        std::string immReg;
+        std::string immValue;
         std::string branchOpcode;
         std::string branchReg;
         std::string branchTarget;
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 3 < kept.size()
+            && moveDst == "t0" && isFoldableSourceRegister(moveSrc)
+            && parseLi(trim(kept[i + 1]), immReg, immValue) && immReg == "a0"
+            && parseThreeRegister(trim(kept[i + 2]), "slt", opDst, opLhs, opRhs)
+            && opDst == "a0" && opLhs == "t0" && opRhs == "a0"
+            && parseBranchZero(trim(kept[i + 3]), branchOpcode, branchReg, branchTarget)
+            && branchReg == "a0") {
+            output.push_back("  li a0, " + immValue);
+            output.push_back("  " + std::string(branchOpcode == "beqz" ? "bge" : "blt") + " " + moveSrc + ", a0, " + branchTarget);
+            i += 3;
+            continue;
+        }
+
+        if (parseRegisterPair(line, "mv", moveDst, moveSrc) && i + 2 < kept.size()
+            && moveDst == "t0" && isFoldableSourceRegister(moveSrc)
+            && parseImmediateBinary(trim(kept[i + 1]), "slti", opDst, opLhs, opRhs)
+            && opDst == "a0" && opLhs == "t0"
+            && parseBranchZero(trim(kept[i + 2]), branchOpcode, branchReg, branchTarget)
+            && branchReg == "a0") {
+            output.push_back("  li a0, " + opRhs);
+            output.push_back("  " + std::string(branchOpcode == "beqz" ? "bge" : "blt") + " " + moveSrc + ", a0, " + branchTarget);
+            i += 2;
+            continue;
+        }
+
         std::string jumpTarget;
+        std::string registerBranchOpcode;
+        std::string registerBranchLhs;
+        std::string registerBranchRhs;
+        std::string registerBranchTarget;
+        if (parseRegisterBranch(line, registerBranchOpcode, registerBranchLhs, registerBranchRhs, registerBranchTarget) && i + 2 < kept.size()
+            && parseJump(trim(kept[i + 1]), jumpTarget)
+            && trim(kept[i + 2]) == registerBranchTarget + ":") {
+            const std::string inverted = invertRegisterBranch(registerBranchOpcode);
+            if (!inverted.empty()) {
+                output.push_back("  " + inverted + " " + registerBranchLhs + ", " + registerBranchRhs + ", " + jumpTarget);
+                ++i;
+                continue;
+            }
+        }
+
         if (parseBranchZero(line, branchOpcode, branchReg, branchTarget) && i + 2 < kept.size()
             && parseJump(trim(kept[i + 1]), jumpTarget)
             && trim(kept[i + 2]) == branchTarget + ":") {

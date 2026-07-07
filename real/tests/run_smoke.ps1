@@ -91,7 +91,7 @@ int main() {
 '@
 $optOutput = Join-Path $Root "optimized_loop.s"
 $optAsm = Compile-Source "optimized_loop" $optimizedLoop $optOutput -Optimize
-if (-not ($optAsm.Contains("beqz") -or $optAsm.Contains("bnez"))) {
+if (-not ($optAsm.Contains("beqz") -or $optAsm.Contains("bnez") -or $optAsm.Contains("blt") -or $optAsm.Contains("bge"))) {
     throw "optimized loop condition was incorrectly folded away"
 }
 

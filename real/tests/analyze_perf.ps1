@@ -60,6 +60,28 @@ int main() {
 '@
     },
     @{
+        Name = "perf_p08_like"
+        Source = @'
+int global = 3;
+int id(int x) {
+    return x;
+}
+int main() {
+    int i = 0;
+    int a = id(7);
+    int b = id(9);
+    int s = 0;
+    while (i < 1000000) {
+        int t = a * b + a * b;
+        int dead = t * 0;
+        s = s + t + i + dead + global * 0;
+        i = i + 1;
+    }
+    return s;
+}
+'@
+    },
+    @{
         Name = "perf_tail_recursion"
         Source = @'
 int sum(int n, int acc) {
@@ -155,12 +177,63 @@ function Measure-Assembly {
     [pscustomobject]$row
 }
 
+function Measure-LoopBody {
+    param(
+        [string]$Name,
+        [string]$Mode,
+        [string]$Asm
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    $bestBody = @()
+    for ($i = 0; $i -lt $lines.Count; ++$i) {
+        if ($lines[$i] -notmatch '^(\.L_\S+):$') {
+            continue
+        }
+        $label = $Matches[1]
+        for ($j = $i + 1; $j -lt $lines.Count; ++$j) {
+            if ($lines[$j] -match '^j\s+' + [regex]::Escape($label) + '$') {
+                $body = @($lines[($i + 1)..$j] | Where-Object { $_ -notmatch '^(\.L_\S+):$' -and $_ -notmatch '^\.' })
+                if ($body.Count -gt $bestBody.Count) {
+                    $bestBody = $body
+                }
+                break
+            }
+            if ($lines[$j] -match '^\S+:$' -and $lines[$j] -notmatch '^\.L_') {
+                break
+            }
+        }
+    }
+
+    $row = [ordered]@{
+        Sample = $Name
+        Mode = $Mode
+        LoopBodyLines = $bestBody.Count
+    }
+    foreach ($opcode in $opcodes) {
+        $count = 0
+        foreach ($line in $bestBody) {
+            if ($line -match "^\s*$([regex]::Escape($opcode))(\s|$)") {
+                ++$count
+            }
+        }
+        $row["loop_$opcode"] = $count
+    }
+    [pscustomobject]$row
+}
+
 $results = @()
+$loopResults = @()
 foreach ($sample in $samples) {
     $plainAsm = Compile-Mode $sample.Name $sample.Source
     $optAsm = Compile-Mode $sample.Name $sample.Source -Optimize
     $results += Measure-Assembly $sample.Name "plain" $plainAsm
     $results += Measure-Assembly $sample.Name "opt" $optAsm
+    $loopResults += Measure-LoopBody $sample.Name "plain" $plainAsm
+    $loopResults += Measure-LoopBody $sample.Name "opt" $optAsm
 }
 
+Write-Output "assembly totals"
 $results | ConvertTo-Csv -NoTypeInformation
+Write-Output "loop body totals"
+$loopResults | ConvertTo-Csv -NoTypeInformation
