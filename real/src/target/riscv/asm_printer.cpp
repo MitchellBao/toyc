@@ -38,6 +38,20 @@ bool fitsI12(std::int32_t value)
     return value >= -2048 && value <= 2047;
 }
 
+bool isPositivePowerOfTwo(std::int32_t value)
+{
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+int log2PowerOfTwo(std::int32_t value)
+{
+    int shift = 0;
+    while ((std::int32_t{1} << shift) != value) {
+        ++shift;
+    }
+    return shift;
+}
+
 bool definesValue(const ir::Instruction& inst)
 {
     return inst.dst.id >= 0
@@ -469,6 +483,10 @@ private:
 
     void emitBinary(const ir::Instruction& inst)
     {
+        if (emitBinaryWithImmediate(inst)) {
+            return;
+        }
+
         const std::string dstReg = writeReg(inst.dst, "t0");
         const std::string lhsReg = readOperand(inst.operands[0], "t0");
         const std::string rhsReg = readOperand(inst.operands[1], lhsReg == "t1" ? "t2" : "t1");
@@ -521,6 +539,181 @@ private:
             break;
         }
         storeValue(inst.dst, dstReg);
+    }
+
+    bool emitBinaryWithImmediate(const ir::Instruction& inst)
+    {
+        if (inst.operands.size() != 2) {
+            return false;
+        }
+
+        const ir::Operand& lhs = inst.operands[0];
+        const ir::Operand& rhs = inst.operands[1];
+        const bool lhsImm = lhs.isImmediate;
+        const bool rhsImm = rhs.isImmediate;
+        if (!lhsImm && !rhsImm) {
+            return false;
+        }
+
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        auto loadNonImmediate = [&](const ir::Operand& operand, const std::string& fallback) {
+            return readOperand(operand, fallback);
+        };
+        auto finish = [&]() {
+            storeValue(inst.dst, dstReg);
+            return true;
+        };
+
+        if (rhsImm && !lhsImm) {
+            const std::int32_t value = rhs.immediate;
+            switch (inst.binaryOp) {
+            case ir::BinaryOpcode::Add:
+                if (fitsI12(value)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  addi " << dstReg << ", " << src << ", " << value << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Sub:
+                {
+                const long long negated = -static_cast<long long>(value);
+                if (negated >= -2048 && negated <= 2047) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  addi " << dstReg << ", " << src << ", " << negated << "\n";
+                    return finish();
+                }
+                return false;
+                }
+            case ir::BinaryOpcode::Mul:
+                if (value == 0) {
+                    out_ << "  li " << dstReg << ", 0\n";
+                    return finish();
+                }
+                if (value == 1) {
+                    loadOperand(lhs, dstReg);
+                    return finish();
+                }
+                if (value == -1) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  neg " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                if (isPositivePowerOfTwo(value)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  slli " << dstReg << ", " << src << ", " << log2PowerOfTwo(value) << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Equal:
+                if (value == 0) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  seqz " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::NotEqual:
+                if (value == 0) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  snez " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Less:
+                if (fitsI12(value)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  slti " << dstReg << ", " << src << ", " << value << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::LessEqual:
+                if (value < 2147483647 && fitsI12(value + 1)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  slti " << dstReg << ", " << src << ", " << (value + 1) << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Greater:
+                if (value < 2147483647 && fitsI12(value + 1)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  slti " << dstReg << ", " << src << ", " << (value + 1) << "\n";
+                    out_ << "  xori " << dstReg << ", " << dstReg << ", 1\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::GreaterEqual:
+                if (fitsI12(value)) {
+                    const std::string src = loadNonImmediate(lhs, dstReg);
+                    out_ << "  slti " << dstReg << ", " << src << ", " << value << "\n";
+                    out_ << "  xori " << dstReg << ", " << dstReg << ", 1\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Div:
+            case ir::BinaryOpcode::Mod:
+            case ir::BinaryOpcode::LogicalAnd:
+            case ir::BinaryOpcode::LogicalOr:
+                return false;
+            }
+        }
+
+        if (lhsImm && !rhsImm) {
+            const std::int32_t value = lhs.immediate;
+            switch (inst.binaryOp) {
+            case ir::BinaryOpcode::Add:
+                if (fitsI12(value)) {
+                    const std::string src = loadNonImmediate(rhs, dstReg);
+                    out_ << "  addi " << dstReg << ", " << src << ", " << value << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Mul:
+                if (value == 0) {
+                    out_ << "  li " << dstReg << ", 0\n";
+                    return finish();
+                }
+                if (value == 1) {
+                    loadOperand(rhs, dstReg);
+                    return finish();
+                }
+                if (value == -1) {
+                    const std::string src = loadNonImmediate(rhs, dstReg);
+                    out_ << "  neg " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                if (isPositivePowerOfTwo(value)) {
+                    const std::string src = loadNonImmediate(rhs, dstReg);
+                    out_ << "  slli " << dstReg << ", " << src << ", " << log2PowerOfTwo(value) << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Equal:
+                if (value == 0) {
+                    const std::string src = loadNonImmediate(rhs, dstReg);
+                    out_ << "  seqz " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::NotEqual:
+                if (value == 0) {
+                    const std::string src = loadNonImmediate(rhs, dstReg);
+                    out_ << "  snez " << dstReg << ", " << src << "\n";
+                    return finish();
+                }
+                return false;
+            case ir::BinaryOpcode::Sub:
+            case ir::BinaryOpcode::Div:
+            case ir::BinaryOpcode::Mod:
+            case ir::BinaryOpcode::Less:
+            case ir::BinaryOpcode::LessEqual:
+            case ir::BinaryOpcode::Greater:
+            case ir::BinaryOpcode::GreaterEqual:
+            case ir::BinaryOpcode::LogicalAnd:
+            case ir::BinaryOpcode::LogicalOr:
+                return false;
+            }
+        }
+
+        return false;
     }
 
     void emitCall(const ir::Instruction& inst)
