@@ -12,7 +12,8 @@ class RegisterAllocator {
 public:
     std::unordered_map<int, std::string> allocate(
         const std::unordered_map<int, analysis::LiveInterval>& intervals,
-        const std::unordered_set<int>& liveAcrossCalls = {}) const;
+        const std::unordered_set<int>& liveAcrossCalls = {},
+        bool mayUseArgumentRegs = false) const;
 };
 
 } // namespace toyc::riscv

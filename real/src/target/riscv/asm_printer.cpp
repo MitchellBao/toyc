@@ -215,7 +215,7 @@ private:
         }
 
         const auto intervals = analysis::computeLocalIntervals(function_);
-        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals));
+        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals), !hasCall);
         collectSavedRegs();
 
         outgoingArgBytes_ = std::max(0, maxCallArgs - 8) * 4;
