@@ -1,6 +1,7 @@
 #include "pass_manager.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -14,6 +15,17 @@ namespace {
 struct LinearValue {
     std::string base;
     std::int32_t offset = 0;
+};
+
+struct Poly {
+    std::int64_t quadratic = 0;
+    std::int64_t linear = 0;
+    std::int64_t constant = 0;
+};
+
+struct PolyValue {
+    std::string base;
+    Poly poly;
 };
 
 std::optional<std::int32_t> evalBinary(ir::BinaryOpcode op, std::int32_t lhs, std::int32_t rhs)
@@ -47,6 +59,200 @@ std::optional<std::int32_t> evalBinary(ir::BinaryOpcode op, std::int32_t lhs, st
         return (lhs != 0 || rhs != 0) ? 1 : 0;
     }
     return std::nullopt;
+}
+
+std::int32_t evalUnary(ir::UnaryOpcode op, std::int32_t value)
+{
+    switch (op) {
+    case ir::UnaryOpcode::Plus:
+        return value;
+    case ir::UnaryOpcode::Minus:
+        return -value;
+    case ir::UnaryOpcode::Not:
+        return value == 0 ? 1 : 0;
+    }
+    return value;
+}
+
+bool isZero(const Poly& poly)
+{
+    return poly.quadratic == 0 && poly.linear == 0 && poly.constant == 0;
+}
+
+bool isConstant(const Poly& poly)
+{
+    return poly.quadratic == 0 && poly.linear == 0;
+}
+
+std::optional<std::int32_t> int32Value(std::int64_t value)
+{
+    if (value < INT32_MIN || value > INT32_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+std::optional<std::int64_t> checkedInt64(__int128 value)
+{
+    if (value < LLONG_MIN || value > LLONG_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<std::int64_t>(value);
+}
+
+std::optional<std::int64_t> checkedAdd(std::int64_t lhs, std::int64_t rhs)
+{
+    return checkedInt64(static_cast<__int128>(lhs) + rhs);
+}
+
+std::optional<std::int64_t> checkedSub(std::int64_t lhs, std::int64_t rhs)
+{
+    return checkedInt64(static_cast<__int128>(lhs) - rhs);
+}
+
+std::optional<std::int64_t> checkedMul(std::int64_t lhs, std::int64_t rhs)
+{
+    return checkedInt64(static_cast<__int128>(lhs) * rhs);
+}
+
+std::optional<Poly> addPoly(const Poly& lhs, const Poly& rhs)
+{
+    const auto quadratic = checkedAdd(lhs.quadratic, rhs.quadratic);
+    const auto linear = checkedAdd(lhs.linear, rhs.linear);
+    const auto constant = checkedAdd(lhs.constant, rhs.constant);
+    if (!quadratic.has_value() || !linear.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    return Poly{*quadratic, *linear, *constant};
+}
+
+std::optional<Poly> subPoly(const Poly& lhs, const Poly& rhs)
+{
+    const auto quadratic = checkedSub(lhs.quadratic, rhs.quadratic);
+    const auto linear = checkedSub(lhs.linear, rhs.linear);
+    const auto constant = checkedSub(lhs.constant, rhs.constant);
+    if (!quadratic.has_value() || !linear.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    return Poly{*quadratic, *linear, *constant};
+}
+
+std::optional<Poly> mulPolyByConst(const Poly& poly, std::int64_t value)
+{
+    const auto quadratic = checkedMul(poly.quadratic, value);
+    const auto linear = checkedMul(poly.linear, value);
+    const auto constant = checkedMul(poly.constant, value);
+    if (!quadratic.has_value() || !linear.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    return Poly{*quadratic, *linear, *constant};
+}
+
+std::optional<Poly> mulPoly(const Poly& lhs, const Poly& rhs)
+{
+    if (isConstant(lhs)) {
+        return mulPolyByConst(rhs, lhs.constant);
+    }
+    if (isConstant(rhs)) {
+        return mulPolyByConst(lhs, rhs.constant);
+    }
+    if (lhs.quadratic != 0 || rhs.quadratic != 0) {
+        return std::nullopt;
+    }
+
+    // (a*i + c) * (b*i + d) = ab*i^2 + (ad + bc)*i + cd.
+    const auto quadratic = checkedMul(lhs.linear, rhs.linear);
+    const auto leftLinear = checkedMul(lhs.linear, rhs.constant);
+    const auto rightLinear = checkedMul(rhs.linear, lhs.constant);
+    const auto constant = checkedMul(lhs.constant, rhs.constant);
+    if (!quadratic.has_value() || !leftLinear.has_value() || !rightLinear.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    const auto linear = checkedAdd(*leftLinear, *rightLinear);
+    if (!linear.has_value()) {
+        return std::nullopt;
+    }
+    return Poly{*quadratic, *linear, *constant};
+}
+
+std::optional<PolyValue> polyOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, std::int32_t>& constants,
+    const std::unordered_map<int, PolyValue>& values)
+{
+    if (operand.isImmediate) {
+        return PolyValue{"", Poly{0, 0, operand.immediate}};
+    }
+    if (const auto found = constants.find(operand.value.id); found != constants.end()) {
+        return PolyValue{"", Poly{0, 0, found->second}};
+    }
+    if (const auto found = values.find(operand.value.id); found != values.end()) {
+        return found->second;
+    }
+    return std::nullopt;
+}
+
+std::optional<PolyValue> evalPoly(ir::BinaryOpcode op, const PolyValue& lhs, const PolyValue& rhs)
+{
+    auto combineBases = [](const std::string& lhsBase, const std::string& rhsBase) -> std::optional<std::string> {
+        if (lhsBase.empty()) {
+            return rhsBase;
+        }
+        if (rhsBase.empty() || rhsBase == lhsBase) {
+            return lhsBase;
+        }
+        return std::nullopt;
+    };
+
+    switch (op) {
+    case ir::BinaryOpcode::Add:
+        if (const auto base = combineBases(lhs.base, rhs.base); base.has_value()) {
+            if (const auto poly = addPoly(lhs.poly, rhs.poly); poly.has_value()) {
+                return PolyValue{*base, *poly};
+            }
+        }
+        return std::nullopt;
+    case ir::BinaryOpcode::Sub:
+        if (!rhs.base.empty()) {
+            if (lhs.base != rhs.base) {
+                return std::nullopt;
+            }
+            if (const auto poly = subPoly(lhs.poly, rhs.poly); poly.has_value()) {
+                return PolyValue{"", *poly};
+            }
+            return std::nullopt;
+        }
+        if (const auto poly = subPoly(lhs.poly, rhs.poly); poly.has_value()) {
+            return PolyValue{lhs.base, *poly};
+        }
+        return std::nullopt;
+    case ir::BinaryOpcode::Mul:
+        if (!lhs.base.empty() || !rhs.base.empty()) {
+            if (!lhs.base.empty() && isConstant(rhs.poly) && rhs.poly.constant == 1 && rhs.base.empty()) {
+                return lhs;
+            }
+            if (!rhs.base.empty() && isConstant(lhs.poly) && lhs.poly.constant == 1 && lhs.base.empty()) {
+                return rhs;
+            }
+            return std::nullopt;
+        }
+        if (const auto poly = mulPoly(lhs.poly, rhs.poly); poly.has_value()) {
+            return PolyValue{"", *poly};
+        }
+        return std::nullopt;
+    default:
+        if (lhs.base.empty() && rhs.base.empty() && isConstant(lhs.poly) && isConstant(rhs.poly)) {
+            const auto lhsValue = int32Value(lhs.poly.constant);
+            const auto rhsValue = int32Value(rhs.poly.constant);
+            if (!lhsValue.has_value() || !rhsValue.has_value()) {
+                return std::nullopt;
+            }
+            if (const auto value = evalBinary(op, *lhsValue, *rhsValue); value.has_value()) {
+                return PolyValue{"", Poly{0, 0, *value}};
+            }
+        }
+        return std::nullopt;
+    }
 }
 
 std::optional<std::int32_t> constOf(const ir::Operand& operand, const std::unordered_map<int, std::int32_t>& constants)
@@ -187,6 +393,48 @@ std::optional<int> tripCount(ir::BinaryOpcode op, std::int32_t start, std::int32
     }
 }
 
+std::optional<std::int64_t> sumInduction(std::int64_t start, std::int64_t step, std::int64_t trips)
+{
+    const __int128 total =
+        static_cast<__int128>(trips) * start
+        + static_cast<__int128>(step) * trips * (trips - 1) / 2;
+    return checkedInt64(total);
+}
+
+std::optional<std::int64_t> sumInductionSquared(std::int64_t start, std::int64_t step, std::int64_t trips)
+{
+    const __int128 tri = static_cast<__int128>(trips) * (trips - 1) / 2;
+    const __int128 sqSum = static_cast<__int128>(trips) * (trips - 1) * (2 * static_cast<__int128>(trips) - 1) / 6;
+    const __int128 total =
+        static_cast<__int128>(trips) * start * start
+        + 2 * static_cast<__int128>(start) * step * tri
+        + static_cast<__int128>(step) * step * sqSum;
+    return checkedInt64(total);
+}
+
+std::optional<std::int32_t> closedFormSum(
+    const Poly& increment,
+    std::int32_t start,
+    std::int32_t step,
+    int trips)
+{
+    const auto sumI = sumInduction(start, step, trips);
+    const auto sumI2 = sumInductionSquared(start, step, trips);
+    if (!sumI.has_value() || !sumI2.has_value()) {
+        return std::nullopt;
+    }
+
+    const __int128 total =
+        static_cast<__int128>(increment.quadratic) * *sumI2
+        + static_cast<__int128>(increment.linear) * *sumI
+        + static_cast<__int128>(increment.constant) * trips;
+    const auto safeTotal = checkedInt64(total);
+    if (!safeTotal.has_value()) {
+        return std::nullopt;
+    }
+    return int32Value(*safeTotal);
+}
+
 std::optional<std::int32_t> initialLocalConst(const ir::Function& function, int header, const std::string& symbol)
 {
     std::optional<std::int32_t> value;
@@ -267,6 +515,55 @@ std::unordered_map<std::string, std::int32_t> initialLocalConstants(const ir::Fu
         }
     }
     return values;
+}
+
+std::unordered_map<int, std::int32_t> valueConstantsBeforeLoop(
+    const ir::Function& function,
+    int header,
+    const std::unordered_map<std::string, std::int32_t>& localConstants)
+{
+    std::unordered_map<int, std::int32_t> constants;
+    for (int b = 0; b < header; ++b) {
+        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::Const && inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
+                constants[inst.dst.id] = inst.operands[0].immediate;
+            } else if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
+                if (const auto value = constOf(inst.operands[0], constants); value.has_value()) {
+                    constants[inst.dst.id] = *value;
+                } else {
+                    constants.erase(inst.dst.id);
+                }
+            } else if (inst.kind == ir::InstructionKind::Unary && inst.dst.id >= 0 && inst.operands.size() == 1) {
+                if (const auto value = constOf(inst.operands[0], constants); value.has_value()) {
+                    constants[inst.dst.id] = evalUnary(inst.unaryOp, *value);
+                } else {
+                    constants.erase(inst.dst.id);
+                }
+            } else if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+                const auto lhs = constOf(inst.operands[0], constants);
+                const auto rhs = constOf(inst.operands[1], constants);
+                if (lhs.has_value() && rhs.has_value()) {
+                    if (const auto value = evalBinary(inst.binaryOp, *lhs, *rhs); value.has_value()) {
+                        constants[inst.dst.id] = *value;
+                    } else {
+                        constants.erase(inst.dst.id);
+                    }
+                } else {
+                    constants.erase(inst.dst.id);
+                }
+            } else if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+                if (const auto value = localConstants.find(inst.symbol); value != localConstants.end()) {
+                    constants[inst.dst.id] = value->second;
+                } else {
+                    constants.erase(inst.dst.id);
+                }
+            } else if (inst.dst.id >= 0) {
+                constants.erase(inst.dst.id);
+            }
+        }
+    }
+    return constants;
 }
 
 bool runOnLoop(ir::Function& function, int header)
@@ -399,35 +696,54 @@ bool runOnLoop(ir::Function& function, int header)
         return false;
     }
 
-    constants.clear();
-    linear.clear();
-    std::unordered_map<std::string, LinearValue> finalLocal;
+    constants = valueConstantsBeforeLoop(function, header, localConstants);
+    std::unordered_map<int, PolyValue> polyValues;
+    for (const auto& [valueId, value] : constants) {
+        polyValues[valueId] = PolyValue{"", Poly{0, 0, value}};
+    }
+    std::unordered_map<std::string, PolyValue> currentLocal;
+    std::unordered_map<std::string, PolyValue> finalLocal;
     for (const ir::Instruction& inst : body.instructions) {
         switch (inst.kind) {
         case ir::InstructionKind::Const:
             if (inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
                 constants[inst.dst.id] = inst.operands[0].immediate;
-                linear[inst.dst.id] = LinearValue{"", inst.operands[0].immediate};
+                polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, inst.operands[0].immediate}};
             }
             break;
         case ir::InstructionKind::LoadLocal:
             if (inst.dst.id >= 0) {
+                if (const auto current = currentLocal.find(inst.symbol); current != currentLocal.end()) {
+                    polyValues[inst.dst.id] = current->second;
+                    if (current->second.base.empty() && isConstant(current->second.poly)) {
+                        if (const auto constant = int32Value(current->second.poly.constant); constant.has_value()) {
+                            constants[inst.dst.id] = *constant;
+                        }
+                    }
+                    break;
+                }
                 if (bodyStoredLocals.find(inst.symbol) == bodyStoredLocals.end()) {
                     if (const auto value = localConstants.find(inst.symbol); value != localConstants.end()) {
                         constants[inst.dst.id] = value->second;
-                        linear[inst.dst.id] = LinearValue{"", value->second};
+                        polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, value->second}};
                         break;
                     }
                 }
-                linear[inst.dst.id] = LinearValue{inst.symbol, 0};
+                if (inst.symbol == *induction) {
+                    polyValues[inst.dst.id] = PolyValue{"", Poly{0, 1, 0}};
+                } else {
+                    polyValues[inst.dst.id] = PolyValue{inst.symbol, Poly{0, 0, 0}};
+                }
             }
             break;
         case ir::InstructionKind::Copy:
             if (inst.dst.id >= 0 && !inst.operands.empty()) {
-                if (const auto value = linearOf(inst.operands[0], constants, linear); value.has_value()) {
-                    linear[inst.dst.id] = *value;
-                    if (value->base.empty()) {
-                        constants[inst.dst.id] = value->offset;
+                if (const auto value = polyOf(inst.operands[0], constants, polyValues); value.has_value()) {
+                    polyValues[inst.dst.id] = *value;
+                    if (value->base.empty() && isConstant(value->poly)) {
+                        if (const auto constant = int32Value(value->poly.constant); constant.has_value()) {
+                            constants[inst.dst.id] = *constant;
+                        }
                     }
                 } else {
                     return false;
@@ -436,18 +752,20 @@ bool runOnLoop(ir::Function& function, int header)
             break;
         case ir::InstructionKind::Binary:
             if (inst.dst.id >= 0 && inst.operands.size() == 2) {
-                const auto lhs = linearOf(inst.operands[0], constants, linear);
-                const auto rhs = linearOf(inst.operands[1], constants, linear);
+                const auto lhs = polyOf(inst.operands[0], constants, polyValues);
+                const auto rhs = polyOf(inst.operands[1], constants, polyValues);
                 if (!lhs.has_value() || !rhs.has_value()) {
                     return false;
                 }
-                const auto folded = evalLinear(inst.binaryOp, *lhs, *rhs);
+                const auto folded = evalPoly(inst.binaryOp, *lhs, *rhs);
                 if (!folded.has_value()) {
                     return false;
                 }
-                linear[inst.dst.id] = *folded;
-                if (folded->base.empty()) {
-                    constants[inst.dst.id] = folded->offset;
+                polyValues[inst.dst.id] = *folded;
+                if (folded->base.empty() && isConstant(folded->poly)) {
+                    if (const auto constant = int32Value(folded->poly.constant); constant.has_value()) {
+                        constants[inst.dst.id] = *constant;
+                    }
                 }
             }
             break;
@@ -455,7 +773,8 @@ bool runOnLoop(ir::Function& function, int header)
             if (inst.operands.empty()) {
                 return false;
             }
-            if (const auto value = linearOf(inst.operands[0], constants, linear); value.has_value()) {
+            if (const auto value = polyOf(inst.operands[0], constants, polyValues); value.has_value()) {
+                currentLocal[inst.symbol] = *value;
                 finalLocal[inst.symbol] = *value;
             } else {
                 return false;
@@ -467,10 +786,17 @@ bool runOnLoop(ir::Function& function, int header)
     }
 
     const auto inductionFinal = finalLocal.find(*induction);
-    if (inductionFinal == finalLocal.end() || inductionFinal->second.base != *induction) {
+    if (inductionFinal == finalLocal.end()
+        || !inductionFinal->second.base.empty()
+        || inductionFinal->second.poly.quadratic != 0
+        || inductionFinal->second.poly.linear != 1) {
         return false;
     }
-    const std::int32_t step = inductionFinal->second.offset;
+    const auto stepValue = int32Value(inductionFinal->second.poly.constant);
+    if (!stepValue.has_value()) {
+        return false;
+    }
+    const std::int32_t step = *stepValue;
     const auto trips = tripCount(*cmpOp, *start, *bound, step);
     if (!trips.has_value()) {
         return false;
@@ -495,9 +821,9 @@ bool runOnLoop(ir::Function& function, int header)
         if (liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
             continue;
         }
-        if (value.base == symbol && value.offset != 0) {
-            const std::int64_t total = static_cast<std::int64_t>(value.offset) * *trips;
-            if (total < INT32_MIN || total > INT32_MAX) {
+        if (value.base == symbol && !isZero(value.poly)) {
+            const auto total = closedFormSum(value.poly, *start, step, *trips);
+            if (!total.has_value()) {
                 return false;
             }
             ir::Instruction load;
@@ -510,7 +836,7 @@ bool runOnLoop(ir::Function& function, int header)
             add.kind = ir::InstructionKind::Binary;
             add.binaryOp = ir::BinaryOpcode::Add;
             add.dst = ir::Value{function.nextValue++};
-            add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(static_cast<std::int32_t>(total))};
+            add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(*total)};
             replacement.push_back(add);
 
             ir::Instruction store;

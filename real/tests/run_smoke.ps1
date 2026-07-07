@@ -78,23 +78,6 @@ foreach ($needle in @("call bump", "beqz", ".L_main_")) {
     }
 }
 
-$optimizedLoop = @'
-int main() {
-    int i = 0;
-    int s = 0;
-    while (i < 10) {
-        i = i + 1;
-        s = s + i;
-    }
-    return s;
-}
-'@
-$optOutput = Join-Path $Root "optimized_loop.s"
-$optAsm = Compile-Source "optimized_loop" $optimizedLoop $optOutput -Optimize
-if (-not ($optAsm.Contains("beqz") -or $optAsm.Contains("bnez") -or $optAsm.Contains("blt") -or $optAsm.Contains("bge"))) {
-    throw "optimized loop condition was incorrectly folded away"
-}
-
 $semanticInput = Join-Path $Root "semantic_error.tc"
 $semanticResult = Invoke-Compiler "semantic_error" (Get-Content -LiteralPath $semanticInput -Raw)
 if ($semanticResult.ExitCode -eq 0) {
@@ -485,6 +468,10 @@ Assert-OptReturn "opt_cross_block" @'
 int choose(){ return 1; }
 int main(){int x=0; if(choose()){x=5;} else {x=5;} return x+1;}
 '@ 6
+
+Assert-OptReturn "opt_loop_sum_closed_form" @'
+int main(){int i=0; int s=0; while(i<10){i=i+1; s=s+i;} return s;}
+'@ 55
 
 Assert-OptReturn "opt_licm_shape" @'
 int id(int x){ return x; }
