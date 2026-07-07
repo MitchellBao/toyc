@@ -84,6 +84,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         }
         manager.add(createDsePass());
         manager.add(createLicmPass());
+        manager.add(createLoopSumPass());
         manager.add(createTailRecursionPass());
         manager.add(createInlineSmallPass());
         for (int iteration = 0; iteration < 3; ++iteration) {
@@ -93,6 +94,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createCsePass());
             manager.add(createDcePass());
             manager.add(createDsePass());
+            manager.add(createLoopSumPass());
         }
         manager.add(createSimplifyCfgPass());
     }
