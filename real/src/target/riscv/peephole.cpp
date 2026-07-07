@@ -1,5 +1,6 @@
 #include "peephole.h"
 
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -91,6 +92,29 @@ bool isMemorySlot(const std::string& operand)
     return open != std::string::npos && operand.find(')', open + 1) == operand.size() - 1;
 }
 
+std::optional<std::string> invertedBranchOpcode(const std::string& opcode)
+{
+    if (opcode == "beqz") {
+        return "bnez";
+    }
+    if (opcode == "bnez") {
+        return "beqz";
+    }
+    if (opcode == "beq") {
+        return "bne";
+    }
+    if (opcode == "bne") {
+        return "beq";
+    }
+    if (opcode == "blt") {
+        return "bge";
+    }
+    if (opcode == "bge") {
+        return "blt";
+    }
+    return std::nullopt;
+}
+
 std::vector<std::string> splitLines(const std::string& text)
 {
     std::vector<std::string> lines;
@@ -155,6 +179,26 @@ std::string peephole(const std::string& assembly)
             const std::string target = trim(text.substr(2));
             if (isLabel(trim(lines[i + 1])) && trim(lines[i + 1]) == target + ":") {
                 continue;
+            }
+        }
+        if (parsed && (opcode == "beqz" || opcode == "bnez" || opcode == "beq" || opcode == "bne" || opcode == "blt" || opcode == "bge")
+            && operands.size() >= 2
+            && i + 2 < lines.size()) {
+            std::string jumpOpcode;
+            std::vector<std::string> jumpOperands;
+            const std::string falseLabel = operands.back();
+            if (parseInstruction(trim(lines[i + 1]), jumpOpcode, jumpOperands)
+                && jumpOpcode == "j"
+                && jumpOperands.size() == 1
+                && isLabel(trim(lines[i + 2]))
+                && trim(lines[i + 2]) == falseLabel + ":") {
+                if (const auto inverted = invertedBranchOpcode(opcode); inverted.has_value()) {
+                    std::vector<std::string> invertedOperands = operands;
+                    invertedOperands.back() = jumpOperands[0];
+                    out.push_back(formatInstruction(indentOf(lines[i]), *inverted, invertedOperands));
+                    ++i;
+                    continue;
+                }
             }
         }
         if (parsed && opcode == "sw" && operands.size() == 2 && isMemorySlot(operands[1]) && i + 1 < lines.size()) {

@@ -34,6 +34,7 @@ PassManager buildPipeline(bool optimize, bool collectStats = false, std::ostream
 std::unique_ptr<Pass> createCanonicalizePass();
 std::unique_ptr<Pass> createSimplifyCfgPass();
 std::unique_ptr<Pass> createConstPropPass();
+std::unique_ptr<Pass> createGlobalConstPropPass();
 std::unique_ptr<Pass> createAlgebraicSimplifyPass();
 std::unique_ptr<Pass> createCopyPropPass();
 std::unique_ptr<Pass> createCsePass();

@@ -75,6 +75,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
     manager.add(createSimplifyCfgPass());
     if (optimize) {
         for (int iteration = 0; iteration < 4; ++iteration) {
+            manager.add(createGlobalConstPropPass());
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
@@ -88,6 +89,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createTailRecursionPass());
         manager.add(createInlineSmallPass());
         for (int iteration = 0; iteration < 3; ++iteration) {
+            manager.add(createGlobalConstPropPass());
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
@@ -95,6 +97,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createDcePass());
             manager.add(createDsePass());
             manager.add(createLoopSumPass());
+            manager.add(createSimplifyCfgPass());
         }
         manager.add(createSimplifyCfgPass());
     }
