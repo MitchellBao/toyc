@@ -205,10 +205,6 @@ private:
         bool removed = false;
         for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
             ir::BasicBlock& block = function.blocks[blockIndex];
-            const bool preserveStores = block.label.rfind(".while.body", 0) == 0
-                || std::any_of(successors[blockIndex].begin(), successors[blockIndex].end(), [&](int successor) {
-                       return successor <= static_cast<int>(blockIndex);
-                   });
             LocalSet live = liveOut[blockIndex];
             std::vector<ir::Instruction> kept;
             kept.reserve(block.instructions.size());
@@ -221,7 +217,7 @@ private:
                     continue;
                 }
                 if (instruction.kind == ir::InstructionKind::StoreLocal) {
-                    if (!preserveStores && !live.contains(instruction.symbol)) {
+                    if (!live.contains(instruction.symbol)) {
                         removed = true;
                         continue;
                     }

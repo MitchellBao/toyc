@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -40,6 +41,13 @@ struct ValueAlias {
     ir::Value value;
     std::string local;
     std::string reg;
+};
+
+struct ValueInterval {
+    int value = -1;
+    int start = 0;
+    int end = 0;
+    int weight = 0;
 };
 
 int alignTo(int value, int alignment)
@@ -510,6 +518,10 @@ private:
         savesRa_ = hasCalls();
         std::unordered_map<std::string, int> localUseCounts;
         std::unordered_set<std::string> locals;
+        std::vector<ValueInterval> valueIntervals(static_cast<std::size_t>(std::max(function_.nextValue, 0)));
+        for (int value = 0; value < function_.nextValue; ++value) {
+            valueIntervals[static_cast<std::size_t>(value)] = ValueInterval{value, std::numeric_limits<int>::max(), -1, 0};
+        }
 
         auto touchLocal = [&](const std::string& symbol, int weight) {
             if (symbol.empty()) {
@@ -524,11 +536,21 @@ private:
         }
 
         int maxValue = -1;
-        for (const auto& block : function_.blocks) {
+        std::unordered_map<int, int> valueDefinitionBlock;
+        int position = 0;
+        for (std::size_t blockIndex = 0; blockIndex < function_.blocks.size(); ++blockIndex) {
+            const auto& block = function_.blocks[blockIndex];
             for (const auto& inst : block.instructions) {
+                const int instPosition = position++;
                 maxValue = std::max(maxValue, inst.dst.id);
+                if (inst.dst.id >= 0) {
+                    valueDefinitionBlock[inst.dst.id] = static_cast<int>(blockIndex);
+                    defineValue(inst.dst, instPosition, valueIntervals);
+                }
                 for (const auto& operand : inst.operands) {
                     countValueUse(operand);
+                    countRawValueUse(operand);
+                    touchValueUse(operand, instPosition, 1, valueIntervals);
                 }
                 switch (inst.kind) {
                 case ir::InstructionKind::LoadLocal:
@@ -542,8 +564,32 @@ private:
                 }
             }
             if (block.hasTerminator) {
+                const int terminatorPosition = position++;
                 countValueUse(block.terminator.condition);
                 countValueUse(block.terminator.returnValue);
+                countRawValueUse(block.terminator.condition);
+                countRawValueUse(block.terminator.returnValue);
+                touchValueUse(block.terminator.condition, terminatorPosition, 2, valueIntervals);
+                touchValueUse(block.terminator.returnValue, terminatorPosition, 2, valueIntervals);
+            }
+        }
+
+        for (std::size_t blockIndex = 0; blockIndex < function_.blocks.size(); ++blockIndex) {
+            const ir::BasicBlock& block = function_.blocks[blockIndex];
+            if (!hasBackedge(block, blockIndex)) {
+                continue;
+            }
+            for (const ir::Instruction& inst : block.instructions) {
+                for (const ir::Operand& operand : inst.operands) {
+                    countLoopCarriedValueUse(operand, valueDefinitionBlock, blockIndex);
+                    boostLoopCarriedValue(operand, valueDefinitionBlock, blockIndex, valueIntervals);
+                }
+            }
+            if (block.hasTerminator) {
+                countLoopCarriedValueUse(block.terminator.condition, valueDefinitionBlock, blockIndex);
+                countLoopCarriedValueUse(block.terminator.returnValue, valueDefinitionBlock, blockIndex);
+                boostLoopCarriedValue(block.terminator.condition, valueDefinitionBlock, blockIndex, valueIntervals);
+                boostLoopCarriedValue(block.terminator.returnValue, valueDefinitionBlock, blockIndex, valueIntervals);
             }
         }
 
@@ -569,31 +615,7 @@ private:
         }
 
         const int regBudget = nextSavedReg;
-
-        std::vector<std::pair<int, int>> hotValues;
-        hotValues.reserve(valueUseCounts_.size());
-        for (const auto& [value, count] : valueUseCounts_) {
-            if (count > 1) {
-                hotValues.push_back({value, count});
-            }
-        }
-        std::sort(hotValues.begin(), hotValues.end(), [](const auto& lhs, const auto& rhs) {
-            if (lhs.second != rhs.second) {
-                return lhs.second > rhs.second;
-            }
-            return lhs.first < rhs.first;
-        });
-
-        int nextValueReg = regBudget;
-        for (const auto& [value, count] : hotValues) {
-            (void)count;
-            if (nextValueReg >= 11) {
-                break;
-            }
-            valueRegs_[value] = nextValueReg;
-            usedSavedRegs_.push_back(nextValueReg);
-            ++nextValueReg;
-        }
+        allocateValueRegisters(valueIntervals, regBudget);
 
         savedAreaBytes_ = 4; // s0
         if (savesRa_) {
@@ -665,11 +687,19 @@ private:
         for (std::size_t i = 0; i < function_.blocks.size(); ++i) {
             out_ << blockLabel(static_cast<int>(i)) << ":\n";
             const auto& block = function_.blocks[i];
-            for (const auto& inst : block.instructions) {
-                emitInstruction(inst);
+            const bool directBranch = canEmitDirectBranch(block);
+            const std::size_t instructionCount = directBranch && !block.instructions.empty()
+                ? block.instructions.size() - 1
+                : block.instructions.size();
+            for (std::size_t instIndex = 0; instIndex < instructionCount; ++instIndex) {
+                emitInstruction(block.instructions[instIndex]);
             }
             if (block.hasTerminator) {
-                emitTerminator(block.terminator);
+                if (directBranch) {
+                    emitDirectBranch(block.instructions.back(), block.terminator);
+                } else {
+                    emitTerminator(block.terminator);
+                }
             } else {
                 out_ << "  j " << returnLabel() << "\n";
             }
@@ -934,6 +964,57 @@ private:
         }
     }
 
+    bool canEmitDirectBranch(const ir::BasicBlock& block) const
+    {
+        if (!block.hasTerminator || block.terminator.kind != ir::TerminatorKind::Branch || block.terminator.condition.isImmediate || block.instructions.empty()) {
+            return false;
+        }
+        const ir::Instruction& inst = block.instructions.back();
+        if (inst.kind != ir::InstructionKind::Binary || inst.dst.id != block.terminator.condition.value.id || rawValueUseCount(inst.dst) != 1) {
+            return false;
+        }
+        switch (inst.binaryOp) {
+        case ir::BinaryOpcode::Equal:
+        case ir::BinaryOpcode::NotEqual:
+        case ir::BinaryOpcode::Less:
+        case ir::BinaryOpcode::LessEqual:
+        case ir::BinaryOpcode::Greater:
+        case ir::BinaryOpcode::GreaterEqual:
+            return inst.operands.size() >= 2;
+        default:
+            return false;
+        }
+    }
+
+    void emitDirectBranch(const ir::Instruction& inst, const ir::Terminator& terminator)
+    {
+        loadOperand(inst.operands.at(0), "t0");
+        loadOperand(inst.operands.at(1), "a0");
+        switch (inst.binaryOp) {
+        case ir::BinaryOpcode::Equal:
+            out_ << "  beq t0, a0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::NotEqual:
+            out_ << "  bne t0, a0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::Less:
+            out_ << "  blt t0, a0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::LessEqual:
+            out_ << "  bge a0, t0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::Greater:
+            out_ << "  blt a0, t0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::GreaterEqual:
+            out_ << "  bge t0, a0, " << blockLabel(terminator.trueBlock) << "\n";
+            break;
+        default:
+            throw IrCodegenError("invalid direct branch opcode");
+        }
+        out_ << "  j " << blockLabel(terminator.falseBlock) << "\n";
+    }
+
     void loadOperand(const ir::Operand& operand, const std::string& reg)
     {
         if (operand.isImmediate) {
@@ -1157,10 +1238,166 @@ private:
         }
     }
 
-    void countValueUse(const ir::Operand& operand)
+    void countValueUse(const ir::Operand& operand, int weight = 1)
     {
         if (!operand.isImmediate && operand.value.id >= 0) {
-            ++valueUseCounts_[operand.value.id];
+            valueUseCounts_[operand.value.id] += weight;
+        }
+    }
+
+    void countRawValueUse(const ir::Operand& operand)
+    {
+        if (!operand.isImmediate && operand.value.id >= 0) {
+            ++rawValueUseCounts_[operand.value.id];
+        }
+    }
+
+    void defineValue(ir::Value value, int position, std::vector<ValueInterval>& intervals)
+    {
+        if (value.id < 0 || value.id >= static_cast<int>(intervals.size())) {
+            return;
+        }
+        ValueInterval& interval = intervals[static_cast<std::size_t>(value.id)];
+        interval.start = std::min(interval.start, position);
+        interval.end = std::max(interval.end, position);
+    }
+
+    void touchValueUse(const ir::Operand& operand, int position, int weight, std::vector<ValueInterval>& intervals)
+    {
+        if (operand.isImmediate || operand.value.id < 0 || operand.value.id >= static_cast<int>(intervals.size())) {
+            return;
+        }
+        ValueInterval& interval = intervals[static_cast<std::size_t>(operand.value.id)];
+        interval.start = std::min(interval.start, position);
+        interval.end = std::max(interval.end, position);
+        interval.weight += weight;
+    }
+
+    bool hasBackedge(const ir::BasicBlock& block, std::size_t blockIndex) const
+    {
+        if (!block.hasTerminator) {
+            return false;
+        }
+        switch (block.terminator.kind) {
+        case ir::TerminatorKind::Jump:
+            return block.terminator.trueBlock <= static_cast<int>(blockIndex);
+        case ir::TerminatorKind::Branch:
+            return block.terminator.trueBlock <= static_cast<int>(blockIndex)
+                || block.terminator.falseBlock <= static_cast<int>(blockIndex);
+        case ir::TerminatorKind::Return:
+            return false;
+        }
+        return false;
+    }
+
+    void countLoopCarriedValueUse(const ir::Operand& operand, const std::unordered_map<int, int>& valueDefinitionBlock, std::size_t blockIndex)
+    {
+        if (operand.isImmediate || operand.value.id < 0) {
+            return;
+        }
+        const auto found = valueDefinitionBlock.find(operand.value.id);
+        if (found == valueDefinitionBlock.end()) {
+            return;
+        }
+        if (found->second < static_cast<int>(blockIndex)) {
+            countValueUse(operand, 8);
+        }
+    }
+
+    void boostLoopCarriedValue(const ir::Operand& operand, const std::unordered_map<int, int>& valueDefinitionBlock, std::size_t blockIndex, std::vector<ValueInterval>& intervals)
+    {
+        if (operand.isImmediate || operand.value.id < 0 || operand.value.id >= static_cast<int>(intervals.size())) {
+            return;
+        }
+        const auto found = valueDefinitionBlock.find(operand.value.id);
+        if (found == valueDefinitionBlock.end()) {
+            return;
+        }
+        if (found->second < static_cast<int>(blockIndex)) {
+            intervals[static_cast<std::size_t>(operand.value.id)].weight += 12;
+        }
+    }
+
+    void allocateValueRegisters(std::vector<ValueInterval>& intervals, int firstRegister)
+    {
+        if (firstRegister >= 11) {
+            return;
+        }
+        std::vector<ValueInterval> candidates;
+        for (const ValueInterval& interval : intervals) {
+            const int rawUses = rawValueUseCounts_.contains(interval.value) ? rawValueUseCounts_[interval.value] : 0;
+            if (interval.value < 0 || interval.end < interval.start || (interval.weight < 3 && rawUses < 2)) {
+                continue;
+            }
+            candidates.push_back(interval);
+        }
+        std::sort(candidates.begin(), candidates.end(), [](const ValueInterval& lhs, const ValueInterval& rhs) {
+            if (lhs.start != rhs.start) {
+                return lhs.start < rhs.start;
+            }
+            if (lhs.end != rhs.end) {
+                return lhs.end < rhs.end;
+            }
+            return lhs.value < rhs.value;
+        });
+
+        std::vector<int> freeRegs;
+        for (int reg = 10; reg >= firstRegister; --reg) {
+            freeRegs.push_back(reg);
+        }
+        struct ActiveInterval {
+            int value = -1;
+            int end = 0;
+            int reg = -1;
+            int weight = 0;
+        };
+        std::vector<ActiveInterval> active;
+
+        auto expireOld = [&](int start) {
+            std::vector<ActiveInterval> kept;
+            for (const ActiveInterval& current : active) {
+                if (current.end < start) {
+                    freeRegs.push_back(current.reg);
+                } else {
+                    kept.push_back(current);
+                }
+            }
+            active = std::move(kept);
+        };
+
+        for (const ValueInterval& interval : candidates) {
+            expireOld(interval.start);
+            if (!freeRegs.empty()) {
+                const int reg = freeRegs.back();
+                freeRegs.pop_back();
+                valueRegs_[interval.value] = reg;
+                active.push_back(ActiveInterval{interval.value, interval.end, reg, interval.weight});
+                continue;
+            }
+
+            auto spill = std::max_element(active.begin(), active.end(), [](const ActiveInterval& lhs, const ActiveInterval& rhs) {
+                if (lhs.end != rhs.end) {
+                    return lhs.end < rhs.end;
+                }
+                return lhs.weight < rhs.weight;
+            });
+            if (spill != active.end() && spill->end > interval.end && spill->weight <= interval.weight) {
+                const int reg = spill->reg;
+                valueRegs_.erase(spill->value);
+                *spill = ActiveInterval{interval.value, interval.end, reg, interval.weight};
+                valueRegs_[interval.value] = reg;
+            }
+        }
+
+        std::vector<int> regs;
+        regs.reserve(valueRegs_.size());
+        for (const auto& [_, reg] : valueRegs_) {
+            regs.push_back(reg);
+        }
+        std::sort(regs.begin(), regs.end());
+        regs.erase(std::unique(regs.begin(), regs.end()), regs.end());
+        for (int reg : regs) {
+            usedSavedRegs_.push_back(reg);
         }
     }
 
@@ -1168,6 +1405,12 @@ private:
     {
         const auto found = valueUseCounts_.find(value.id);
         return found == valueUseCounts_.end() ? 0 : found->second;
+    }
+
+    int rawValueUseCount(ir::Value value) const
+    {
+        const auto found = rawValueUseCounts_.find(value.id);
+        return found == rawValueUseCounts_.end() ? 0 : found->second;
     }
 
     void consumeValueUse(ir::Value value)
@@ -1187,6 +1430,7 @@ private:
     std::unordered_map<std::string, LocalSlot> locals_;
     std::vector<int> valueOffsets_;
     std::unordered_map<int, int> valueUseCounts_;
+    std::unordered_map<int, int> rawValueUseCounts_;
     std::unordered_map<int, int> remainingValueUses_;
     std::unordered_map<int, int> valueRegs_;
     std::unordered_map<int, ValueAlias> valueAliases_;

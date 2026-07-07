@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -2078,7 +2080,14 @@ void emitAstBackend(const Program& program, std::ostream& out, CodegenOptions op
     backend.generate();
 }
 
-bool tryEmitOptimizedIrBackend(const Program& optimized, std::ostream& out)
+std::string emitAstBackendToString(const Program& program, CodegenOptions options)
+{
+    std::ostringstream buffer;
+    emitAstBackend(program, buffer, options);
+    return buffer.str();
+}
+
+std::optional<std::string> tryEmitOptimizedIrBackend(const Program& optimized)
 {
     IrBuilder irBuilder;
     ir::Module module = irBuilder.build(optimized);
@@ -2087,15 +2096,153 @@ bool tryEmitOptimizedIrBackend(const Program& optimized, std::ostream& out)
 
     IrRiscVCodeGenerator irBackend;
     if (!irBackend.canGenerate(module)) {
-        return false;
+        return std::nullopt;
     }
-    irBackend.generate(module, out);
-    return true;
+    std::ostringstream buffer;
+    irBackend.generate(module, buffer);
+    return buffer.str();
 }
 
 void emitOptimizedAstFallback(const Program& optimized, std::ostream& out)
 {
     emitAstBackend(optimized, out, CodegenOptions{true});
+}
+
+struct AssemblyCost {
+    int instructionCount = 0;
+    int loopInstructionCount = 0;
+    int memoryInstructionCount = 0;
+    int savedRegisterTraffic = 0;
+};
+
+std::string stripCommentAndTrim(const std::string& line)
+{
+    const std::size_t comment = line.find('#');
+    std::string text = comment == std::string::npos ? line : line.substr(0, comment);
+    const std::size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const std::size_t end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+bool startsWithText(const std::string& text, const std::string& prefix)
+{
+    return text.rfind(prefix, 0) == 0;
+}
+
+bool isAssemblyDirective(const std::string& line)
+{
+    return !line.empty() && line.front() == '.';
+}
+
+bool isAssemblyLabel(const std::string& line)
+{
+    return !line.empty() && line.back() == ':';
+}
+
+bool jumpsToLabel(const std::string& line, const std::string& label)
+{
+    if (startsWithText(line, "j ")) {
+        return stripCommentAndTrim(line.substr(2)) == label;
+    }
+    const std::string suffix = ", " + label;
+    return (startsWithText(line, "beqz ") || startsWithText(line, "bnez ") || startsWithText(line, "beq ")
+               || startsWithText(line, "bne ") || startsWithText(line, "blt ") || startsWithText(line, "bge "))
+        && line.size() >= suffix.size()
+        && line.compare(line.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string labelName(const std::string& line)
+{
+    return isAssemblyLabel(line) ? line.substr(0, line.size() - 1) : std::string{};
+}
+
+std::vector<std::string> normalizedAssemblyLines(const std::string& assembly)
+{
+    std::vector<std::string> lines;
+    std::istringstream input(assembly);
+    std::string line;
+    while (std::getline(input, line)) {
+        std::string trimmed = stripCommentAndTrim(line);
+        if (!trimmed.empty()) {
+            lines.push_back(std::move(trimmed));
+        }
+    }
+    return lines;
+}
+
+AssemblyCost estimateAssemblyCost(const std::string& assembly)
+{
+    const std::vector<std::string> lines = normalizedAssemblyLines(assembly);
+    AssemblyCost cost;
+    for (const std::string& line : lines) {
+        if (isAssemblyDirective(line) || isAssemblyLabel(line)) {
+            continue;
+        }
+        ++cost.instructionCount;
+        if (startsWithText(line, "lw ") || startsWithText(line, "sw ")) {
+            ++cost.memoryInstructionCount;
+            if (startsWithText(line, "lw s") || startsWithText(line, "sw s")) {
+                ++cost.savedRegisterTraffic;
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (!isAssemblyLabel(lines[i])) {
+            continue;
+        }
+        const std::string label = labelName(lines[i]);
+        int body = 0;
+        for (std::size_t j = i + 1; j < lines.size(); ++j) {
+            if (jumpsToLabel(lines[j], label)) {
+                if (body > cost.loopInstructionCount) {
+                    cost.loopInstructionCount = body;
+                }
+                break;
+            }
+            if (isAssemblyLabel(lines[j])) {
+                continue;
+            }
+            if (!isAssemblyDirective(lines[j])) {
+                ++body;
+            }
+        }
+    }
+    return cost;
+}
+
+bool isIrCandidateCheaper(const std::string& irAssembly, const std::string& astAssembly)
+{
+    const AssemblyCost irCost = estimateAssemblyCost(irAssembly);
+    const AssemblyCost astCost = estimateAssemblyCost(astAssembly);
+    const int irWeighted = irCost.instructionCount + irCost.memoryInstructionCount * 2 + irCost.savedRegisterTraffic * 6 + irCost.loopInstructionCount * 8;
+    const int astWeighted = astCost.instructionCount + astCost.memoryInstructionCount * 2 + astCost.savedRegisterTraffic * 6 + astCost.loopInstructionCount * 8;
+    return irWeighted <= astWeighted;
+}
+
+enum class ForcedBackend {
+    Auto,
+    Ast,
+    Ir,
+};
+
+ForcedBackend forcedOptimizedBackend()
+{
+    const char* value = std::getenv("TOYC_OPT_BACKEND");
+    if (value == nullptr) {
+        return ForcedBackend::Auto;
+    }
+    const std::string backend(value);
+    if (backend == "ast") {
+        return ForcedBackend::Ast;
+    }
+    if (backend == "ir") {
+        return ForcedBackend::Ir;
+    }
+    return ForcedBackend::Auto;
 }
 
 } // namespace
@@ -2108,11 +2255,27 @@ void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
     }
 
     Program optimized = optimizeAst(program);
-    if (tryEmitOptimizedIrBackend(optimized, out)) {
+    const ForcedBackend forced = forcedOptimizedBackend();
+    if (forced == ForcedBackend::Ast) {
+        emitOptimizedAstFallback(optimized, out);
         return;
     }
 
-    emitOptimizedAstFallback(optimized, out);
+    std::optional<std::string> irAssembly = tryEmitOptimizedIrBackend(optimized);
+    if (forced == ForcedBackend::Ir) {
+        if (!irAssembly.has_value()) {
+            throw CodegenError("forced IR backend cannot generate this program");
+        }
+        out << *irAssembly;
+        return;
+    }
+
+    const std::string astAssembly = emitAstBackendToString(optimized, CodegenOptions{true});
+    if (irAssembly.has_value() && isIrCandidateCheaper(*irAssembly, astAssembly)) {
+        out << *irAssembly;
+    } else {
+        out << astAssembly;
+    }
 }
 
 } // namespace toyc
