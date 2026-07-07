@@ -593,6 +593,47 @@ int main() {
 Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "seqz" 0
 Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "slt" 0
 
+$localCseCommutativeAsm = Compile-Source "backend_local_cse_commutative" @'
+int calc(int a, int b) {
+    int x = a * b;
+    int y = b * a;
+    return x + y;
+}
+int main() {
+    return calc(7, 9);
+}
+'@ -Optimize
+Assert-OpcodeAtMost "backend_local_cse_commutative" $localCseCommutativeAsm "mul" 1
+
+Assert-BackendsAgree "backend_local_cse_store_kill" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(1);
+    int a = x;
+    x = id(2);
+    int b = x;
+    return a * 10 + b;
+}
+'@ 12
+
+$cfgCleanupAsm = Compile-Source "backend_cfg_cleanup" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = 1;
+    if (0) {
+        x = id(100);
+    } else {
+        x = x + 1;
+    }
+    return x;
+}
+'@ -Optimize
+Assert-OpcodeAtMost "backend_cfg_cleanup" $cfgCleanupAsm "call" 0
+
 $loopRegisterAsm = Compile-Source "backend_loop_registers" @'
 int main() {
     int i = 0;
@@ -604,6 +645,9 @@ int main() {
     return s;
 }
 '@ -Optimize
+Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "lw" 4
+Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "sw" 6
+Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "mv" 2
 
 Compile-Source "backend_loop_dead_store" @'
 int main() {

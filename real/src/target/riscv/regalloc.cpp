@@ -5,7 +5,9 @@
 
 namespace toyc::riscv {
 
-std::unordered_map<int, std::string> RegisterAllocator::allocate(const std::unordered_map<int, analysis::LiveInterval>& intervals) const
+std::unordered_map<int, std::string> RegisterAllocator::allocate(
+    const std::unordered_map<int, analysis::LiveInterval>& intervals,
+    const std::unordered_set<int>& liveAcrossCalls) const
 {
     std::vector<std::pair<int, analysis::LiveInterval>> ordered(intervals.begin(), intervals.end());
     std::sort(ordered.begin(), ordered.end(), [](const auto& lhs, const auto& rhs) {
@@ -15,15 +17,20 @@ std::unordered_map<int, std::string> RegisterAllocator::allocate(const std::unor
         return lhs.first < rhs.first;
     });
 
-    static constexpr const char* regs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+    static constexpr const char* callerSavedRegs[] = {"t3", "t4", "t5"};
+    static constexpr const char* calleeSavedRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
     std::unordered_map<int, std::string> result;
-    int regIndex = 0;
+    int callerRegIndex = 0;
+    int calleeRegIndex = 0;
     for (const auto& [value, interval] : ordered) {
         (void)interval;
-        if (regIndex >= static_cast<int>(std::size(regs))) {
-            break;
+        if (liveAcrossCalls.find(value) == liveAcrossCalls.end() && callerRegIndex < static_cast<int>(std::size(callerSavedRegs))) {
+            result.emplace(value, callerSavedRegs[callerRegIndex++]);
+            continue;
         }
-        result.emplace(value, regs[regIndex++]);
+        if (calleeRegIndex < static_cast<int>(std::size(calleeSavedRegs))) {
+            result.emplace(value, calleeSavedRegs[calleeRegIndex++]);
+        }
     }
     return result;
 }

@@ -1,7 +1,9 @@
 #include "asm_printer.h"
 
+#include "analysis/liveness.h"
 #include "frame.h"
 #include "peephole.h"
+#include "regalloc.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -148,7 +150,6 @@ private:
                     locals.insert(inst.symbol);
                 }
                 if (definesValue(inst)) {
-                    valueOffsets_[inst.dst.id] = 0;
                     ++valueCount;
                 }
                 if (inst.kind == ir::InstructionKind::Call) {
@@ -158,6 +159,10 @@ private:
             }
         }
 
+        const auto intervals = analysis::computeLocalIntervals(function_);
+        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals));
+        collectSavedRegs();
+
         outgoingArgBytes_ = std::max(0, maxCallArgs - 8) * 4;
         savesRa_ = hasCall;
         int nextOffset = outgoingArgBytes_;
@@ -165,9 +170,17 @@ private:
             localOffsets_[local] = nextOffset;
             nextOffset += 4;
         }
-        for (auto& [value, offset] : valueOffsets_) {
-            (void)value;
-            offset = nextOffset;
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if (definesValue(inst) && allocatedValueRegs_.find(inst.dst.id) == allocatedValueRegs_.end()) {
+                    valueOffsets_[inst.dst.id] = nextOffset;
+                    nextOffset += 4;
+                }
+            }
+        }
+
+        for (const std::string& reg : savedRegs_) {
+            savedRegOffsets_[reg] = nextOffset;
             nextOffset += 4;
         }
 
@@ -185,10 +198,16 @@ private:
         if (savesRa_) {
             storeStack("ra", raOffset_);
         }
+        for (const std::string& reg : savedRegs_) {
+            storeStack(reg, savedRegOffsets_.at(reg));
+        }
     }
 
     void emitEpilogue()
     {
+        for (auto iter = savedRegs_.rbegin(); iter != savedRegs_.rend(); ++iter) {
+            loadStack(*iter, savedRegOffsets_.at(*iter));
+        }
         if (savesRa_) {
             loadStack("ra", raOffset_);
         }
@@ -229,6 +248,15 @@ private:
         return found->second;
     }
 
+    const std::string* allocatedReg(ir::Value value) const
+    {
+        const auto found = allocatedValueRegs_.find(value.id);
+        if (found == allocatedValueRegs_.end()) {
+            return nullptr;
+        }
+        return &found->second;
+    }
+
     int offsetForLocal(const std::string& symbol) const
     {
         const auto found = localOffsets_.find(symbol);
@@ -243,13 +271,79 @@ private:
         if (operand.isImmediate) {
             out_ << "  li " << reg << ", " << operand.immediate << "\n";
         } else {
+            if (const std::string* allocated = allocatedReg(operand.value)) {
+                if (*allocated != reg) {
+                    out_ << "  mv " << reg << ", " << *allocated << "\n";
+                }
+                return;
+            }
             loadStack(reg, offsetForValue(operand.value));
         }
     }
 
+    std::string readOperand(const ir::Operand& operand, const std::string& scratch)
+    {
+        if (!operand.isImmediate) {
+            if (const std::string* allocated = allocatedReg(operand.value)) {
+                return *allocated;
+            }
+        }
+        loadOperand(operand, scratch);
+        return scratch;
+    }
+
+    std::string writeReg(ir::Value value, const std::string& fallback) const
+    {
+        if (const std::string* allocated = allocatedReg(value)) {
+            return *allocated;
+        }
+        return fallback;
+    }
+
     void storeValue(ir::Value value, const std::string& reg)
     {
+        if (const std::string* allocated = allocatedReg(value)) {
+            if (*allocated != reg) {
+                out_ << "  mv " << *allocated << ", " << reg << "\n";
+            }
+            return;
+        }
         storeStack(reg, offsetForValue(value));
+    }
+
+    void collectSavedRegs()
+    {
+        static constexpr const char* orderedRegs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        std::unordered_set<std::string> used;
+        for (const auto& [value, reg] : allocatedValueRegs_) {
+            (void)value;
+            used.insert(reg);
+        }
+        for (const char* reg : orderedRegs) {
+            if (used.find(reg) != used.end()) {
+                savedRegs_.push_back(reg);
+            }
+        }
+    }
+
+    std::unordered_set<int> computeLiveAcrossCalls(const std::unordered_map<int, analysis::LiveInterval>& intervals) const
+    {
+        std::unordered_set<int> liveAcrossCalls;
+        int index = 0;
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.kind == ir::InstructionKind::Call) {
+                    for (const auto& [value, interval] : intervals) {
+                        if (interval.start < index && index < interval.end) {
+                            liveAcrossCalls.insert(value);
+                        }
+                    }
+                }
+                ++index;
+            }
+            ++index;
+        }
+        return liveAcrossCalls;
     }
 
     void adjustStack(int amount)
@@ -292,31 +386,27 @@ private:
     {
         switch (inst.kind) {
         case ir::InstructionKind::Const:
-            loadOperand(inst.operands.empty() ? ir::Operand::imm(0) : inst.operands[0], "t0");
-            storeValue(inst.dst, "t0");
+            emitCopyLike(inst.dst, inst.operands.empty() ? ir::Operand::imm(0) : inst.operands[0]);
             return;
         case ir::InstructionKind::Copy:
-            loadOperand(inst.operands[0], "t0");
-            storeValue(inst.dst, "t0");
+            emitCopyLike(inst.dst, inst.operands[0]);
             return;
         case ir::InstructionKind::LoadLocal:
-            loadStack("t0", offsetForLocal(inst.symbol));
-            storeValue(inst.dst, "t0");
+            emitLoadLocal(inst);
             return;
         case ir::InstructionKind::StoreLocal:
-            loadOperand(inst.operands[0], "t0");
-            storeStack("t0", offsetForLocal(inst.symbol));
+            storeStack(readOperand(inst.operands[0], "t0"), offsetForLocal(inst.symbol));
             return;
         case ir::InstructionKind::LoadGlobal:
-            out_ << "  la t0, " << globalLabel(inst.symbol) << "\n";
-            out_ << "  lw t0, 0(t0)\n";
-            storeValue(inst.dst, "t0");
+            emitLoadGlobal(inst);
             return;
         case ir::InstructionKind::StoreGlobal:
-            loadOperand(inst.operands[0], "t0");
+            {
+            const std::string valueReg = readOperand(inst.operands[0], "t0");
             out_ << "  la t1, " << globalLabel(inst.symbol) << "\n";
-            out_ << "  sw t0, 0(t1)\n";
+            out_ << "  sw " << valueReg << ", 0(t1)\n";
             return;
+            }
         case ir::InstructionKind::Unary:
             emitUnary(inst);
             return;
@@ -327,6 +417,28 @@ private:
             emitCall(inst);
             return;
         }
+    }
+
+    void emitCopyLike(ir::Value dst, const ir::Operand& source)
+    {
+        const std::string dstReg = writeReg(dst, "t0");
+        loadOperand(source, dstReg);
+        storeValue(dst, dstReg);
+    }
+
+    void emitLoadLocal(const ir::Instruction& inst)
+    {
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        loadStack(dstReg, offsetForLocal(inst.symbol));
+        storeValue(inst.dst, dstReg);
+    }
+
+    void emitLoadGlobal(const ir::Instruction& inst)
+    {
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        out_ << "  la " << dstReg << ", " << globalLabel(inst.symbol) << "\n";
+        out_ << "  lw " << dstReg << ", 0(" << dstReg << ")\n";
+        storeValue(inst.dst, dstReg);
     }
 
     std::string globalLabel(const std::string& name) const
@@ -340,80 +452,81 @@ private:
 
     void emitUnary(const ir::Instruction& inst)
     {
-        loadOperand(inst.operands[0], "t0");
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        loadOperand(inst.operands[0], dstReg);
         switch (inst.unaryOp) {
         case ir::UnaryOpcode::Plus:
             break;
         case ir::UnaryOpcode::Minus:
-            out_ << "  neg t0, t0\n";
+            out_ << "  neg " << dstReg << ", " << dstReg << "\n";
             break;
         case ir::UnaryOpcode::Not:
-            out_ << "  seqz t0, t0\n";
+            out_ << "  seqz " << dstReg << ", " << dstReg << "\n";
             break;
         }
-        storeValue(inst.dst, "t0");
+        storeValue(inst.dst, dstReg);
     }
 
     void emitBinary(const ir::Instruction& inst)
     {
-        loadOperand(inst.operands[0], "t0");
-        loadOperand(inst.operands[1], "t1");
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        const std::string lhsReg = readOperand(inst.operands[0], "t0");
+        const std::string rhsReg = readOperand(inst.operands[1], lhsReg == "t1" ? "t2" : "t1");
         switch (inst.binaryOp) {
         case ir::BinaryOpcode::Add:
-            out_ << "  add t0, t0, t1\n";
+            out_ << "  add " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Sub:
-            out_ << "  sub t0, t0, t1\n";
+            out_ << "  sub " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Mul:
-            out_ << "  mul t0, t0, t1\n";
+            out_ << "  mul " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Div:
-            out_ << "  div t0, t0, t1\n";
+            out_ << "  div " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Mod:
-            out_ << "  rem t0, t0, t1\n";
+            out_ << "  rem " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Equal:
-            out_ << "  sub t0, t0, t1\n";
-            out_ << "  seqz t0, t0\n";
+            out_ << "  sub " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
+            out_ << "  seqz " << dstReg << ", " << dstReg << "\n";
             break;
         case ir::BinaryOpcode::NotEqual:
-            out_ << "  sub t0, t0, t1\n";
-            out_ << "  snez t0, t0\n";
+            out_ << "  sub " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
+            out_ << "  snez " << dstReg << ", " << dstReg << "\n";
             break;
         case ir::BinaryOpcode::Less:
-            out_ << "  slt t0, t0, t1\n";
+            out_ << "  slt " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
             break;
         case ir::BinaryOpcode::Greater:
-            out_ << "  slt t0, t1, t0\n";
+            out_ << "  slt " << dstReg << ", " << rhsReg << ", " << lhsReg << "\n";
             break;
         case ir::BinaryOpcode::LessEqual:
-            out_ << "  slt t0, t1, t0\n";
-            out_ << "  xori t0, t0, 1\n";
+            out_ << "  slt " << dstReg << ", " << rhsReg << ", " << lhsReg << "\n";
+            out_ << "  xori " << dstReg << ", " << dstReg << ", 1\n";
             break;
         case ir::BinaryOpcode::GreaterEqual:
-            out_ << "  slt t0, t0, t1\n";
-            out_ << "  xori t0, t0, 1\n";
+            out_ << "  slt " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
+            out_ << "  xori " << dstReg << ", " << dstReg << ", 1\n";
             break;
         case ir::BinaryOpcode::LogicalAnd:
-            out_ << "  snez t0, t0\n";
-            out_ << "  snez t1, t1\n";
-            out_ << "  and t0, t0, t1\n";
+            out_ << "  snez t0, " << lhsReg << "\n";
+            out_ << "  snez t1, " << rhsReg << "\n";
+            out_ << "  and " << dstReg << ", t0, t1\n";
             break;
         case ir::BinaryOpcode::LogicalOr:
-            out_ << "  or t0, t0, t1\n";
-            out_ << "  snez t0, t0\n";
+            out_ << "  or " << dstReg << ", " << lhsReg << ", " << rhsReg << "\n";
+            out_ << "  snez " << dstReg << ", " << dstReg << "\n";
             break;
         }
-        storeValue(inst.dst, "t0");
+        storeValue(inst.dst, dstReg);
     }
 
     void emitCall(const ir::Instruction& inst)
     {
         for (int i = static_cast<int>(inst.operands.size()) - 1; i >= 8; --i) {
-            loadOperand(inst.operands[static_cast<std::size_t>(i)], "t0");
-            storeStack("t0", (i - 8) * 4);
+            storeStack(readOperand(inst.operands[static_cast<std::size_t>(i)], "t0"), (i - 8) * 4);
         }
         for (int i = 0; i < static_cast<int>(inst.operands.size()) && i < 8; ++i) {
             loadOperand(inst.operands[static_cast<std::size_t>(i)], "a" + std::to_string(i));
@@ -431,8 +544,7 @@ private:
             out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
             break;
         case ir::TerminatorKind::Branch:
-            loadOperand(terminator.condition, "t0");
-            out_ << "  beqz t0, " << labelFor(terminator.falseBlock) << "\n";
+            out_ << "  beqz " << readOperand(terminator.condition, "t0") << ", " << labelFor(terminator.falseBlock) << "\n";
             out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
             break;
         case ir::TerminatorKind::Return:
@@ -449,6 +561,9 @@ private:
     std::ostream& out_;
     std::unordered_map<std::string, int> localOffsets_;
     std::unordered_map<int, int> valueOffsets_;
+    std::unordered_map<int, std::string> allocatedValueRegs_;
+    std::unordered_map<std::string, int> savedRegOffsets_;
+    std::vector<std::string> savedRegs_;
     int outgoingArgBytes_ = 0;
     int frameSize_ = 0;
     int raOffset_ = 0;
