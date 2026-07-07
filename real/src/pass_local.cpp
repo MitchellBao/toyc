@@ -270,7 +270,7 @@ private:
                 const bool hasBackedge = isWhileHeader && std::any_of(predecessors[blockIndex].begin(), predecessors[blockIndex].end(), [&](int predecessor) {
                     return predecessor >= static_cast<int>(blockIndex);
                 });
-                LocalValueMap nextIn = hasBackedge ? LocalValueMap{} : mergeLocalValues(predecessors[blockIndex], out);
+                LocalValueMap nextIn = (blockIndex == 0 || hasBackedge) ? LocalValueMap{} : mergeLocalValues(predecessors[blockIndex], out);
                 LocalValueMap nextOut = transferValues(nextIn, function.blocks[blockIndex]);
                 if (!sameMap(nextIn, in[blockIndex]) || !sameMap(nextOut, out[blockIndex])) {
                     in[blockIndex] = std::move(nextIn);

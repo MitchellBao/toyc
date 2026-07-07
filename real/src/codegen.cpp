@@ -2070,21 +2070,49 @@ RiscVCodeGenerator::RiscVCodeGenerator(CodegenOptions options)
 {
 }
 
+namespace {
+
+void emitAstBackend(const Program& program, std::ostream& out, CodegenOptions options)
+{
+    AstRiscVBackend backend(program, out, options);
+    backend.generate();
+}
+
+bool tryEmitOptimizedIrBackend(const Program& optimized, std::ostream& out)
+{
+    IrBuilder irBuilder;
+    ir::Module module = irBuilder.build(optimized);
+    PassManager passes = buildDefaultPassPipeline(true);
+    passes.run(module);
+
+    IrRiscVCodeGenerator irBackend;
+    if (!irBackend.canGenerate(module)) {
+        return false;
+    }
+    irBackend.generate(module, out);
+    return true;
+}
+
+void emitOptimizedAstFallback(const Program& optimized, std::ostream& out)
+{
+    emitAstBackend(optimized, out, CodegenOptions{true});
+}
+
+} // namespace
+
 void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
-    if (options_.optimize) {
-        Program optimized = optimizeAst(program);
-        IrBuilder irBuilder;
-        ir::Module module = irBuilder.build(optimized);
-        PassManager passes = buildDefaultPassPipeline(true);
-        passes.run(module);
-        IrRiscVCodeGenerator irBackend;
-        irBackend.generate(module, out);
+    if (!options_.optimize) {
+        emitAstBackend(program, out, CodegenOptions{false});
         return;
     }
 
-    AstRiscVBackend backend(program, out, options_);
-    backend.generate();
+    Program optimized = optimizeAst(program);
+    if (tryEmitOptimizedIrBackend(optimized, out)) {
+        return;
+    }
+
+    emitOptimizedAstFallback(optimized, out);
 }
 
 } // namespace toyc

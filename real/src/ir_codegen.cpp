@@ -280,10 +280,10 @@ private:
         validateInstruction(inst);
         switch (inst.kind) {
         case ir::InstructionKind::Const:
-            aliasImmediate(inst.dst, inst.operands.at(0).immediate);
+            materializeConst(inst.dst, inst.operands.at(0).immediate);
             break;
         case ir::InstructionKind::Copy:
-            aliasOperand(inst.dst, inst.operands.at(0));
+            materializeCopy(inst.dst, inst.operands.at(0));
             break;
         case ir::InstructionKind::Unary:
             loadOperand(inst.operands.at(0), "a0");
@@ -294,17 +294,20 @@ private:
             emitBinary(inst);
             break;
         case ir::InstructionKind::LoadGlobal:
+            clobberRegisterAliases("t0");
             out_ << "  la t0, g_" << sanitizeLabel(inst.symbol) << "\n";
+            clobberRegisterAliases("a0");
             out_ << "  lw a0, 0(t0)\n";
             storeValue(inst.dst, "a0");
             break;
         case ir::InstructionKind::StoreGlobal:
             loadOperand(inst.operands.at(0), "a0");
+            clobberRegisterAliases("t0");
             out_ << "  la t0, g_" << sanitizeLabel(inst.symbol) << "\n";
             out_ << "  sw a0, 0(t0)\n";
             break;
         case ir::InstructionKind::LoadLocal:
-            aliasLocal(inst.dst, inst.symbol);
+            materializeLocal(inst.dst, inst.symbol);
             break;
         case ir::InstructionKind::StoreLocal:
             loadOperand(inst.operands.at(0), "a0");
@@ -403,6 +406,7 @@ private:
             out_ << "  xori a0, a0, 1\n";
             break;
         case ir::BinaryOpcode::LogicalAnd:
+            clobberRegisterAliases("t0");
             out_ << "  snez t0, t0\n";
             out_ << "  snez a0, a0\n";
             out_ << "  and a0, t0, a0\n";
@@ -462,33 +466,25 @@ private:
     void emitCall(const ir::Instruction& inst)
     {
         const int argCount = static_cast<int>(inst.operands.size());
-        for (const auto& arg : inst.operands) {
-            loadOperand(arg, "a0");
-            out_ << "  addi sp, sp, -4\n";
-            out_ << "  sw a0, 0(sp)\n";
-        }
-
-        const int evalBytes = argCount * 4;
         const int stackArgBytes = std::max(0, argCount - 8) * 4;
-        const int reserveBytes = alignTo(evalBytes + stackArgBytes, 16) - evalBytes;
+        const int reserveBytes = alignTo(stackArgBytes, 16);
         if (reserveBytes > 0) {
             out_ << "  addi sp, sp, -" << reserveBytes << "\n";
         }
 
-        for (int i = 0; i < std::min(8, argCount); ++i) {
-            const int offset = reserveBytes + (argCount - 1 - i) * 4;
-            out_ << "  lw a" << i << ", " << offset << "(sp)\n";
-        }
         for (int i = 8; i < argCount; ++i) {
-            const int sourceOffset = reserveBytes + (argCount - 1 - i) * 4;
-            out_ << "  lw t0, " << sourceOffset << "(sp)\n";
+            loadOperand(inst.operands[static_cast<std::size_t>(i)], "t0");
             out_ << "  sw t0, " << (i - 8) * 4 << "(sp)\n";
         }
 
-        clobberRegisterAliases("a0");
+        for (int i = std::min(8, argCount) - 1; i >= 0; --i) {
+            loadOperand(inst.operands[static_cast<std::size_t>(i)], "a" + std::to_string(i));
+        }
+
+        clobberCallerSavedRegisterAliases();
         out_ << "  call " << inst.symbol << "\n";
-        if (reserveBytes + evalBytes > 0) {
-            out_ << "  addi sp, sp, " << reserveBytes + evalBytes << "\n";
+        if (reserveBytes > 0) {
+            out_ << "  addi sp, sp, " << reserveBytes << "\n";
         }
     }
 
@@ -583,6 +579,7 @@ private:
     {
         switch (alias.kind) {
         case ValueAlias::Kind::Immediate:
+            clobberRegisterAliases(reg);
             out_ << "  li " << reg << ", " << alias.immediate << "\n";
             break;
         case ValueAlias::Kind::Value:
@@ -639,6 +636,50 @@ private:
         }
     }
 
+    bool hasValueRegister(ir::Value value) const
+    {
+        return value.id >= 0 && valueRegs_.find(value.id) != valueRegs_.end();
+    }
+
+    std::string valueRegisterName(ir::Value value) const
+    {
+        const auto found = valueRegs_.find(value.id);
+        if (found == valueRegs_.end()) {
+            throw IrCodegenError("IR value has no allocated register");
+        }
+        return savedRegName(found->second);
+    }
+
+    void materializeConst(ir::Value value, std::int32_t immediate)
+    {
+        if (hasValueRegister(value) && valueUseCount(value) > 0) {
+            valueAliases_.erase(value.id);
+            out_ << "  li " << valueRegisterName(value) << ", " << immediate << "\n";
+            return;
+        }
+        aliasImmediate(value, immediate);
+    }
+
+    void materializeCopy(ir::Value value, const ir::Operand& operand)
+    {
+        if (hasValueRegister(value) && valueUseCount(value) > 0) {
+            valueAliases_.erase(value.id);
+            loadOperand(operand, valueRegisterName(value));
+            return;
+        }
+        aliasOperand(value, operand);
+    }
+
+    void materializeLocal(ir::Value value, const std::string& symbol)
+    {
+        if (hasValueRegister(value) && valueUseCount(value) > 0) {
+            valueAliases_.erase(value.id);
+            loadLocal(symbol, valueRegisterName(value));
+            return;
+        }
+        aliasLocal(value, symbol);
+    }
+
     void clobberRegisterAliases(const std::string& reg)
     {
         std::vector<int> toErase;
@@ -652,6 +693,17 @@ private:
         }
         for (int value : toErase) {
             valueAliases_.erase(value);
+        }
+    }
+
+    void clobberCallerSavedRegisterAliases()
+    {
+        static const char* regs[] = {
+            "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
+            "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+        };
+        for (const char* reg : regs) {
+            clobberRegisterAliases(reg);
         }
     }
 
@@ -731,7 +783,59 @@ private:
 
 bool IrRiscVCodeGenerator::canGenerate(const ir::Module& module) const
 {
-    (void)module;
+    for (const auto& function : module.functions) {
+        if (function.blocks.empty() || function.nextValue < 0) {
+            return false;
+        }
+
+        auto validValue = [&](ir::Value value) {
+            return value.id >= 0 && value.id < function.nextValue;
+        };
+
+        auto validOperand = [&](const ir::Operand& operand) {
+            return operand.isImmediate || validValue(operand.value);
+        };
+
+        auto validBlock = [&](int block) {
+            return block >= 0 && block < static_cast<int>(function.blocks.size());
+        };
+
+        for (const auto& block : function.blocks) {
+            for (const auto& inst : block.instructions) {
+                if (inst.dst.id >= function.nextValue) {
+                    return false;
+                }
+                for (const auto& operand : inst.operands) {
+                    if (!validOperand(operand)) {
+                        return false;
+                    }
+                }
+            }
+
+            if (!block.hasTerminator) {
+                continue;
+            }
+            switch (block.terminator.kind) {
+            case ir::TerminatorKind::Jump:
+                if (!validBlock(block.terminator.trueBlock)) {
+                    return false;
+                }
+                break;
+            case ir::TerminatorKind::Branch:
+                if (!validOperand(block.terminator.condition)
+                    || !validBlock(block.terminator.trueBlock)
+                    || !validBlock(block.terminator.falseBlock)) {
+                    return false;
+                }
+                break;
+            case ir::TerminatorKind::Return:
+                if (block.terminator.hasReturnValue && !validOperand(block.terminator.returnValue)) {
+                    return false;
+                }
+                break;
+            }
+        }
+    }
     return true;
 }
 

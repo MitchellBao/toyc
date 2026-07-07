@@ -22,7 +22,9 @@ Lexer
 ```
 
 The non-optimized path may keep using the old AST backend as a correctness fallback.
-The `-opt` path must use IR:
+The `-opt` path prefers IR, but must not silently emit assembly from an IR module
+that the IR backend cannot handle. It may fall back to the stable AST backend
+after safe AST optimization:
 
 ```text
 Program ast = parse();
@@ -32,7 +34,11 @@ if (-opt) {
     Program optimized = optimizeAst(ast);
     ir::Module module = IrBuilder().build(optimized);
     buildDefaultPassPipeline(true).run(module);
-    IrRiscVCodeGenerator().generate(module, stdout);
+    if (IrRiscVCodeGenerator().canGenerate(module)) {
+        IrRiscVCodeGenerator().generate(module, stdout);
+    } else {
+        emit the optimized AST with the AST backend;
+    }
 } else {
     RiscVCodeGenerator({false}).generate(ast, stdout);
 }
@@ -161,6 +167,8 @@ Backend priorities:
 2. Keep loop variables in registers when possible.
 3. Avoid unnecessary `ra` saves in leaf functions.
 4. Use immediate instructions such as `addi` and `slti` where safe.
+5. Reject structurally invalid IR through `canGenerate()` instead of producing
+   best-effort assembly.
 
 ### Legacy AST Backend
 
@@ -172,6 +180,33 @@ Responsibilities:
 
 - Remain as non-optimized fallback until the IR backend is fully trusted.
 - Do not grow new generic optimizations here.
+- Accept already AST-optimized programs as the safe fallback for `-opt` when
+  the IR backend gate rejects a module.
+
+## Backend Selection
+
+Files:
+
+- `real/src/codegen.*`
+- `real/src/ir_codegen.*`
+
+The public compiler interface stays fixed: source is read from stdin, assembly
+is written to stdout, and `-opt` is optional.
+
+Backend selection happens only after parsing and semantic analysis:
+
+1. Plain mode emits the original AST through the AST backend.
+2. Optimized mode first creates an AST-optimized program.
+3. The optimized AST is lowered to IR.
+4. IR passes run independently from AST optimization.
+5. `IrRiscVCodeGenerator::canGenerate()` validates basic IR shape.
+6. If the IR backend accepts the module, it emits RISC-V32 assembly.
+7. If the IR backend rejects the module, optimized mode emits the AST-optimized
+   program through the AST backend instead of producing risky IR assembly.
+
+Exceptions from parsing, semantic analysis, IR building, passes, or codegen are
+not swallowed. They are reported through the existing `main.cpp` error path so
+the compiler fails loudly rather than silently producing incorrect assembly.
 
 ## Performance Work Plan
 
@@ -214,3 +249,15 @@ Required smoke coverage:
 - Short-circuit side effects.
 - Global variable and global const use.
 - Semantic error path.
+
+Useful local commands:
+
+```powershell
+g++ -std=c++20 -O2 -pipe -Ireal/src real/src/main.cpp real/src/lexer.cpp real/src/parser.cpp real/src/semantic.cpp real/src/ast_optimizer.cpp real/src/ir.cpp real/src/ir_builder.cpp real/src/pass.cpp real/src/pass_simplify.cpp real/src/pass_cse.cpp real/src/pass_local.cpp real/src/pass_loop.cpp real/src/pass_dce.cpp real/src/ir_codegen.cpp real/src/codegen.cpp -o compiler.exe
+powershell -ExecutionPolicy Bypass -File real/tests/run_smoke.ps1 -Compiler ..\..\compiler.exe
+powershell -ExecutionPolicy Bypass -File real/tests/run_backend_compare.ps1 -Compiler ..\..\compiler.exe
+```
+
+`run_backend_compare.ps1` compiles representative ToyC snippets both with and
+without `-opt`, executes the generated assembly with the local test interpreter,
+and checks that both backends return the expected exit code.
