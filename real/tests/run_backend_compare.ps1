@@ -337,6 +337,22 @@ function Assert-BackendsAgree {
     }
 }
 
+function New-ManyVariablesSource {
+    param(
+        [int]$Count
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add("int main() {")
+    for ($i = 0; $i -lt $Count; ++$i) {
+        $lines.Add("    int v$i = $i;")
+    }
+    $terms = @(0..($Count - 1) | ForEach-Object { "v$_" })
+    $lines.Add("    return $($terms -join ' + ');")
+    $lines.Add("}")
+    return ($lines -join "`n")
+}
+
 function Assert-NoJumpToNextLabel {
     param(
         [string]$Name,
@@ -494,6 +510,8 @@ int main() {
     return sum9(1,2,3,4,5,6,7,8,9);
 }
 '@ 45
+
+Assert-BackendsAgree "backend_many_variables" (New-ManyVariablesSource 700) 244650
 
 $peepholeAsm = Compile-Source "backend_peephole" @'
 int main() {

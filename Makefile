@@ -19,6 +19,7 @@ SOURCES := \
 	real/src/passes/canonicalize.cpp \
 	real/src/passes/simplify_cfg.cpp \
 	real/src/passes/const_prop.cpp \
+	real/src/passes/algebraic_simplify.cpp \
 	real/src/passes/copy_prop.cpp \
 	real/src/passes/cse.cpp \
 	real/src/passes/dce.cpp \

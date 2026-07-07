@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstddef>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -40,6 +41,71 @@ bool definesValue(const ir::Instruction& inst)
     return inst.dst.id >= 0
         && inst.kind != ir::InstructionKind::StoreGlobal
         && inst.kind != ir::InstructionKind::StoreLocal;
+}
+
+struct AssemblyStats {
+    std::size_t lines = 0;
+    std::size_t lw = 0;
+    std::size_t sw = 0;
+    std::size_t mv = 0;
+    std::size_t j = 0;
+    std::size_t addiZero = 0;
+};
+
+std::string trim(const std::string& text)
+{
+    const std::size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const std::size_t end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+bool startsWithOpcode(const std::string& line, const std::string& opcode)
+{
+    return line == opcode || line.rfind(opcode + " ", 0) == 0 || line.rfind(opcode + "\t", 0) == 0;
+}
+
+AssemblyStats measureAssembly(const std::string& assembly)
+{
+    AssemblyStats stats;
+    std::istringstream in(assembly);
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::string text = trim(line);
+        if (text.empty()) {
+            continue;
+        }
+        ++stats.lines;
+        if (startsWithOpcode(text, "lw")) {
+            ++stats.lw;
+        } else if (startsWithOpcode(text, "sw")) {
+            ++stats.sw;
+        } else if (startsWithOpcode(text, "mv")) {
+            ++stats.mv;
+        } else if (startsWithOpcode(text, "j")) {
+            ++stats.j;
+        } else if (startsWithOpcode(text, "addi")) {
+            const std::size_t lastComma = text.find_last_of(',');
+            if (lastComma != std::string::npos && trim(text.substr(lastComma + 1)) == "0") {
+                ++stats.addiZero;
+            }
+        }
+    }
+    return stats;
+}
+
+void printAssemblyStats(std::ostream& out, const AssemblyStats& before, const AssemblyStats& after)
+{
+    out << "[toycc] stage=backend-peephole"
+        << " asm_lines=" << before.lines << "->" << after.lines
+        << " lw=" << before.lw << "->" << after.lw
+        << " sw=" << before.sw << "->" << after.sw
+        << " mv=" << before.mv << "->" << after.mv
+        << " j=" << before.j << "->" << after.j
+        << " addi0=" << before.addiZero << "->" << after.addiZero
+        << '\n';
 }
 
 class FunctionEmitter {
@@ -114,20 +180,20 @@ private:
     void emitPrologue()
     {
         if (frameSize_ > 0) {
-            out_ << "  addi sp, sp, -" << frameSize_ << "\n";
+            adjustStack(-frameSize_);
         }
         if (savesRa_) {
-            out_ << "  sw ra, " << raOffset_ << "(sp)\n";
+            storeStack("ra", raOffset_);
         }
     }
 
     void emitEpilogue()
     {
         if (savesRa_) {
-            out_ << "  lw ra, " << raOffset_ << "(sp)\n";
+            loadStack("ra", raOffset_);
         }
         if (frameSize_ > 0) {
-            out_ << "  addi sp, sp, " << frameSize_ << "\n";
+            adjustStack(frameSize_);
         }
         out_ << "  ret\n";
     }
@@ -140,11 +206,11 @@ private:
                 continue;
             }
             if (i < 8) {
-                out_ << "  sw a" << i << ", " << found->second << "(sp)\n";
+                storeStack("a" + std::to_string(i), found->second);
             } else {
                 const int callerOffset = frameSize_ + (i - 8) * 4;
-                out_ << "  lw t0, " << callerOffset << "(sp)\n";
-                out_ << "  sw t0, " << found->second << "(sp)\n";
+                loadStack("t0", callerOffset);
+                storeStack("t0", found->second);
             }
         }
     }
@@ -177,13 +243,49 @@ private:
         if (operand.isImmediate) {
             out_ << "  li " << reg << ", " << operand.immediate << "\n";
         } else {
-            out_ << "  lw " << reg << ", " << offsetForValue(operand.value) << "(sp)\n";
+            loadStack(reg, offsetForValue(operand.value));
         }
     }
 
     void storeValue(ir::Value value, const std::string& reg)
     {
-        out_ << "  sw " << reg << ", " << offsetForValue(value) << "(sp)\n";
+        storeStack(reg, offsetForValue(value));
+    }
+
+    void adjustStack(int amount)
+    {
+        if (fitsI12(amount)) {
+            out_ << "  addi sp, sp, " << amount << "\n";
+            return;
+        }
+        out_ << "  li t6, " << (amount < 0 ? -amount : amount) << "\n";
+        if (amount < 0) {
+            out_ << "  sub sp, sp, t6\n";
+        } else {
+            out_ << "  add sp, sp, t6\n";
+        }
+    }
+
+    void loadStack(const std::string& reg, int offset)
+    {
+        if (fitsI12(offset)) {
+            out_ << "  lw " << reg << ", " << offset << "(sp)\n";
+            return;
+        }
+        out_ << "  li t6, " << offset << "\n";
+        out_ << "  add t6, sp, t6\n";
+        out_ << "  lw " << reg << ", 0(t6)\n";
+    }
+
+    void storeStack(const std::string& reg, int offset)
+    {
+        if (fitsI12(offset)) {
+            out_ << "  sw " << reg << ", " << offset << "(sp)\n";
+            return;
+        }
+        out_ << "  li t6, " << offset << "\n";
+        out_ << "  add t6, sp, t6\n";
+        out_ << "  sw " << reg << ", 0(t6)\n";
     }
 
     void emitInstruction(const ir::Instruction& inst)
@@ -198,12 +300,12 @@ private:
             storeValue(inst.dst, "t0");
             return;
         case ir::InstructionKind::LoadLocal:
-            out_ << "  lw t0, " << offsetForLocal(inst.symbol) << "(sp)\n";
+            loadStack("t0", offsetForLocal(inst.symbol));
             storeValue(inst.dst, "t0");
             return;
         case ir::InstructionKind::StoreLocal:
             loadOperand(inst.operands[0], "t0");
-            out_ << "  sw t0, " << offsetForLocal(inst.symbol) << "(sp)\n";
+            storeStack("t0", offsetForLocal(inst.symbol));
             return;
         case ir::InstructionKind::LoadGlobal:
             out_ << "  la t0, " << globalLabel(inst.symbol) << "\n";
@@ -311,7 +413,7 @@ private:
     {
         for (int i = static_cast<int>(inst.operands.size()) - 1; i >= 8; --i) {
             loadOperand(inst.operands[static_cast<std::size_t>(i)], "t0");
-            out_ << "  sw t0, " << ((i - 8) * 4) << "(sp)\n";
+            storeStack("t0", (i - 8) * 4);
         }
         for (int i = 0; i < static_cast<int>(inst.operands.size()) && i < 8; ++i) {
             loadOperand(inst.operands[static_cast<std::size_t>(i)], "a" + std::to_string(i));
@@ -355,7 +457,7 @@ private:
 
 } // namespace
 
-void AsmPrinter::print(const ir::Module& module, std::ostream& out) const
+void AsmPrinter::print(const ir::Module& module, std::ostream& out, std::ostream* statsOut) const
 {
     std::ostringstream buffer;
     std::unordered_map<std::string, std::string> globals;
@@ -374,7 +476,12 @@ void AsmPrinter::print(const ir::Module& module, std::ostream& out) const
         emitter.emit();
     }
 
-    out << peephole(buffer.str());
+    const std::string beforePeephole = buffer.str();
+    const std::string afterPeephole = peephole(beforePeephole);
+    if (statsOut != nullptr) {
+        printAssemblyStats(*statsOut, measureAssembly(beforePeephole), measureAssembly(afterPeephole));
+    }
+    out << afterPeephole;
 }
 
 } // namespace toyc::riscv

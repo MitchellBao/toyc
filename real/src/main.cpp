@@ -11,9 +11,13 @@
 int main(int argc, char* argv[])
 {
     bool optimize = false;
+    bool emitStats = false;
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "-opt") {
+        const std::string arg = argv[i];
+        if (arg == "-opt") {
             optimize = true;
+        } else if (arg == "--stats" || arg == "-stats") {
+            emitStats = true;
         }
     }
 
@@ -25,7 +29,7 @@ int main(int argc, char* argv[])
         toyc::SemanticAnalyzer semantic;
         semantic.analyze(*program);
 
-        toyc::CompilerPipeline pipeline({optimize});
+        toyc::CompilerPipeline pipeline({optimize, emitStats});
         pipeline.emitAssembly(*program, std::cout);
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << '\n';
