@@ -1,15 +1,11 @@
 #pragma once
 
-#include <cstdint>
+#include "value.h"
+
 #include <string>
 #include <vector>
 
 namespace toyc::ir {
-
-enum class Type {
-    Int,
-    Void,
-};
 
 enum class BinaryOpcode {
     Add,
@@ -51,19 +47,6 @@ enum class TerminatorKind {
     Return,
 };
 
-struct Value {
-    int id = -1;
-};
-
-struct Operand {
-    bool isImmediate = false;
-    std::int32_t immediate = 0;
-    Value value;
-
-    static Operand imm(std::int32_t value);
-    static Operand ref(Value value);
-};
-
 struct Instruction {
     InstructionKind kind = InstructionKind::Const;
     Value dst;
@@ -81,32 +64,6 @@ struct Terminator {
     int falseBlock = -1;
     Operand returnValue;
     bool hasReturnValue = false;
-};
-
-struct BasicBlock {
-    std::string label;
-    std::vector<Instruction> instructions;
-    Terminator terminator;
-    bool hasTerminator = false;
-};
-
-struct Function {
-    Type returnType = Type::Int;
-    std::string name;
-    std::vector<std::string> params;
-    std::vector<BasicBlock> blocks;
-    int nextValue = 0;
-};
-
-struct Global {
-    bool isConst = false;
-    std::string name;
-    std::int32_t init = 0;
-};
-
-struct Module {
-    std::vector<Global> globals;
-    std::vector<Function> functions;
 };
 
 const char* instructionKindName(InstructionKind kind);

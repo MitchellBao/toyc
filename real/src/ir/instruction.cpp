@@ -1,16 +1,6 @@
-#include "ir.h"
+#include "instruction.h"
 
 namespace toyc::ir {
-
-Operand Operand::imm(std::int32_t value)
-{
-    return Operand{true, value, {}};
-}
-
-Operand Operand::ref(Value value)
-{
-    return Operand{false, 0, value};
-}
 
 const char* instructionKindName(InstructionKind kind)
 {

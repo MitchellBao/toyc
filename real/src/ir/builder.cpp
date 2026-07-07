@@ -1,4 +1,4 @@
-#include "ir_builder.h"
+#include "builder.h"
 
 #include <cstddef>
 #include <optional>
@@ -116,22 +116,12 @@ private:
         scopes_.pop_back();
     }
 
-    std::string makeLocalSymbol(const std::string& name)
-    {
-        return name + "#" + std::to_string(nextLocalId_++);
-    }
-
-    std::string makeTempLocal()
-    {
-        return "__tmp" + std::to_string(nextTempId_++);
-    }
-
     std::string declareLocal(const std::string& name)
     {
         if (scopes_.empty()) {
             enterScope();
         }
-        const std::string symbol = makeLocalSymbol(name);
+        const std::string symbol = name + "#" + std::to_string(nextLocalId_++);
         scopes_.back()[name] = symbol;
         return symbol;
     }
@@ -145,11 +135,6 @@ private:
             }
         }
         return std::nullopt;
-    }
-
-    bool isDeclaredGlobal(const std::string& name) const
-    {
-        return globals_.find(name) != globals_.end();
     }
 
     ir::Value newValue()
@@ -240,7 +225,6 @@ private:
             const ir::Operand value = lowerExpr(*assign->value);
             ir::Instruction instruction;
             instruction.operands.push_back(value);
-
             if (const auto local = lookupLocal(assign->name); local.has_value()) {
                 instruction.kind = ir::InstructionKind::StoreLocal;
                 instruction.symbol = *local;
@@ -249,7 +233,6 @@ private:
                 instruction.symbol = assign->name;
                 instruction.hasSideEffect = true;
             }
-
             emit(std::move(instruction));
             return;
         }
@@ -257,7 +240,6 @@ private:
         if (const auto* declStmt = dynamic_cast<const DeclStmt*>(&stmt)) {
             const ir::Operand init = lowerExpr(*declStmt->decl->init);
             const std::string symbol = declareLocal(declStmt->decl->name);
-
             ir::Instruction instruction;
             instruction.kind = ir::InstructionKind::StoreLocal;
             instruction.symbol = symbol;
@@ -373,12 +355,10 @@ private:
                 instruction.symbol = *local;
                 return emitValue(std::move(instruction));
             }
-
             const auto constant = constants_.find(name->name);
             if (constant != constants_.end()) {
                 return ir::Operand::imm(constant->second);
             }
-
             ir::Instruction instruction;
             instruction.kind = ir::InstructionKind::LoadGlobal;
             instruction.symbol = name->name;
@@ -423,7 +403,7 @@ private:
 
     ir::Operand lowerLogicalValue(const Expr& expr)
     {
-        const std::string temp = makeTempLocal();
+        const std::string temp = "__logic" + std::to_string(nextTempId_++);
         const int trueBlock = newBlock(".logic.true");
         const int falseBlock = newBlock(".logic.false");
         const int endBlock = newBlock(".logic.end");
@@ -519,46 +499,13 @@ ir::Module IrBuilder::build(const Program& program)
             if (declItem->decl->isConst) {
                 constants_[declItem->decl->name] = *init;
             }
-            continue;
-        }
-
-        if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
-            FunctionLowerer lowerer(*funcItem->func, constants_, globals);
-            module.functions.push_back(lowerer.lower());
         }
     }
 
-    return module;
-}
-
-ir::Module IrBuilder::buildSkeleton(const Program& program)
-{
-    constants_.clear();
-    ir::Module module;
-
     for (const auto& item : program.items) {
-        if (const auto* declItem = dynamic_cast<const TopDecl*>(item.get())) {
-            const auto init = evalConst(*declItem->decl->init);
-            if (!init.has_value()) {
-                throw std::runtime_error("IR builder expected constant global initializer");
-            }
-            module.globals.push_back(ir::Global{declItem->decl->isConst, declItem->decl->name, *init});
-            if (declItem->decl->isConst) {
-                constants_[declItem->decl->name] = *init;
-            }
-            continue;
-        }
-
         if (const auto* funcItem = dynamic_cast<const TopFunc*>(item.get())) {
-            ir::Function function;
-            function.returnType = mapType(funcItem->func->returnType);
-            function.name = funcItem->func->name;
-            function.params.reserve(funcItem->func->params.size());
-            for (const Param& param : funcItem->func->params) {
-                function.params.push_back(param.name);
-            }
-            function.blocks.push_back(ir::BasicBlock{".entry", {}, {}, false});
-            module.functions.push_back(std::move(function));
+            FunctionLowerer lowerer(*funcItem->func, constants_, globals);
+            module.functions.push_back(lowerer.lower());
         }
     }
 

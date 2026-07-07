@@ -1,8 +1,8 @@
-#include "ast.h"
-#include "codegen.h"
-#include "lexer.h"
-#include "parser.h"
-#include "semantic.h"
+#include "driver/compiler_pipeline.h"
+#include "frontend/ast.h"
+#include "frontend/lexer.h"
+#include "frontend/parser.h"
+#include "frontend/semantic.h"
 
 #include <exception>
 #include <iostream>
@@ -25,8 +25,8 @@ int main(int argc, char* argv[])
         toyc::SemanticAnalyzer semantic;
         semantic.analyze(*program);
 
-        toyc::RiscVCodeGenerator codegen({optimize});
-        codegen.generate(*program, std::cout);
+        toyc::CompilerPipeline pipeline({optimize});
+        pipeline.emitAssembly(*program, std::cout);
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << '\n';
         return 1;

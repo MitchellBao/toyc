@@ -1,263 +1,218 @@
 # ToyC Compiler Architecture
 
-## Target Score Strategy
-
-The current grading formula makes performance important after functional correctness is stable.
-With 100 functional points and a full report, a performance score around 50 reaches roughly 90 total points; 60+ gives a safer margin.
-
-The architecture therefore favors a stable optimized compiler path over more experimental layers.
+This version is a hand-written LLVM/QBE-style compiler architecture. The old
+production AST backend, AST optimizer, IR backend selector, and text-cost
+backend chooser have been removed. Both normal mode and `-opt` now use one
+compiler pipeline.
 
 ## Production Pipeline
 
 ```text
-Lexer
-  -> Parser
-  -> AST
-  -> SemanticAnalyzer
-  -> Safe AST Optimizer
-  -> IR Builder
-  -> IR Pass Pipeline
-  -> IR RISC-V Backend
-  -> Assembly
+stdin
+  -> frontend::Lexer
+  -> frontend::Parser
+  -> frontend AST
+  -> frontend::SemanticAnalyzer
+  -> ir::IrBuilder
+  -> ir::Verifier
+  -> passes::PassManager
+  -> ir::Verifier
+  -> riscv::AsmPrinter
+  -> stdout
 ```
 
-The non-optimized path may keep using the old AST backend as a correctness fallback.
-The `-opt` path prefers IR, but must not silently emit assembly from an IR module
-that the IR backend cannot handle. It may fall back to the stable AST backend
-after safe AST optimization:
+Plain mode and optimized mode differ only by pass pipeline:
 
 ```text
-Program ast = parse();
-SemanticAnalyzer().analyze(ast);
+plain:
+  AST -> IR -> canonicalize -> simplify-cfg -> RISC-V
 
-if (-opt) {
-    Program optimized = optimizeAst(ast);
-    ir::Module module = IrBuilder().build(optimized);
-    buildDefaultPassPipeline(true).run(module);
-    if (IrRiscVCodeGenerator().canGenerate(module)) {
-        IrRiscVCodeGenerator().generate(module, stdout);
-    } else {
-        emit the optimized AST with the AST backend;
-    }
-} else {
-    RiscVCodeGenerator({false}).generate(ast, stdout);
-}
+-opt:
+  AST -> IR
+      -> canonicalize
+      -> simplify-cfg
+      -> const-prop
+      -> copy-prop
+      -> local-cse
+      -> dce
+      -> dse
+      -> licm
+      -> tail-recursion
+      -> inline-small
+      -> second cleanup round
+      -> RISC-V
 ```
 
-## Removed Layers
+The current `licm`, `tail-recursion`, `inline-small`, and `dse` passes are
+architectural slots with conservative implementations. They are intentionally
+separate files so future optimization work does not grow back into a monolithic
+backend.
 
-The following layers were removed from the production design:
-
-- Flex/Bison sources: the project uses the hand-written C++ lexer/parser.
-- DAG layer: ToyC is small enough for direct AST -> IR lowering.
-
-The deleted DAG path was:
+## Module Layout
 
 ```text
-AST -> DAG -> IR
+real/src/
+  frontend/
+    ast.h
+    lexer.*
+    parser.*
+    semantic.*
+
+  driver/
+    options.h
+    compiler_pipeline.*
+
+  ir/
+    value.h
+    instruction.*
+    basic_block.h
+    function.h
+    module.h
+    builder.*
+    verifier.*
+    printer.*
+
+  analysis/
+    cfg.*
+    dominator.h
+    loop_info.h
+    liveness.*
+    side_effect.*
+
+  passes/
+    pass_manager.*
+    canonicalize.cpp
+    simplify_cfg.cpp
+    const_prop.cpp
+    copy_prop.cpp
+    cse.cpp
+    dce.cpp
+    dse.cpp
+    licm.cpp
+    inline_small.cpp
+    tail_recursion.cpp
+
+  target/riscv/
+    riscv_mir.h
+    isel.*
+    frame.*
+    regalloc.*
+    peephole.*
+    asm_printer.*
 ```
 
-The replacement is:
+## Removed Production Layers
 
-```text
-AST -> IR
-```
+Deleted files:
 
-This avoids duplicate IR entry points and keeps optimization work centered on one representation.
-
-## Module Ownership
-
-### Front End
-
-Files:
-
-- `real/src/lexer.*`
-- `real/src/parser.*`
-- `real/src/ast.h`
-
-Responsibilities:
-
-- Tokenize and parse ToyC into AST.
-- Preserve ToyC syntax, expression precedence, and short-circuit structure.
-- Do not perform optimization here.
-
-### Semantic Analysis
-
-Files:
-
-- `real/src/semantic.*`
-
-Responsibilities:
-
-- Validate declarations, scopes, function ordering, return paths, `break` / `continue`, and `void` value usage.
-- Keep legality checks separate from optimization.
-
-### Safe AST Optimizer
-
-Files:
-
+- `real/src/codegen.*`
 - `real/src/ast_optimizer.*`
-
-Responsibilities:
-
-- Fold literal and immutable-const expressions.
-- Remove unreachable code after terminal statements.
-- Remove pure expression statements.
-- Simplify safe `if` / `while (0)` cases.
-
-Hard rules:
-
-1. Mutable facts must not cross loop boundaries.
-2. Mutable facts must be cleared before optimizing loop conditions.
-3. Function calls are effectful unless explicitly proven otherwise.
-4. Global stores are observable.
-5. Short-circuit side effects must be preserved.
-
-### IR
-
-Files:
-
-- `real/src/ir.*`
-- `real/src/ir_builder.*`
-
-Responsibilities:
-
-- Represent functions as basic blocks with explicit terminators.
-- Represent computations as values and side-effecting instructions.
-- Lower local variables, globals, calls, branches, loops, and returns.
-
-Current IR is intentionally not SSA. Three-address code plus basic blocks is enough for the immediate performance target.
-
-### IR Passes
-
-Files:
-
-- `real/src/pass.*`
-- `real/src/pass_simplify.cpp`
-- `real/src/pass_cse.cpp`
-- `real/src/pass_dce.cpp`
-
-Responsibilities:
-
-- Local constant folding and algebraic simplification.
-- Copy propagation.
-- Basic-block local common subexpression elimination.
-- Dead pure instruction removal.
-
-Side-effect rule:
-
-- Calls, global stores, and local stores are not removed by generic dead-instruction cleanup.
-- More aggressive dead-store cleanup must prove that no later load observes the store.
-
-### IR RISC-V Backend
-
-Files:
-
 - `real/src/ir_codegen.*`
+- old flat `real/src/ir.*`
+- old flat `real/src/ir_builder.*`
+- old flat `real/src/pass*`
 
-Responsibilities:
+Removed responsibilities:
 
-- Emit RISC-V32 assembly from IR.
-- Own stack layout, calls, labels, branches, and register placement.
-- Prefer hot locals in saved registers to reduce loop stack traffic.
+- AST-to-RISC-V production backend.
+- AST-level optimization as a main optimization layer.
+- Generating two assemblies and choosing by static text cost.
+- Environment-variable backend forcing for AST/IR/auto.
+- One giant backend file owning semantic-ish facts, optimization, frame layout,
+  register choices, and assembly emission at the same time.
 
-Backend priorities:
+## IR Design
 
-1. Preserve functional correctness.
-2. Keep loop variables in registers when possible.
-3. Avoid unnecessary `ra` saves in leaf functions.
-4. Use immediate instructions such as `addi` and `slti` where safe.
-5. Reject structurally invalid IR through `canGenerate()` instead of producing
-   best-effort assembly.
+The IR is a typed, basic-block, three-address representation:
 
-### Legacy AST Backend
+- `ir::Module` owns globals and functions.
+- `ir::Function` owns parameters, blocks, and value numbering.
+- `ir::BasicBlock` owns instructions plus one explicit terminator.
+- `ir::Instruction` represents pure computations, loads, stores, and calls.
+- `ir::Terminator` represents jump, branch, and return.
 
-Files:
+The current IR is not full SSA yet. Local variables are still represented by
+`LoadLocal` and `StoreLocal`. That keeps the first refactor stable, but it is
+also the main reason loop-heavy code still has many stack loads/stores. The
+next major performance step should be a mem2reg pass that promotes ToyC locals
+to SSA-like values and introduces phi nodes.
 
-- `real/src/codegen.*`
+## Backend Design
 
-Responsibilities:
+The RISC-V target is split into the same conceptual layers as a larger compiler:
 
-- Remain as non-optimized fallback until the IR backend is fully trusted.
-- Do not grow new generic optimizations here.
-- Accept already AST-optimized programs as the safe fallback for `-opt` when
-  the IR backend gate rejects a module.
+- `isel.*`: instruction-selection boundary.
+- `riscv_mir.h`: machine IR data structures.
+- `frame.*`: stack-frame policy.
+- `regalloc.*`: register allocation boundary.
+- `asm_printer.*`: RISC-V assembly emission.
+- `peephole.*`: final mechanical assembly cleanup.
 
-## Backend Selection
+The first implementation keeps emission conservative: locals and temporaries are
+stack allocated, and function calls follow a simple RISC-V calling convention.
+The important architectural point is that stack layout, liveness, register
+allocation, and printing are now separable units instead of one god file.
 
-Files:
+The frame layout uses positive offsets from the adjusted `sp`, so callees cannot
+overwrite caller locals or temporaries. Outgoing stack arguments are reserved at
+the bottom of the caller frame.
 
-- `real/src/codegen.*`
-- `real/src/ir_codegen.*`
+## Optimization Safety Rules
 
-The public compiler interface stays fixed: source is read from stdin, assembly
-is written to stdout, and `-opt` is optional.
+1. A pass may not move facts across CFG edges unless it is CFG-aware.
+2. `Call`, `StoreGlobal`, and global loads after those side effects must be
+   treated conservatively.
+3. Short-circuit expressions are lowered as explicit control flow before
+   optimization.
+4. The verifier runs before and after the pass pipeline.
+5. Backend peephole optimizations must be mechanical and local.
 
-Backend selection happens only after parsing and semantic analysis:
+## Current Performance Baseline
 
-1. Plain mode emits the original AST through the AST backend.
-2. Optimized mode first creates an AST-optimized program.
-3. The optimized AST is lowered to IR.
-4. IR passes run independently from AST optimization.
-5. `IrRiscVCodeGenerator::canGenerate()` validates basic IR shape.
-6. If the IR backend accepts the module, it emits RISC-V32 assembly.
-7. If the IR backend rejects the module, optimized mode emits the AST-optimized
-   program through the AST backend instead of producing risky IR assembly.
+The architecture refactor favors correctness and maintainability first. The
+current conservative backend still emits many `lw`/`sw` instructions in loops.
+Local analysis after the refactor showed representative optimized loop bodies
+still containing stack traffic, for example:
 
-Exceptions from parsing, semantic analysis, IR building, passes, or codegen are
-not swallowed. They are reported through the existing `main.cpp` error path so
-the compiler fails loudly rather than silently producing incorrect assembly.
+- `perf_loop_locals opt`: loop body 25 lines, `lw=10`, `sw=8`.
+- `perf_combined opt`: loop body 62 lines, `lw=26`, `sw=20`.
+- `perf_p08_like opt`: loop body 70 lines, `lw=30`, `sw=23`.
 
-## Performance Work Plan
+This is expected for the first architectural cut. The old tangled backend had
+some registerization tricks, but they lived in the wrong place. The new target
+is to reintroduce them through `analysis/liveness.*`, `target/riscv/regalloc.*`,
+and a future SSA/mem2reg pass.
 
-### Stage 1: Safe `-opt`
+## Next Performance Work
 
-- Route `-opt` through IR.
-- Preserve loop exits.
-- Add smoke tests for optimized loops.
-- Keep functional score at 100.
+Recommended order:
 
-### Stage 2: IR Optimizations
+1. Add `mem2reg` and phi support to remove most local `LoadLocal`/`StoreLocal`.
+2. Make `dse` remove overwritten local stores after mem2reg or with local
+   memory SSA-like reasoning.
+3. Teach `regalloc` to assign hot loop values to `s1`-`s11` and have
+   `asm_printer` use allocated registers instead of always spilling values.
+4. Implement tail-recursion lowering as parameter parallel assignment plus jump
+   to entry.
+5. Implement small non-recursive function inlining before register allocation.
+6. Replace branch-to-jump patterns with direct inverted branches in peephole.
+7. Make LICM depend on `cfg`, `dominator`, and `loop_info` instead of pattern
+   matching fixed loop shapes.
 
-- Constant propagation.
-- Copy propagation.
-- Local CSE.
-- Dead pure instruction cleanup.
-- Algebraic simplification.
-
-These target `p01_const`, `p02_dead_code`, `p03_copy`, `p04_common_subexpr`, `p05_algebra`, `p11_global_const_prop`, and `p12_const_expr_chain`.
-
-### Stage 3: Backend Performance
-
-- Hot local register allocation.
-- Leaf function prologue reduction.
-- Strength reduction for safe immediate cases.
-- Tail recursion lowering.
-
-These target `p06_tail_recursion`, `p07_loop`, `p09_advanced_graph`, and `p10_advanced_matrix`.
-
-## Testing Rules
-
-Every optimization bug must add a regression test before the fix.
-
-Required smoke coverage:
-
-- Minimal return.
-- Function call and recursion.
-- `while` under `-opt` must contain a conditional exit branch.
-- `break` and `continue`.
-- Short-circuit side effects.
-- Global variable and global const use.
-- Semantic error path.
+## Validation
 
 Useful local commands:
 
 ```powershell
-g++ -std=c++20 -O2 -pipe -Ireal/src real/src/main.cpp real/src/lexer.cpp real/src/parser.cpp real/src/semantic.cpp real/src/ast_optimizer.cpp real/src/ir.cpp real/src/ir_builder.cpp real/src/pass.cpp real/src/pass_simplify.cpp real/src/pass_cse.cpp real/src/pass_local.cpp real/src/pass_loop.cpp real/src/pass_dce.cpp real/src/ir_codegen.cpp real/src/codegen.cpp -o compiler.exe
-powershell -ExecutionPolicy Bypass -File real/tests/run_smoke.ps1 -Compiler ..\..\compiler.exe
-powershell -ExecutionPolicy Bypass -File real/tests/run_backend_compare.ps1 -Compiler ..\..\compiler.exe
+mingw32-make
+powershell -ExecutionPolicy Bypass -File real/tests/run_smoke.ps1
+powershell -ExecutionPolicy Bypass -File real/tests/run_backend_compare.ps1
+powershell -ExecutionPolicy Bypass -File real/tests/analyze_perf.ps1 -Compiler "..\..\compiler.exe"
 ```
 
-`run_backend_compare.ps1` compiles representative ToyC snippets both with and
-without `-opt`, executes the generated assembly with the local test interpreter,
-and checks that both backends return the expected exit code.
+The compiler interface remains:
+
+```powershell
+compiler.exe < input.tc > output.s
+compiler.exe -opt < input.tc > output.s
+```

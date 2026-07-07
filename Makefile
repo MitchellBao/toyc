@@ -4,32 +4,61 @@ CXXFLAGS ?= -std=c++20 -O2 -pipe
 TARGET := compiler
 SOURCES := \
 	real/src/main.cpp \
-	real/src/lexer.cpp \
-	real/src/parser.cpp \
-	real/src/semantic.cpp \
-	real/src/ast_optimizer.cpp \
-	real/src/ir.cpp \
-	real/src/ir_builder.cpp \
-	real/src/pass.cpp \
-    real/src/pass_simplify.cpp \
-    real/src/pass_cse.cpp \
-    real/src/pass_local.cpp \
-    real/src/pass_loop.cpp \
-    real/src/pass_dce.cpp \
-	real/src/ir_codegen.cpp \
-	real/src/codegen.cpp
+	real/src/frontend/lexer.cpp \
+	real/src/frontend/parser.cpp \
+	real/src/frontend/semantic.cpp \
+	real/src/driver/compiler_pipeline.cpp \
+	real/src/ir/instruction.cpp \
+	real/src/ir/builder.cpp \
+	real/src/ir/verifier.cpp \
+	real/src/ir/printer.cpp \
+	real/src/analysis/cfg.cpp \
+	real/src/analysis/liveness.cpp \
+	real/src/analysis/side_effect.cpp \
+	real/src/passes/pass_manager.cpp \
+	real/src/passes/canonicalize.cpp \
+	real/src/passes/simplify_cfg.cpp \
+	real/src/passes/const_prop.cpp \
+	real/src/passes/copy_prop.cpp \
+	real/src/passes/cse.cpp \
+	real/src/passes/dce.cpp \
+	real/src/passes/dse.cpp \
+	real/src/passes/licm.cpp \
+	real/src/passes/inline_small.cpp \
+	real/src/passes/tail_recursion.cpp \
+	real/src/target/riscv/isel.cpp \
+	real/src/target/riscv/frame.cpp \
+	real/src/target/riscv/regalloc.cpp \
+	real/src/target/riscv/peephole.cpp \
+	real/src/target/riscv/asm_printer.cpp
 
 HEADERS := \
-	real/src/ast.h \
-	real/src/lexer.h \
-	real/src/parser.h \
-	real/src/semantic.h \
-	real/src/ast_optimizer.h \
-	real/src/ir.h \
-	real/src/ir_builder.h \
-	real/src/ir_codegen.h \
-	real/src/pass.h \
-	real/src/codegen.h
+	real/src/frontend/ast.h \
+	real/src/frontend/lexer.h \
+	real/src/frontend/parser.h \
+	real/src/frontend/semantic.h \
+	real/src/driver/options.h \
+	real/src/driver/compiler_pipeline.h \
+	real/src/ir/value.h \
+	real/src/ir/instruction.h \
+	real/src/ir/basic_block.h \
+	real/src/ir/function.h \
+	real/src/ir/module.h \
+	real/src/ir/builder.h \
+	real/src/ir/verifier.h \
+	real/src/ir/printer.h \
+	real/src/analysis/cfg.h \
+	real/src/analysis/dominator.h \
+	real/src/analysis/loop_info.h \
+	real/src/analysis/liveness.h \
+	real/src/analysis/side_effect.h \
+	real/src/passes/pass_manager.h \
+	real/src/target/riscv/riscv_mir.h \
+	real/src/target/riscv/isel.h \
+	real/src/target/riscv/frame.h \
+	real/src/target/riscv/regalloc.h \
+	real/src/target/riscv/peephole.h \
+	real/src/target/riscv/asm_printer.h
 
 .PHONY: all
 

@@ -1,5 +1,8 @@
 build/
 real/build/
 real/tests/*.s
+real/tests/*.o
+real/tests/*.tmp
+real/tests/debug_*.tc
 compiler
 compiler.exe
