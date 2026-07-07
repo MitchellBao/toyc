@@ -403,6 +403,43 @@ function Assert-NoBranchOverJumpToNextLabel {
     }
 }
 
+function Assert-NoAdjacentStoreLoadSameSlot {
+    param(
+        [string]$Name,
+        [string]$Asm
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    for ($i = 0; $i -lt $lines.Count - 1; ++$i) {
+        if ($lines[$i] -match '^sw\s+\w+,\s*(-?\d+\([^)]+\))$') {
+            $slot = $Matches[1]
+            if ($lines[$i + 1] -match '^lw\s+\w+,\s*(-?\d+\([^)]+\))$' -and $Matches[1] -eq $slot) {
+                throw "$Name contains adjacent store/load from the same stack slot: $($lines[$i]) / $($lines[$i + 1])"
+            }
+        }
+    }
+}
+
+function Assert-OpcodeAtMost {
+    param(
+        [string]$Name,
+        [string]$Asm,
+        [string]$Opcode,
+        [int]$MaxCount
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    $count = 0
+    foreach ($line in $lines) {
+        if ($line -match "^\s*$([regex]::Escape($Opcode))(\s|$)") {
+            ++$count
+        }
+    }
+    if ($count -gt $MaxCount) {
+        throw "$Name has $count $Opcode instructions, expected at most $MaxCount"
+    }
+}
+
 function Get-HottestLoopBody {
     param(
         [string]$Asm
@@ -530,6 +567,31 @@ int main() {
 }
 '@ -Optimize
 Assert-NoBranchOverJumpToNextLabel "backend_branch_peephole" $branchPeepholeAsm
+
+$stackRoundTripAsm = Compile-Source "backend_stack_roundtrip_peephole" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(5);
+    int y = x;
+    int z = y;
+    return z;
+}
+'@ -Optimize
+Assert-NoAdjacentStoreLoadSameSlot "backend_stack_roundtrip_peephole" $stackRoundTripAsm
+
+$irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(5);
+    return (x || 1) + (x && 1) + (x == x) + (x <= x) + (x >= x);
+}
+'@ -Optimize
+Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "seqz" 0
+Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "slt" 0
 
 $loopRegisterAsm = Compile-Source "backend_loop_registers" @'
 int main() {

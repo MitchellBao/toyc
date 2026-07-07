@@ -74,11 +74,13 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
     manager.add(createCanonicalizePass());
     manager.add(createSimplifyCfgPass());
     if (optimize) {
-        manager.add(createConstPropPass());
-        manager.add(createAlgebraicSimplifyPass());
-        manager.add(createCopyPropPass());
-        manager.add(createCsePass());
-        manager.add(createDcePass());
+        for (int iteration = 0; iteration < 4; ++iteration) {
+            manager.add(createConstPropPass());
+            manager.add(createAlgebraicSimplifyPass());
+            manager.add(createCopyPropPass());
+            manager.add(createCsePass());
+            manager.add(createDcePass());
+        }
         manager.add(createDsePass());
         manager.add(createLicmPass());
         manager.add(createTailRecursionPass());

@@ -8,6 +8,14 @@ bool isImm(const ir::Operand& operand, std::int32_t value)
     return operand.isImmediate && operand.immediate == value;
 }
 
+bool samePureOperand(const ir::Operand& lhs, const ir::Operand& rhs)
+{
+    if (lhs.isImmediate || rhs.isImmediate) {
+        return lhs.isImmediate && rhs.isImmediate && lhs.immediate == rhs.immediate;
+    }
+    return lhs.value.id >= 0 && lhs.value.id == rhs.value.id;
+}
+
 void replaceWithCopy(ir::Instruction& inst, ir::Operand operand)
 {
     inst.kind = ir::InstructionKind::Copy;
@@ -80,8 +88,20 @@ bool simplifyBinary(ir::Instruction& inst)
             replaceWithConst(inst, 0);
             return true;
         }
+        if (isImm(lhs, 1)) {
+            replaceWithCopy(inst, rhs);
+            return true;
+        }
+        if (isImm(rhs, 1)) {
+            replaceWithCopy(inst, lhs);
+            return true;
+        }
         return false;
     case ir::BinaryOpcode::LogicalOr:
+        if (isImm(lhs, 1) || isImm(rhs, 1)) {
+            replaceWithConst(inst, 1);
+            return true;
+        }
         if (isImm(lhs, 0)) {
             replaceWithCopy(inst, rhs);
             return true;
@@ -92,11 +112,40 @@ bool simplifyBinary(ir::Instruction& inst)
         }
         return false;
     case ir::BinaryOpcode::Equal:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 1);
+            return true;
+        }
+        return false;
     case ir::BinaryOpcode::NotEqual:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 0);
+            return true;
+        }
+        return false;
     case ir::BinaryOpcode::Less:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 0);
+            return true;
+        }
+        return false;
     case ir::BinaryOpcode::LessEqual:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 1);
+            return true;
+        }
+        return false;
     case ir::BinaryOpcode::Greater:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 0);
+            return true;
+        }
+        return false;
     case ir::BinaryOpcode::GreaterEqual:
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 1);
+            return true;
+        }
         return false;
     }
     return false;
