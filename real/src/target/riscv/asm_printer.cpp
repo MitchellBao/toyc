@@ -544,9 +544,12 @@ private:
             out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
             break;
         case ir::TerminatorKind::Branch:
-            out_ << "  beqz " << readOperand(terminator.condition, "t0") << ", " << labelFor(terminator.falseBlock) << "\n";
-            out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
-            break;
+            {
+                const std::string conditionReg = readOperand(terminator.condition, "t0");
+                out_ << "  beqz " << conditionReg << ", " << labelFor(terminator.falseBlock) << "\n";
+                out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
+                break;
+            }
         case ir::TerminatorKind::Return:
             if (terminator.hasReturnValue) {
                 loadOperand(terminator.returnValue, "a0");

@@ -307,7 +307,8 @@ function Assert-RiscVAssemblyAccepted {
     $asmPath = Join-Path $Root "$Name.$Suffix.llvm.s"
     $objPath = Join-Path $Root "$Name.$Suffix.o"
     Set-Content -LiteralPath $asmPath -Value $Asm -Encoding ascii
-    & $Clang.FullName --target=riscv32-unknown-elf -march=rv32im -mabi=ilp32 -c $asmPath -o $objPath
+    $clangPath = if ($Clang.PSObject.Properties.Name -contains "Path") { $Clang.Path } else { $Clang.FullName }
+    & $clangPath --target=riscv32-unknown-elf -march=rv32im -mabi=ilp32 -c $asmPath -o $objPath
     if ($LASTEXITCODE -ne 0) {
         throw "$Name $Suffix LLVM RISC-V assembly failed"
     }
