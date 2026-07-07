@@ -72,7 +72,7 @@ foreach ($needle in @(".globl main", "main:", "call add", "call fact", "beqz")) 
 $flowInput = Join-Path $Root "control_flow.tc"
 $flowOutput = Join-Path $Root "control_flow.s"
 $flowAsm = Compile-Source "control_flow" (Get-Content -LiteralPath $flowInput -Raw) $flowOutput
-foreach ($needle in @("call bump", "rem", "beqz", ".L_main_")) {
+foreach ($needle in @("call bump", "beqz", ".L_main_")) {
     if (-not $flowAsm.Contains($needle)) {
         throw "control_flow.s missing expected assembly fragment: $needle"
     }

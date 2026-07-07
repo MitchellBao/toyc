@@ -43,6 +43,47 @@ bool isPositivePowerOfTwo(std::int32_t value)
     return value > 0 && (value & (value - 1)) == 0;
 }
 
+struct DivMagic {
+    std::int32_t multiplier = 0;
+    int shift = 0;
+    bool addDividend = false;
+};
+
+DivMagic computePositiveDivMagic(std::int32_t divisor)
+{
+    const std::uint32_t twoP31 = 0x80000000u;
+    const std::uint32_t ad = static_cast<std::uint32_t>(divisor);
+    const std::uint32_t anc = twoP31 - 1 - (twoP31 - 1) % ad;
+    int p = 31;
+    std::uint32_t q1 = twoP31 / anc;
+    std::uint32_t r1 = twoP31 - q1 * anc;
+    std::uint32_t q2 = twoP31 / ad;
+    std::uint32_t r2 = twoP31 - q2 * ad;
+    std::uint32_t delta = 0;
+    do {
+        ++p;
+        q1 *= 2;
+        r1 *= 2;
+        if (r1 >= anc) {
+            ++q1;
+            r1 -= anc;
+        }
+        q2 *= 2;
+        r2 *= 2;
+        if (r2 >= ad) {
+            ++q2;
+            r2 -= ad;
+        }
+        delta = ad - r2;
+    } while (q1 < delta || (q1 == delta && r1 == 0));
+
+    DivMagic result;
+    result.multiplier = static_cast<std::int32_t>(q2 + 1);
+    result.shift = p - 32;
+    result.addDividend = result.multiplier < 0;
+    return result;
+}
+
 int log2PowerOfTwo(std::int32_t value)
 {
     int shift = 0;
@@ -541,6 +582,68 @@ private:
         storeValue(inst.dst, dstReg);
     }
 
+    bool emitDivModByConstant(const ir::Instruction& inst, std::int32_t divisor, bool isModulo)
+    {
+        if (divisor == 0) {
+            return false;
+        }
+
+        const std::string dstReg = writeReg(inst.dst, "t0");
+        loadOperand(inst.operands[0], "t2");
+
+        auto finish = [&]() {
+            storeValue(inst.dst, dstReg);
+            return true;
+        };
+
+        if (divisor == 1 || divisor == -1) {
+            if (isModulo) {
+                out_ << "  li " << dstReg << ", 0\n";
+            } else if (divisor == 1) {
+                out_ << "  mv " << dstReg << ", t2\n";
+            } else {
+                out_ << "  neg " << dstReg << ", t2\n";
+            }
+            return finish();
+        }
+
+        if (isPositivePowerOfTwo(divisor)) {
+            const int shift = log2PowerOfTwo(divisor);
+            out_ << "  srai t1, t2, 31\n";
+            out_ << "  srli t1, t1, " << (32 - shift) << "\n";
+            out_ << "  add " << dstReg << ", t2, t1\n";
+            out_ << "  srai " << dstReg << ", " << dstReg << ", " << shift << "\n";
+            if (isModulo) {
+                out_ << "  slli t1, " << dstReg << ", " << shift << "\n";
+                out_ << "  sub " << dstReg << ", t2, t1\n";
+            }
+            return finish();
+        }
+
+        if (divisor < 0) {
+            return false;
+        }
+
+        const DivMagic magic = computePositiveDivMagic(divisor);
+        out_ << "  li t1, " << magic.multiplier << "\n";
+        out_ << "  mulh " << dstReg << ", t2, t1\n";
+        if (magic.addDividend) {
+            out_ << "  add " << dstReg << ", " << dstReg << ", t2\n";
+        }
+        if (magic.shift > 0) {
+            out_ << "  srai " << dstReg << ", " << dstReg << ", " << magic.shift << "\n";
+        }
+        out_ << "  srli t1, t2, 31\n";
+        out_ << "  add " << dstReg << ", " << dstReg << ", t1\n";
+
+        if (isModulo) {
+            out_ << "  li t1, " << divisor << "\n";
+            out_ << "  mul t1, " << dstReg << ", t1\n";
+            out_ << "  sub " << dstReg << ", t2, t1\n";
+        }
+        return finish();
+    }
+
     bool emitBinaryWithImmediate(const ir::Instruction& inst)
     {
         if (inst.operands.size() != 2) {
@@ -649,7 +752,9 @@ private:
                 }
                 return false;
             case ir::BinaryOpcode::Div:
+                return emitDivModByConstant(inst, value, false);
             case ir::BinaryOpcode::Mod:
+                return emitDivModByConstant(inst, value, true);
             case ir::BinaryOpcode::LogicalAnd:
             case ir::BinaryOpcode::LogicalOr:
                 return false;
