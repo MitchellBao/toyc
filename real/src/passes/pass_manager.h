@@ -38,6 +38,7 @@ std::unique_ptr<Pass> createGlobalConstPropPass();
 std::unique_ptr<Pass> createAlgebraicSimplifyPass();
 std::unique_ptr<Pass> createCopyPropPass();
 std::unique_ptr<Pass> createCsePass();
+std::unique_ptr<Pass> createInstCombinePass();
 std::unique_ptr<Pass> createDcePass();
 std::unique_ptr<Pass> createDsePass();
 std::unique_ptr<Pass> createLicmPass();

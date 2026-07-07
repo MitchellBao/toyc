@@ -9,7 +9,7 @@
 namespace toyc::passes {
 namespace {
 
-constexpr std::size_t kMaxInlineInstructions = 120;
+constexpr std::size_t kMaxInlineInstructions = 400;
 
 ir::Value newValue(ir::Function& function)
 {

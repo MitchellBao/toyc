@@ -26,7 +26,10 @@ bool isHoistablePure(const ir::Instruction& inst)
     }
     if (inst.kind == ir::InstructionKind::Binary
         && (inst.binaryOp == ir::BinaryOpcode::Div || inst.binaryOp == ir::BinaryOpcode::Mod)) {
-        return false;
+        return definesValue(inst)
+            && inst.operands.size() == 2
+            && inst.operands[1].isImmediate
+            && inst.operands[1].immediate != 0;
     }
     switch (inst.kind) {
     case ir::InstructionKind::Const:

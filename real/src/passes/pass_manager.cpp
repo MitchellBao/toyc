@@ -80,6 +80,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
             manager.add(createCsePass());
+            manager.add(createInstCombinePass());
             manager.add(createSimplifyCfgPass());
             manager.add(createDcePass());
         }
@@ -94,8 +95,10 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
             manager.add(createCsePass());
+            manager.add(createInstCombinePass());
             manager.add(createDcePass());
             manager.add(createDsePass());
+            manager.add(createLicmPass());
             manager.add(createLoopSumPass());
             manager.add(createSimplifyCfgPass());
         }

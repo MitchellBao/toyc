@@ -435,6 +435,247 @@ std::optional<std::int32_t> closedFormSum(
     return int32Value(*safeTotal);
 }
 
+std::optional<ir::Operand> resolveCopy(
+    ir::Operand operand,
+    const std::unordered_map<int, ir::Operand>& copies)
+{
+    for (int depth = 0; depth < 8 && !operand.isImmediate && operand.value.id >= 0; ++depth) {
+        const auto found = copies.find(operand.value.id);
+        if (found == copies.end()) {
+            break;
+        }
+        operand = found->second;
+    }
+    return operand;
+}
+
+struct BinaryDef {
+    ir::BinaryOpcode op = ir::BinaryOpcode::Add;
+    ir::Operand lhs;
+    ir::Operand rhs;
+};
+
+bool isLoadOfLocal(
+    ir::Operand operand,
+    const std::string& symbol,
+    const std::unordered_map<int, ir::Operand>& copies,
+    const std::unordered_map<int, std::string>& loadedLocal)
+{
+    const auto resolved = resolveCopy(operand, copies);
+    if (!resolved.has_value() || resolved->isImmediate || resolved->value.id < 0) {
+        return false;
+    }
+    const auto found = loadedLocal.find(resolved->value.id);
+    return found != loadedLocal.end() && found->second == symbol;
+}
+
+std::optional<std::int32_t> constOperandValue(
+    ir::Operand operand,
+    const std::unordered_map<int, ir::Operand>& copies,
+    const std::unordered_map<int, std::int32_t>& constants)
+{
+    const auto resolved = resolveCopy(operand, copies);
+    if (!resolved.has_value()) {
+        return std::nullopt;
+    }
+    if (resolved->isImmediate) {
+        return resolved->immediate;
+    }
+    const auto found = constants.find(resolved->value.id);
+    if (found == constants.end()) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+std::optional<ir::Operand> invariantOperand(
+    ir::Operand operand,
+    const std::unordered_map<int, ir::Operand>& copies,
+    const std::unordered_set<int>& definedInBody)
+{
+    const auto resolved = resolveCopy(operand, copies);
+    if (!resolved.has_value()) {
+        return std::nullopt;
+    }
+    if (resolved->isImmediate || resolved->value.id < 0) {
+        return resolved;
+    }
+    if (definedInBody.find(resolved->value.id) != definedInBody.end()) {
+        return std::nullopt;
+    }
+    return resolved;
+}
+
+bool tryInvariantAccumulationLoop(
+    ir::Function& function,
+    int header,
+    int exitIndex,
+    ir::BasicBlock& body,
+    const std::string& induction,
+    std::int32_t start,
+    std::int32_t step,
+    int trips)
+{
+    std::unordered_set<int> definedInBody;
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.dst.id >= 0) {
+            definedInBody.insert(inst.dst.id);
+        }
+    }
+
+    std::unordered_map<int, std::int32_t> constants;
+    std::unordered_map<int, ir::Operand> copies;
+    std::unordered_map<int, std::string> loadedLocal;
+    std::unordered_map<int, BinaryDef> binaryDefs;
+    std::optional<std::string> accumulator;
+    std::optional<ir::Operand> increment;
+    bool sawInductionStore = false;
+
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind == ir::InstructionKind::Const
+            && inst.dst.id >= 0
+            && !inst.operands.empty()
+            && inst.operands[0].isImmediate) {
+            constants[inst.dst.id] = inst.operands[0].immediate;
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+            loadedLocal[inst.dst.id] = inst.symbol;
+            constants.erase(inst.dst.id);
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
+            copies[inst.dst.id] = resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]);
+            constants.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+            binaryDefs[inst.dst.id] = BinaryDef{
+                inst.binaryOp,
+                resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]),
+                resolveCopy(inst.operands[1], copies).value_or(inst.operands[1]),
+            };
+            constants.erase(inst.dst.id);
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind != ir::InstructionKind::StoreLocal || inst.symbol.empty() || inst.operands.empty()) {
+            return false;
+        }
+
+        const ir::Operand stored = resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]);
+        if (stored.isImmediate || stored.value.id < 0) {
+            return false;
+        }
+        const auto def = binaryDefs.find(stored.value.id);
+        if (def == binaryDefs.end()) {
+            return false;
+        }
+
+        if (inst.symbol == induction) {
+            const bool lhsSelf = isLoadOfLocal(def->second.lhs, induction, copies, loadedLocal);
+            const bool rhsSelf = isLoadOfLocal(def->second.rhs, induction, copies, loadedLocal);
+            std::optional<std::int32_t> delta;
+            if (def->second.op == ir::BinaryOpcode::Add && lhsSelf) {
+                delta = constOperandValue(def->second.rhs, copies, constants);
+            } else if (def->second.op == ir::BinaryOpcode::Add && rhsSelf) {
+                delta = constOperandValue(def->second.lhs, copies, constants);
+            } else if (def->second.op == ir::BinaryOpcode::Sub && lhsSelf) {
+                if (const auto value = constOperandValue(def->second.rhs, copies, constants); value.has_value()) {
+                    delta = -*value;
+                }
+            }
+            if (!delta.has_value() || *delta != step) {
+                return false;
+            }
+            sawInductionStore = true;
+            continue;
+        }
+
+        if (accumulator.has_value()) {
+            return false;
+        }
+        if (def->second.op != ir::BinaryOpcode::Add) {
+            return false;
+        }
+        const bool lhsAcc = isLoadOfLocal(def->second.lhs, inst.symbol, copies, loadedLocal);
+        const bool rhsAcc = isLoadOfLocal(def->second.rhs, inst.symbol, copies, loadedLocal);
+        if (lhsAcc == rhsAcc) {
+            return false;
+        }
+        const auto candidate = invariantOperand(lhsAcc ? def->second.rhs : def->second.lhs, copies, definedInBody);
+        if (!candidate.has_value()) {
+            return false;
+        }
+        accumulator = inst.symbol;
+        increment = *candidate;
+    }
+
+    if (!sawInductionStore || !accumulator.has_value() || !increment.has_value()) {
+        return false;
+    }
+
+    std::unordered_set<std::string> liveAfterLoop;
+    for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
+        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
+                liveAfterLoop.insert(inst.symbol);
+            }
+        }
+    }
+    if (liveAfterLoop.find(*accumulator) == liveAfterLoop.end()) {
+        return false;
+    }
+
+    std::vector<ir::Instruction> replacement;
+    ir::Instruction load;
+    load.kind = ir::InstructionKind::LoadLocal;
+    load.symbol = *accumulator;
+    load.dst = ir::Value{function.nextValue++};
+    replacement.push_back(load);
+
+    ir::Operand scaled = *increment;
+    if (trips != 1) {
+        ir::Instruction mul;
+        mul.kind = ir::InstructionKind::Binary;
+        mul.binaryOp = ir::BinaryOpcode::Mul;
+        mul.dst = ir::Value{function.nextValue++};
+        mul.operands = {*increment, ir::Operand::imm(trips)};
+        replacement.push_back(mul);
+        scaled = ir::Operand::ref(mul.dst);
+    }
+
+    ir::Instruction add;
+    add.kind = ir::InstructionKind::Binary;
+    add.binaryOp = ir::BinaryOpcode::Add;
+    add.dst = ir::Value{function.nextValue++};
+    add.operands = {ir::Operand::ref(load.dst), scaled};
+    replacement.push_back(add);
+
+    ir::Instruction store;
+    store.kind = ir::InstructionKind::StoreLocal;
+    store.symbol = *accumulator;
+    store.operands = {ir::Operand::ref(add.dst)};
+    replacement.push_back(store);
+
+    ir::Instruction inductionStore;
+    inductionStore.kind = ir::InstructionKind::StoreLocal;
+    inductionStore.symbol = induction;
+    inductionStore.operands = {ir::Operand::imm(static_cast<std::int32_t>(start + static_cast<std::int64_t>(step) * trips))};
+    replacement.push_back(inductionStore);
+
+    ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+    mutableHeader.instructions = std::move(replacement);
+    mutableHeader.terminator = {};
+    mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
+    mutableHeader.terminator.trueBlock = exitIndex;
+    mutableHeader.hasTerminator = true;
+    return true;
+}
+
 std::optional<std::int32_t> initialLocalConst(const ir::Function& function, int header, const std::string& symbol)
 {
     std::optional<std::int32_t> value;
@@ -800,6 +1041,9 @@ bool runOnLoop(ir::Function& function, int header)
     const auto trips = tripCount(*cmpOp, *start, *bound, step);
     if (!trips.has_value()) {
         return false;
+    }
+    if (tryInvariantAccumulationLoop(function, header, exitIndex, body, *induction, *start, step, *trips)) {
+        return true;
     }
 
     std::vector<ir::Instruction> replacement;
