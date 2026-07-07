@@ -200,6 +200,7 @@ private:
         std::unordered_set<std::string> locals;
         int valueCount = 0;
         bool hasCall = false;
+        bool hasSelfCall = false;
         int maxCallArgs = 0;
 
         for (const std::string& param : function_.params) {
@@ -215,6 +216,7 @@ private:
                 }
                 if (inst.kind == ir::InstructionKind::Call) {
                     hasCall = true;
+                    hasSelfCall = hasSelfCall || inst.symbol == function_.name;
                     maxCallArgs = std::max(maxCallArgs, static_cast<int>(inst.operands.size()));
                 }
             }
@@ -228,7 +230,7 @@ private:
         }
         collectSkippedLocalUpdateDefs();
         const auto intervals = analysis::computeLocalIntervals(function_);
-        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals), !hasCall, reservedRegs);
+        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals), !hasCall, reservedRegs, hasSelfCall ? 1 : -1);
         collectSavedRegs();
 
         outgoingArgBytes_ = std::max(0, maxCallArgs - 8) * 4;

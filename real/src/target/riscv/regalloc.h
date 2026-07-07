@@ -14,7 +14,8 @@ public:
         const std::unordered_map<int, analysis::LiveInterval>& intervals,
         const std::unordered_set<int>& liveAcrossCalls = {},
         bool mayUseArgumentRegs = false,
-        const std::unordered_set<std::string>& reservedRegs = {}) const;
+        const std::unordered_set<std::string>& reservedRegs = {},
+        int calleeSavedLimit = -1) const;
 };
 
 } // namespace toyc::riscv
