@@ -6,14 +6,63 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CompilerPath = Resolve-Path -LiteralPath (Join-Path $Root $Compiler)
 
-$basicInput = Join-Path $Root "basic.tc"
-$basicOutput = Join-Path $Root "basic.s"
-Get-Content -LiteralPath $basicInput -Raw | & $CompilerPath > $basicOutput
-if ($LASTEXITCODE -ne 0) {
-    throw "basic.tc compilation failed"
+function Invoke-Compiler {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [switch]$Optimize
+    )
+
+    $mode = if ($Optimize) { "opt" } else { "plain" }
+    $inputPath = Join-Path $Root "$Name.$mode.input.tc"
+    $stdoutPath = Join-Path $Root "$Name.$mode.stdout.tmp"
+    $stderrPath = Join-Path $Root "$Name.$mode.stderr.tmp"
+    Set-Content -LiteralPath $inputPath -Value $Source -Encoding ascii
+
+    $compilerCommand = '"' + $CompilerPath.Path + '"'
+    if ($Optimize) {
+        $compilerCommand += " -opt"
+    }
+    $cmdLine = "$compilerCommand < `"$inputPath`" > `"$stdoutPath`" 2> `"$stderrPath`""
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $env:ComSpec
+    $psi.Arguments = "/d /s /c `"$cmdLine`""
+    $psi.UseShellExecute = $false
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $process.WaitForExit()
+
+    $stdout = Get-Content -LiteralPath $stdoutPath -Raw
+    $stderr = Get-Content -LiteralPath $stderrPath -Raw
+    Remove-Item -LiteralPath $inputPath
+    Remove-Item -LiteralPath $stdoutPath
+    Remove-Item -LiteralPath $stderrPath
+
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $stdout
+        Stderr = $stderr
+    }
 }
 
-$asm = Get-Content -LiteralPath $basicOutput -Raw
+function Compile-Source {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [string]$Output,
+        [switch]$Optimize
+    )
+
+    $result = Invoke-Compiler $Name $Source -Optimize:$Optimize
+    if ($result.ExitCode -ne 0) {
+        throw "$Name compilation failed: $($result.Stderr)"
+    }
+    Set-Content -LiteralPath $Output -Value $result.Stdout -Encoding ascii
+    return Get-Content -LiteralPath $Output -Raw
+}
+
+$basicInput = Join-Path $Root "basic.tc"
+$basicOutput = Join-Path $Root "basic.s"
+$asm = Compile-Source "basic" (Get-Content -LiteralPath $basicInput -Raw) $basicOutput
 foreach ($needle in @(".globl main", "main:", "call add", "call fact", "beqz")) {
     if (-not $asm.Contains($needle)) {
         throw "basic.s missing expected assembly fragment: $needle"
@@ -22,12 +71,7 @@ foreach ($needle in @(".globl main", "main:", "call add", "call fact", "beqz")) 
 
 $flowInput = Join-Path $Root "control_flow.tc"
 $flowOutput = Join-Path $Root "control_flow.s"
-Get-Content -LiteralPath $flowInput -Raw | & $CompilerPath > $flowOutput
-if ($LASTEXITCODE -ne 0) {
-    throw "control_flow.tc compilation failed"
-}
-
-$flowAsm = Get-Content -LiteralPath $flowOutput -Raw
+$flowAsm = Compile-Source "control_flow" (Get-Content -LiteralPath $flowInput -Raw) $flowOutput
 foreach ($needle in @("call bump", "rem", ".L_or_true_", ".L_while_cond_")) {
     if (-not $flowAsm.Contains($needle)) {
         throw "control_flow.s missing expected assembly fragment: $needle"
@@ -46,19 +90,14 @@ int main() {
 }
 '@
 $optOutput = Join-Path $Root "optimized_loop.s"
-$optimizedLoop | & $CompilerPath -opt > $optOutput
-if ($LASTEXITCODE -ne 0) {
-    throw "optimized loop compilation failed"
-}
-
-$optAsm = Get-Content -LiteralPath $optOutput -Raw
+$optAsm = Compile-Source "optimized_loop" $optimizedLoop $optOutput -Optimize
 if (-not ($optAsm.Contains("beqz") -or $optAsm.Contains("bnez"))) {
     throw "optimized loop condition was incorrectly folded away"
 }
 
 $semanticInput = Join-Path $Root "semantic_error.tc"
-Get-Content -LiteralPath $semanticInput -Raw | & $CompilerPath > $null
-if ($LASTEXITCODE -eq 0) {
+$semanticResult = Invoke-Compiler "semantic_error" (Get-Content -LiteralPath $semanticInput -Raw)
+if ($semanticResult.ExitCode -eq 0) {
     throw "semantic_error.tc should fail"
 }
 
@@ -69,11 +108,7 @@ function Compile-OptSnippet {
     )
 
     $output = Join-Path $Root "$Name.s"
-    $Source | & $CompilerPath -opt > $output
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Name optimized compilation failed"
-    }
-    return Get-Content -LiteralPath $output -Raw
+    return Compile-Source $Name $Source $output -Optimize
 }
 
 function Count-Fragment {

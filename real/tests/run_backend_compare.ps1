@@ -13,6 +13,44 @@ if ($null -eq $Clang) {
     }
 }
 
+function Invoke-Compiler {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [switch]$Optimize
+    )
+
+    $mode = if ($Optimize) { "opt" } else { "plain" }
+    $inputPath = Join-Path $Root "$Name.$mode.input.tc"
+    $stdoutPath = Join-Path $Root "$Name.$mode.stdout.tmp"
+    $stderrPath = Join-Path $Root "$Name.$mode.stderr.tmp"
+    Set-Content -LiteralPath $inputPath -Value $Source -Encoding ascii
+
+    $compilerCommand = '"' + $CompilerPath.Path + '"'
+    if ($Optimize) {
+        $compilerCommand += " -opt"
+    }
+    $cmdLine = "$compilerCommand < `"$inputPath`" > `"$stdoutPath`" 2> `"$stderrPath`""
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $env:ComSpec
+    $psi.Arguments = "/d /s /c `"$cmdLine`""
+    $psi.UseShellExecute = $false
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $process.WaitForExit()
+
+    $stdout = Get-Content -LiteralPath $stdoutPath -Raw
+    $stderr = Get-Content -LiteralPath $stderrPath -Raw
+    Remove-Item -LiteralPath $inputPath
+    Remove-Item -LiteralPath $stdoutPath
+    Remove-Item -LiteralPath $stderrPath
+
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $stdout
+        Stderr = $stderr
+    }
+}
+
 function Invoke-RiscVMain {
     param(
         [string]$Asm,
@@ -227,14 +265,11 @@ function Compile-Source {
 
     $suffix = if ($Optimize) { "opt" } else { "ast" }
     $output = Join-Path $Root "$Name.$suffix.s"
-    if ($Optimize) {
-        $Source | & $CompilerPath -opt > $output
-    } else {
-        $Source | & $CompilerPath > $output
+    $result = Invoke-Compiler $Name $Source -Optimize:$Optimize
+    if ($result.ExitCode -ne 0) {
+        throw "$Name $suffix compilation failed: $($result.Stderr)"
     }
-    if ($LASTEXITCODE -ne 0) {
-        throw "$Name $suffix compilation failed"
-    }
+    Set-Content -LiteralPath $output -Value $result.Stdout -Encoding ascii
     return Get-Content -LiteralPath $output -Raw
 }
 
@@ -282,6 +317,77 @@ function Assert-BackendsAgree {
     }
 }
 
+function Assert-NoJumpToNextLabel {
+    param(
+        [string]$Name,
+        [string]$Asm
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    for ($i = 0; $i -lt $lines.Count - 1; ++$i) {
+        if ($lines[$i] -match '^j\s+(\S+)$' -and $lines[$i + 1] -eq "$($Matches[1]):") {
+            throw "$Name contains jump to immediately following label: $($lines[$i])"
+        }
+    }
+}
+
+function Assert-SavedRegTrafficAtMost {
+    param(
+        [string]$Name,
+        [string]$Asm,
+        [int]$MaxCount
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    $count = 0
+    foreach ($line in $lines) {
+        if ($line -match '^(sw|lw)\s+s(1|2|3|4|5|6|7|8|9|10|11),\s') {
+            ++$count
+        }
+    }
+    if ($count -gt $MaxCount) {
+        throw "$Name has $count saved-register save/restore instructions, expected at most $MaxCount"
+    }
+}
+
+function Assert-NoBranchOverJumpToNextLabel {
+    param(
+        [string]$Name,
+        [string]$Asm
+    )
+
+    $lines = @($Asm -split "`r?`n" | ForEach-Object { ($_ -replace '#.*$', '').Trim() } | Where-Object { $_.Length -gt 0 })
+    for ($i = 0; $i -lt $lines.Count - 2; ++$i) {
+        if ($lines[$i] -match '^(beqz|bnez)\s+[^,]+,\s*(\S+)$') {
+            $branchTarget = $Matches[2]
+            if ($lines[$i + 1] -match '^j\s+\S+$' -and $lines[$i + 2] -eq "${branchTarget}:") {
+                throw "$Name contains branch over jump to immediately following label: $($lines[$i])"
+            }
+        }
+    }
+}
+
+Assert-BackendsAgree "backend_simple_call_args" @'
+int add(int a, int b) {
+    return a + b;
+}
+int main() {
+    return add(1, 2);
+}
+'@ 3
+
+Assert-BackendsAgree "backend_nested_call_args" @'
+int f(int x) {
+    return x + 1;
+}
+int g(int x) {
+    return x * 2;
+}
+int main() {
+    return f(g(10));
+}
+'@ 21
+
 Assert-BackendsAgree "backend_call_global" @'
 int g = 1;
 int setg(int x) {
@@ -320,5 +426,39 @@ int main() {
     return sum9(1,2,3,4,5,6,7,8,9);
 }
 '@ 45
+
+$peepholeAsm = Compile-Source "backend_peephole" @'
+int main() {
+    return 3;
+}
+'@ -Optimize
+Assert-NoJumpToNextLabel "backend_peephole" $peepholeAsm
+
+$branchPeepholeAsm = Compile-Source "backend_branch_peephole" @'
+int main() {
+    int i = 0;
+    while (i < 3) {
+        i = i + 1;
+    }
+    return i;
+}
+'@ -Optimize
+Assert-NoBranchOverJumpToNextLabel "backend_branch_peephole" $branchPeepholeAsm
+
+$smallCallAsm = Compile-Source "backend_small_call_traffic" @'
+int add(int a, int b) {
+    return a + b;
+}
+int f(int x) {
+    return x + 1;
+}
+int g(int x) {
+    return x * 2;
+}
+int main() {
+    return add(1, 2) + f(g(10));
+}
+'@ -Optimize
+Assert-SavedRegTrafficAtMost "backend_small_call_traffic" $smallCallAsm 0
 
 Write-Host "ToyC backend comparison tests passed"

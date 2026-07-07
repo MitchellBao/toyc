@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <ostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -60,6 +61,179 @@ std::string sanitizeLabel(const std::string& name)
     return result;
 }
 
+std::string trim(const std::string& text)
+{
+    const std::size_t begin = text.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const std::size_t end = text.find_last_not_of(" \t\r\n");
+    return text.substr(begin, end - begin + 1);
+}
+
+bool startsWith(const std::string& text, const std::string& prefix)
+{
+    return text.rfind(prefix, 0) == 0;
+}
+
+bool isLabelLine(const std::string& line)
+{
+    return !line.empty() && line.back() == ':';
+}
+
+bool parseRegisterPair(const std::string& line, const std::string& opcode, std::string& lhs, std::string& rhs)
+{
+    const std::string prefix = opcode + " ";
+    if (!startsWith(line, prefix)) {
+        return false;
+    }
+    const std::size_t comma = line.find(',', prefix.size());
+    if (comma == std::string::npos) {
+        return false;
+    }
+    lhs = trim(line.substr(prefix.size(), comma - prefix.size()));
+    rhs = trim(line.substr(comma + 1));
+    return !lhs.empty() && !rhs.empty();
+}
+
+bool parseJump(const std::string& line, std::string& label)
+{
+    if (!startsWith(line, "j ")) {
+        return false;
+    }
+    label = trim(line.substr(2));
+    return !label.empty();
+}
+
+bool parseLi(const std::string& line, std::string& reg, std::string& imm)
+{
+    return parseRegisterPair(line, "li", reg, imm);
+}
+
+bool parseBranchZero(const std::string& line, std::string& opcode, std::string& reg, std::string& label)
+{
+    if (!startsWith(line, "beqz ") && !startsWith(line, "bnez ")) {
+        return false;
+    }
+    const std::size_t space = line.find(' ');
+    const std::size_t comma = line.find(',', space + 1);
+    if (space == std::string::npos || comma == std::string::npos) {
+        return false;
+    }
+    opcode = line.substr(0, space);
+    reg = trim(line.substr(space + 1, comma - space - 1));
+    label = trim(line.substr(comma + 1));
+    return !reg.empty() && !label.empty();
+}
+
+std::vector<std::string> splitLines(const std::string& text)
+{
+    std::vector<std::string> lines;
+    std::istringstream input(text);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        lines.push_back(line);
+    }
+    return lines;
+}
+
+std::string joinLines(const std::vector<std::string>& lines)
+{
+    std::ostringstream output;
+    for (const std::string& line : lines) {
+        output << line << '\n';
+    }
+    return output.str();
+}
+
+std::string peepholeRiscV(const std::string& assembly)
+{
+    const std::vector<std::string> input = splitLines(assembly);
+    std::vector<std::string> kept;
+    kept.reserve(input.size());
+
+    bool unreachable = false;
+    std::string previousLiReg;
+    std::string previousLiImm;
+    bool hasPreviousLi = false;
+
+    for (const std::string& rawLine : input) {
+        const std::string line = trim(rawLine);
+        if (line.empty()) {
+            kept.push_back(rawLine);
+            continue;
+        }
+
+        if (isLabelLine(line) || startsWith(line, ".") || line == ".text" || line == ".data") {
+            unreachable = false;
+            hasPreviousLi = false;
+            kept.push_back(rawLine);
+            continue;
+        }
+
+        if (unreachable) {
+            continue;
+        }
+
+        std::string dst;
+        std::string src;
+        if (parseRegisterPair(line, "mv", dst, src) && dst == src) {
+            continue;
+        }
+
+        std::string liReg;
+        std::string liImm;
+        if (parseLi(line, liReg, liImm)) {
+            if (hasPreviousLi && previousLiReg == liReg && previousLiImm == liImm) {
+                continue;
+            }
+            previousLiReg = liReg;
+            previousLiImm = liImm;
+            hasPreviousLi = true;
+        } else {
+            hasPreviousLi = false;
+        }
+
+        kept.push_back(rawLine);
+
+        if (startsWith(line, "j ") || line == "ret") {
+            unreachable = true;
+        }
+    }
+
+    std::vector<std::string> output;
+    output.reserve(kept.size());
+    for (std::size_t i = 0; i < kept.size(); ++i) {
+        const std::string line = trim(kept[i]);
+        std::string branchOpcode;
+        std::string branchReg;
+        std::string branchTarget;
+        std::string jumpTarget;
+        if (parseBranchZero(line, branchOpcode, branchReg, branchTarget) && i + 2 < kept.size()
+            && parseJump(trim(kept[i + 1]), jumpTarget)
+            && trim(kept[i + 2]) == branchTarget + ":") {
+            const std::string inverted = branchOpcode == "bnez" ? "beqz" : "bnez";
+            output.push_back("  " + inverted + " " + branchReg + ", " + jumpTarget);
+            ++i;
+            continue;
+        }
+
+        std::string label;
+        if (parseJump(line, label) && i + 1 < kept.size()) {
+            const std::string next = trim(kept[i + 1]);
+            if (next == label + ":") {
+                continue;
+            }
+        }
+        output.push_back(kept[i]);
+    }
+
+    return joinLines(output);
+}
+
 const char* savedRegName(int index)
 {
     static const char* regs[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
@@ -109,7 +283,7 @@ private:
         };
 
         for (const std::string& param : function_.params) {
-            touchLocal(param, 4);
+            touchLocal(param, 0);
         }
 
         int maxValue = -1;
@@ -144,11 +318,20 @@ private:
             return lhs < rhs;
         });
 
-        const int regBudget = std::min<int>(11, static_cast<int>(orderedLocals.size()));
-        for (int i = 0; i < regBudget; ++i) {
-            locals_[orderedLocals[i]] = LocalSlot{true, i, 0};
-            usedSavedRegs_.push_back(i);
+        int nextSavedReg = 0;
+        for (const std::string& local : orderedLocals) {
+            if (nextSavedReg >= 11) {
+                break;
+            }
+            if (localUseCounts[local] < 4) {
+                continue;
+            }
+            locals_[local] = LocalSlot{true, nextSavedReg, 0};
+            usedSavedRegs_.push_back(nextSavedReg);
+            ++nextSavedReg;
         }
+
+        const int regBudget = nextSavedReg;
 
         std::vector<std::pair<int, int>> hotValues;
         hotValues.reserve(valueUseCounts_.size());
@@ -841,17 +1024,20 @@ bool IrRiscVCodeGenerator::canGenerate(const ir::Module& module) const
 
 void IrRiscVCodeGenerator::generate(const ir::Module& module, std::ostream& out) const
 {
-    out << ".data\n";
+    std::ostringstream buffer;
+    buffer << ".data\n";
     for (const auto& global : module.globals) {
-        out << ".globl g_" << sanitizeLabel(global.name) << "\n";
-        out << "g_" << sanitizeLabel(global.name) << ":\n";
-        out << "  .word " << global.init << "\n";
+        buffer << ".globl g_" << sanitizeLabel(global.name) << "\n";
+        buffer << "g_" << sanitizeLabel(global.name) << ":\n";
+        buffer << "  .word " << global.init << "\n";
     }
 
-    out << "\n.text\n";
+    buffer << "\n.text\n";
     for (const auto& function : module.functions) {
-        FunctionEmitter(function, out).emit();
+        FunctionEmitter(function, buffer).emit();
     }
+
+    out << peepholeRiscV(buffer.str());
 }
 
 } // namespace toyc
