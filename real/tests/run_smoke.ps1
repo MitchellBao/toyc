@@ -34,6 +34,28 @@ foreach ($needle in @("call bump", "rem", ".L_or_true_", ".L_while_cond_")) {
     }
 }
 
+$optimizedLoop = @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 10) {
+        i = i + 1;
+        s = s + i;
+    }
+    return s;
+}
+'@
+$optOutput = Join-Path $Root "optimized_loop.s"
+$optimizedLoop | & $CompilerPath -opt > $optOutput
+if ($LASTEXITCODE -ne 0) {
+    throw "optimized loop compilation failed"
+}
+
+$optAsm = Get-Content -LiteralPath $optOutput -Raw
+if (-not ($optAsm.Contains("beqz") -or $optAsm.Contains("bnez"))) {
+    throw "optimized loop condition was incorrectly folded away"
+}
+
 $semanticInput = Join-Path $Root "semantic_error.tc"
 Get-Content -LiteralPath $semanticInput -Raw | & $CompilerPath > $null
 if ($LASTEXITCODE -eq 0) {

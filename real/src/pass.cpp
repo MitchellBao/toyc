@@ -24,8 +24,10 @@ PassManager buildDefaultPassPipeline(bool optimize)
     PassManager manager;
     if (optimize) {
         manager.add(createLocalSimplifyPass());
+        manager.add(createLocalCsePass());
         manager.add(createDeadInstructionPass());
         manager.add(createLocalSimplifyPass());
+        manager.add(createLocalCsePass());
         manager.add(createDeadInstructionPass());
     }
     return manager;

@@ -546,6 +546,7 @@ private:
 
     StmtPtr optimizeWhile(const WhileStmt& stmt)
     {
+        clearMutableKnowledge();
         ExprPtr cond = optimizeExpr(*stmt.cond);
         if (const auto value = asInt(*cond); value.has_value() && *value == 0) {
             return std::make_unique<EmptyStmt>();

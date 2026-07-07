@@ -25,6 +25,7 @@ private:
 };
 
 std::unique_ptr<IrPass> createLocalSimplifyPass();
+std::unique_ptr<IrPass> createLocalCsePass();
 std::unique_ptr<IrPass> createDeadInstructionPass();
 
 PassManager buildDefaultPassPipeline(bool optimize);

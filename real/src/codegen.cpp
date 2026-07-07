@@ -1,7 +1,6 @@
 #include "codegen.h"
 #include "ast_optimizer.h"
-#include "dag_builder.h"
-#include "dag_to_ir.h"
+#include "ir_builder.h"
 #include "ir_codegen.h"
 #include "pass.h"
 
@@ -2075,19 +2074,12 @@ void RiscVCodeGenerator::generate(const Program& program, std::ostream& out)
 {
     if (options_.optimize) {
         Program optimized = optimizeAst(program);
-        DagBuilder dagBuilder;
-        dag::Module dagModule = dagBuilder.build(optimized);
-        DagToIrBuilder irBuilder;
-        ir::Module module = irBuilder.buildSkeleton(dagModule);
+        IrBuilder irBuilder;
+        ir::Module module = irBuilder.build(optimized);
         PassManager passes = buildDefaultPassPipeline(true);
         passes.run(module);
         IrRiscVCodeGenerator irBackend;
-        if (irBackend.canGenerate(module)) {
-            irBackend.generate(module, out);
-            return;
-        }
-        AstRiscVBackend backend(optimized, out, options_);
-        backend.generate();
+        irBackend.generate(module, out);
         return;
     }
 

@@ -8,13 +8,11 @@ SOURCES := \
 	real/src/parser.cpp \
 	real/src/semantic.cpp \
 	real/src/ast_optimizer.cpp \
-	real/src/dag.cpp \
-	real/src/dag_builder.cpp \
-	real/src/dag_to_ir.cpp \
 	real/src/ir.cpp \
 	real/src/ir_builder.cpp \
 	real/src/pass.cpp \
 	real/src/pass_simplify.cpp \
+	real/src/pass_cse.cpp \
 	real/src/pass_dce.cpp \
 	real/src/ir_codegen.cpp \
 	real/src/codegen.cpp
@@ -25,9 +23,6 @@ HEADERS := \
 	real/src/parser.h \
 	real/src/semantic.h \
 	real/src/ast_optimizer.h \
-	real/src/dag.h \
-	real/src/dag_builder.h \
-	real/src/dag_to_ir.h \
 	real/src/ir.h \
 	real/src/ir_builder.h \
 	real/src/ir_codegen.h \
