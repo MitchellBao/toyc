@@ -254,6 +254,26 @@ public:
                 }
             }
         }
+        for (ir::Function& function : module.functions) {
+            if (!function.params.empty() || !isEvaluableFunction(function)) {
+                continue;
+            }
+            const auto result = Evaluator(function).run({});
+            if (!result.has_value()) {
+                continue;
+            }
+
+            ir::BasicBlock block;
+            block.label = ".entry";
+            block.hasTerminator = true;
+            block.terminator.kind = ir::TerminatorKind::Return;
+            block.terminator.hasReturnValue = true;
+            block.terminator.returnValue = ir::Operand::imm(*result);
+            function.blocks.clear();
+            function.blocks.push_back(std::move(block));
+            function.nextValue = 0;
+            changed = true;
+        }
         return changed;
     }
 };
