@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -98,6 +99,11 @@ bool definesValue(const ir::Instruction& inst)
     return inst.dst.id >= 0
         && inst.kind != ir::InstructionKind::StoreGlobal
         && inst.kind != ir::InstructionKind::StoreLocal;
+}
+
+bool isCalleeSavedReg(const std::string& reg)
+{
+    return reg.size() >= 2 && reg[0] == 's' && reg != "sp";
 }
 
 struct AssemblyStats {
@@ -214,14 +220,24 @@ private:
             }
         }
 
+        allocateLocalRegs(locals, hasCall);
+        std::unordered_set<std::string> reservedRegs;
+        for (const auto& [local, reg] : allocatedLocalRegs_) {
+            (void)local;
+            reservedRegs.insert(reg);
+        }
+        collectSkippedLocalUpdateDefs();
         const auto intervals = analysis::computeLocalIntervals(function_);
-        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals), !hasCall);
+        allocatedValueRegs_ = RegisterAllocator().allocate(intervals, computeLiveAcrossCalls(intervals), !hasCall, reservedRegs);
         collectSavedRegs();
 
         outgoingArgBytes_ = std::max(0, maxCallArgs - 8) * 4;
         savesRa_ = hasCall;
         int nextOffset = outgoingArgBytes_;
         for (const std::string& local : locals) {
+            if (allocatedLocalRegs_.find(local) != allocatedLocalRegs_.end()) {
+                continue;
+            }
             localOffsets_[local] = nextOffset;
             nextOffset += 4;
         }
@@ -275,16 +291,13 @@ private:
     void storeIncomingParams()
     {
         for (int i = 0; i < static_cast<int>(function_.params.size()); ++i) {
-            const auto found = localOffsets_.find(function_.params[static_cast<std::size_t>(i)]);
-            if (found == localOffsets_.end()) {
-                continue;
-            }
+            const std::string& param = function_.params[static_cast<std::size_t>(i)];
             if (i < 8) {
-                storeStack("a" + std::to_string(i), found->second);
+                storeLocal(param, "a" + std::to_string(i));
             } else {
                 const int callerOffset = frameSize_ + (i - 8) * 4;
                 loadStack("t0", callerOffset);
-                storeStack("t0", found->second);
+                storeLocal(param, "t0");
             }
         }
     }
@@ -319,6 +332,37 @@ private:
             throw std::runtime_error("missing stack slot for local: " + symbol);
         }
         return found->second;
+    }
+
+    const std::string* allocatedLocalReg(const std::string& symbol) const
+    {
+        const auto found = allocatedLocalRegs_.find(symbol);
+        if (found == allocatedLocalRegs_.end()) {
+            return nullptr;
+        }
+        return &found->second;
+    }
+
+    void loadLocal(const std::string& symbol, const std::string& reg)
+    {
+        if (const std::string* allocated = allocatedLocalReg(symbol)) {
+            if (*allocated != reg) {
+                out_ << "  mv " << reg << ", " << *allocated << "\n";
+            }
+            return;
+        }
+        loadStack(reg, offsetForLocal(symbol));
+    }
+
+    void storeLocal(const std::string& symbol, const std::string& reg)
+    {
+        if (const std::string* allocated = allocatedLocalReg(symbol)) {
+            if (*allocated != reg) {
+                out_ << "  mv " << *allocated << ", " << reg << "\n";
+            }
+            return;
+        }
+        storeStack(reg, offsetForLocal(symbol));
     }
 
     void loadOperand(const ir::Operand& operand, const std::string& reg)
@@ -372,7 +416,15 @@ private:
         std::unordered_set<std::string> used;
         for (const auto& [value, reg] : allocatedValueRegs_) {
             (void)value;
-            used.insert(reg);
+            if (isCalleeSavedReg(reg)) {
+                used.insert(reg);
+            }
+        }
+        for (const auto& [local, reg] : allocatedLocalRegs_) {
+            (void)local;
+            if (isCalleeSavedReg(reg)) {
+                used.insert(reg);
+            }
         }
         for (const char* reg : orderedRegs) {
             if (used.find(reg) != used.end()) {
@@ -399,6 +451,206 @@ private:
             ++index;
         }
         return liveAcrossCalls;
+    }
+
+    void allocateLocalRegs(const std::unordered_set<std::string>& locals, bool hasCall)
+    {
+        if (hasCall || !function_.params.empty()) {
+            return;
+        }
+
+        std::unordered_map<std::string, int> weights;
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if ((inst.kind == ir::InstructionKind::LoadLocal || inst.kind == ir::InstructionKind::StoreLocal) && !inst.symbol.empty()) {
+                    weights[inst.symbol] += 8;
+                }
+            }
+        }
+        for (const std::string& param : function_.params) {
+            if (locals.find(param) != locals.end()) {
+                ++weights[param];
+            }
+        }
+
+        std::vector<std::pair<std::string, int>> ordered;
+        ordered.reserve(weights.size());
+        for (const auto& [symbol, weight] : weights) {
+            if (weight > 0) {
+                ordered.emplace_back(symbol, weight);
+            }
+        }
+        std::sort(ordered.begin(), ordered.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first;
+        });
+
+        static constexpr const char* regs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+        const std::size_t count = std::min<std::size_t>(ordered.size(), std::size(regs));
+        for (std::size_t i = 0; i < count; ++i) {
+            allocatedLocalRegs_[ordered[i].first] = regs[i];
+        }
+    }
+
+    bool emitLocalAddUpdate(const ir::Instruction& inst)
+    {
+        if (inst.kind != ir::InstructionKind::StoreLocal || inst.symbol.empty() || inst.operands.empty()) {
+            return false;
+        }
+        const std::string* targetReg = allocatedLocalReg(inst.symbol);
+        if (targetReg == nullptr || inst.operands[0].isImmediate) {
+            return false;
+        }
+
+        const ir::Value value = inst.operands[0].value;
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (std::size_t defIndex = 0; defIndex < block.instructions.size(); ++defIndex) {
+                const ir::Instruction& def = block.instructions[defIndex];
+                if (def.dst != value || def.kind != ir::InstructionKind::Binary || def.operands.size() != 2) {
+                    continue;
+                }
+                const auto storeIndex = findInstructionIndex(block, inst);
+                if (!storeIndex.has_value() || defIndex >= *storeIndex) {
+                    return false;
+                }
+                const bool lhsSelf = !def.operands[0].isImmediate
+                    && def.operands[0].value.id >= 0
+                    && isCurrentLoadOfLocal(block, def.operands[0].value, inst.symbol, defIndex, *storeIndex);
+                const bool rhsSelf = !def.operands[1].isImmediate
+                    && def.operands[1].value.id >= 0
+                    && isCurrentLoadOfLocal(block, def.operands[1].value, inst.symbol, defIndex, *storeIndex);
+                if (def.binaryOp == ir::BinaryOpcode::Add && lhsSelf) {
+                    if (def.operands[1].isImmediate && fitsI12(def.operands[1].immediate)) {
+                        out_ << "  addi " << *targetReg << ", " << *targetReg << ", " << def.operands[1].immediate << "\n";
+                        return true;
+                    }
+                    const std::string rhs = readOperand(def.operands[1], "t0");
+                    out_ << "  add " << *targetReg << ", " << *targetReg << ", " << rhs << "\n";
+                    return true;
+                }
+                if (def.binaryOp == ir::BinaryOpcode::Add && rhsSelf) {
+                    if (def.operands[0].isImmediate && fitsI12(def.operands[0].immediate)) {
+                        out_ << "  addi " << *targetReg << ", " << *targetReg << ", " << def.operands[0].immediate << "\n";
+                        return true;
+                    }
+                    const std::string lhs = readOperand(def.operands[0], "t0");
+                    out_ << "  add " << *targetReg << ", " << *targetReg << ", " << lhs << "\n";
+                    return true;
+                }
+                if (def.binaryOp == ir::BinaryOpcode::Sub && lhsSelf) {
+                    if (def.operands[1].isImmediate) {
+                        const long long negated = -static_cast<long long>(def.operands[1].immediate);
+                        if (negated >= -2048 && negated <= 2047) {
+                            out_ << "  addi " << *targetReg << ", " << *targetReg << ", " << negated << "\n";
+                            return true;
+                        }
+                    }
+                    const std::string rhs = readOperand(def.operands[1], "t0");
+                    out_ << "  sub " << *targetReg << ", " << *targetReg << ", " << rhs << "\n";
+                    return true;
+                }
+                return false;
+            }
+        }
+        return false;
+    }
+
+    std::optional<std::size_t> findInstructionIndex(const ir::BasicBlock& block, const ir::Instruction& needle) const
+    {
+        for (std::size_t i = 0; i < block.instructions.size(); ++i) {
+            if (&block.instructions[i] == &needle) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool isCurrentLoadOfLocal(
+        const ir::BasicBlock& block,
+        ir::Value value,
+        const std::string& symbol,
+        std::size_t defIndex,
+        std::size_t storeIndex) const
+    {
+        std::optional<std::size_t> loadIndex;
+        for (std::size_t i = 0; i < block.instructions.size(); ++i) {
+            const ir::Instruction& inst = block.instructions[i];
+            if (inst.dst == value && inst.kind == ir::InstructionKind::LoadLocal && inst.symbol == symbol) {
+                loadIndex = i;
+                break;
+            }
+        }
+        if (!loadIndex.has_value() || *loadIndex >= defIndex) {
+            return false;
+        }
+        for (std::size_t i = *loadIndex + 1; i < storeIndex; ++i) {
+            const ir::Instruction& inst = block.instructions[i];
+            if (inst.kind == ir::InstructionKind::StoreLocal && inst.symbol == symbol) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void collectSkippedLocalUpdateDefs()
+    {
+        std::unordered_map<int, int> useCounts;
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                for (const ir::Operand& operand : inst.operands) {
+                    if (!operand.isImmediate && operand.value.id >= 0) {
+                        ++useCounts[operand.value.id];
+                    }
+                }
+            }
+            if (!block.terminator.condition.isImmediate && block.terminator.condition.value.id >= 0) {
+                ++useCounts[block.terminator.condition.value.id];
+            }
+            if (!block.terminator.returnValue.isImmediate && block.terminator.returnValue.value.id >= 0) {
+                ++useCounts[block.terminator.returnValue.value.id];
+            }
+        }
+
+        for (const ir::BasicBlock& block : function_.blocks) {
+            for (std::size_t storeIndex = 0; storeIndex < block.instructions.size(); ++storeIndex) {
+                const ir::Instruction& store = block.instructions[storeIndex];
+                if (store.kind != ir::InstructionKind::StoreLocal
+                    || allocatedLocalReg(store.symbol) == nullptr
+                    || store.operands.empty()
+                    || store.operands[0].isImmediate) {
+                    continue;
+                }
+                const ir::Value result = store.operands[0].value;
+                if (useCounts[result.id] != 1) {
+                    continue;
+                }
+                for (std::size_t defIndex = 0; defIndex < storeIndex; ++defIndex) {
+                    const ir::Instruction& def = block.instructions[defIndex];
+                    if (def.dst != result || def.kind != ir::InstructionKind::Binary || def.operands.size() != 2) {
+                        continue;
+                    }
+                    bool matched = false;
+                    for (const ir::Operand& operand : def.operands) {
+                        if (operand.isImmediate || operand.value.id < 0) {
+                            continue;
+                        }
+                        if (useCounts[operand.value.id] != 1) {
+                            continue;
+                        }
+                        if (isCurrentLoadOfLocal(block, operand.value, store.symbol, defIndex, storeIndex)) {
+                            skippedValueDefs_.insert(operand.value.id);
+                            matched = true;
+                        }
+                    }
+                    if (matched) {
+                        skippedValueDefs_.insert(def.dst.id);
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     void adjustStack(int amount)
@@ -439,6 +691,9 @@ private:
 
     void emitInstruction(const ir::Instruction& inst)
     {
+        if (inst.dst.id >= 0 && skippedValueDefs_.find(inst.dst.id) != skippedValueDefs_.end()) {
+            return;
+        }
         switch (inst.kind) {
         case ir::InstructionKind::Const:
             emitCopyLike(inst.dst, inst.operands.empty() ? ir::Operand::imm(0) : inst.operands[0]);
@@ -450,7 +705,9 @@ private:
             emitLoadLocal(inst);
             return;
         case ir::InstructionKind::StoreLocal:
-            storeStack(readOperand(inst.operands[0], "t0"), offsetForLocal(inst.symbol));
+            if (!emitLocalAddUpdate(inst)) {
+                storeLocal(inst.symbol, readOperand(inst.operands[0], "t0"));
+            }
             return;
         case ir::InstructionKind::LoadGlobal:
             emitLoadGlobal(inst);
@@ -484,7 +741,7 @@ private:
     void emitLoadLocal(const ir::Instruction& inst)
     {
         const std::string dstReg = writeReg(inst.dst, "t0");
-        loadStack(dstReg, offsetForLocal(inst.symbol));
+        loadLocal(inst.symbol, dstReg);
         storeValue(inst.dst, dstReg);
     }
 
@@ -863,6 +1120,8 @@ private:
     std::unordered_map<std::string, int> localOffsets_;
     std::unordered_map<int, int> valueOffsets_;
     std::unordered_map<int, std::string> allocatedValueRegs_;
+    std::unordered_map<std::string, std::string> allocatedLocalRegs_;
+    std::unordered_set<int> skippedValueDefs_;
     std::unordered_map<std::string, int> savedRegOffsets_;
     std::vector<std::string> savedRegs_;
     int outgoingArgBytes_ = 0;

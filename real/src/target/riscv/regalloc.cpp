@@ -8,7 +8,8 @@ namespace toyc::riscv {
 std::unordered_map<int, std::string> RegisterAllocator::allocate(
     const std::unordered_map<int, analysis::LiveInterval>& intervals,
     const std::unordered_set<int>& liveAcrossCalls,
-    bool mayUseArgumentRegs) const
+    bool mayUseArgumentRegs,
+    const std::unordered_set<std::string>& reservedRegs) const
 {
     std::vector<std::pair<int, analysis::LiveInterval>> ordered(intervals.begin(), intervals.end());
     std::sort(ordered.begin(), ordered.end(), [](const auto& lhs, const auto& rhs) {
@@ -27,15 +28,24 @@ std::unordered_map<int, std::string> RegisterAllocator::allocate(
     int calleeRegIndex = 0;
     for (const auto& [value, interval] : ordered) {
         (void)interval;
+        while (callerRegIndex < static_cast<int>(std::size(callerSavedRegs)) && reservedRegs.find(callerSavedRegs[callerRegIndex]) != reservedRegs.end()) {
+            ++callerRegIndex;
+        }
         if (liveAcrossCalls.find(value) == liveAcrossCalls.end() && callerRegIndex < static_cast<int>(std::size(callerSavedRegs))) {
             result.emplace(value, callerSavedRegs[callerRegIndex++]);
             continue;
+        }
+        while (extraRegIndex < static_cast<int>(std::size(noCallExtraRegs)) && reservedRegs.find(noCallExtraRegs[extraRegIndex]) != reservedRegs.end()) {
+            ++extraRegIndex;
         }
         if (mayUseArgumentRegs
             && liveAcrossCalls.find(value) == liveAcrossCalls.end()
             && extraRegIndex < static_cast<int>(std::size(noCallExtraRegs))) {
             result.emplace(value, noCallExtraRegs[extraRegIndex++]);
             continue;
+        }
+        while (calleeRegIndex < static_cast<int>(std::size(calleeSavedRegs)) && reservedRegs.find(calleeSavedRegs[calleeRegIndex]) != reservedRegs.end()) {
+            ++calleeRegIndex;
         }
         if (calleeRegIndex < static_cast<int>(std::size(calleeSavedRegs))) {
             result.emplace(value, calleeSavedRegs[calleeRegIndex++]);

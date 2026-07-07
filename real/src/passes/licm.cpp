@@ -91,6 +91,63 @@ std::unordered_set<int> collectNaturalLoop(const analysis::Cfg& cfg, int header,
     return loop;
 }
 
+std::unordered_map<int, std::unordered_set<int>> computeLoopDominators(
+    const analysis::Cfg& cfg,
+    const std::unordered_set<int>& loop,
+    int header)
+{
+    std::unordered_map<int, std::unordered_set<int>> dominators;
+    for (int block : loop) {
+        auto& dom = dominators[block];
+        if (block == header) {
+            dom.insert(header);
+        } else {
+            dom.insert(loop.begin(), loop.end());
+        }
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int block : loop) {
+            if (block == header) {
+                continue;
+            }
+
+            std::unordered_set<int> next;
+            bool hasLoopPred = false;
+            for (int pred : cfg.predecessors[static_cast<std::size_t>(block)]) {
+                if (loop.find(pred) == loop.end()) {
+                    continue;
+                }
+                const auto predDom = dominators.find(pred);
+                if (predDom == dominators.end()) {
+                    continue;
+                }
+                if (!hasLoopPred) {
+                    next = predDom->second;
+                    hasLoopPred = true;
+                } else {
+                    for (auto iter = next.begin(); iter != next.end();) {
+                        if (predDom->second.find(*iter) == predDom->second.end()) {
+                            iter = next.erase(iter);
+                        } else {
+                            ++iter;
+                        }
+                    }
+                }
+            }
+            next.insert(block);
+            if (next != dominators[block]) {
+                dominators[block] = std::move(next);
+                changed = true;
+            }
+        }
+    }
+
+    return dominators;
+}
+
 std::unordered_set<int> collectLiveOutValues(const ir::Function& function, const std::unordered_set<int>& loop)
 {
     std::unordered_set<int> liveOut;
@@ -143,12 +200,6 @@ bool runOnLoop(ir::Function& function, const analysis::Cfg& cfg, int header, int
     if (preheaderTerm.kind != ir::TerminatorKind::Jump || preheaderTerm.trueBlock != header) {
         return false;
     }
-    const ir::Terminator& headerTerm = function.blocks[static_cast<std::size_t>(header)].terminator;
-    if (headerTerm.kind != ir::TerminatorKind::Branch || headerTerm.trueBlock < 0) {
-        return false;
-    }
-    const int requiredBodyBlock = headerTerm.trueBlock;
-
     std::unordered_map<int, int> defCount;
     std::unordered_set<std::string> storedLocals;
     std::unordered_set<std::string> storedGlobals;
@@ -178,11 +229,18 @@ bool runOnLoop(ir::Function& function, const analysis::Cfg& cfg, int header, int
 
     std::unordered_set<int> invariantValues;
     std::vector<std::pair<int, std::size_t>> toHoist;
+    const auto dominators = computeLoopDominators(cfg, loop, header);
+    std::unordered_set<int> requiredBlocks;
+    const auto backedgeDominators = dominators.find(backedge);
+    if (backedgeDominators == dominators.end()) {
+        return false;
+    }
+    requiredBlocks = backedgeDominators->second;
 
     std::vector<int> orderedBlocks(loop.begin(), loop.end());
     std::sort(orderedBlocks.begin(), orderedBlocks.end());
     for (int blockIndex : orderedBlocks) {
-        if (blockIndex != requiredBodyBlock) {
+        if (blockIndex == header || requiredBlocks.find(blockIndex) == requiredBlocks.end()) {
             continue;
         }
         const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];

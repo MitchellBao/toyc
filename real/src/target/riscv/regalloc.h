@@ -13,7 +13,8 @@ public:
     std::unordered_map<int, std::string> allocate(
         const std::unordered_map<int, analysis::LiveInterval>& intervals,
         const std::unordered_set<int>& liveAcrossCalls = {},
-        bool mayUseArgumentRegs = false) const;
+        bool mayUseArgumentRegs = false,
+        const std::unordered_set<std::string>& reservedRegs = {}) const;
 };
 
 } // namespace toyc::riscv
