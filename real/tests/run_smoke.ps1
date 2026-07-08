@@ -639,6 +639,58 @@ if ((Invoke-RiscVMain $polyLoopSumResult.Stdout) -ne 136) {
     throw "opt_loop_sum_dynamic_poly_stats returned unexpected value"
 }
 
+$dynamicLoopSumLeStepResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_le_step_linear_stats" @'
+int limitSeed = 9;
+int getLimit(){ limitSeed = limitSeed + 0; return limitSeed; }
+int main(){
+    int n = getLimit();
+    int i = 1;
+    int s = 0;
+    int t = 0;
+    while(i <= n){
+        s = s + 5 * i + 1;
+        t = t + 3 * i - 1;
+        i = i + 2;
+    }
+    return (s + t + i) % 256;
+}
+'@
+Assert-StatsContains "opt_loop_sum_dynamic_le_step_linear_stats" $dynamicLoopSumLeStepResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $dynamicLoopSumLeStepResult.Stdout) -ne 211) {
+    throw "opt_loop_sum_dynamic_le_step_linear_stats returned unexpected value"
+}
+
+$dynamicLoopSumDescendingResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_descending_stats" @'
+int floorSeed = 2;
+int getFloor(){ floorSeed = floorSeed + 0; return floorSeed; }
+int main(){
+    int n = getFloor();
+    int i = 10;
+    int s = 0;
+    while(i > n){
+        s = s + i;
+        i = i - 2;
+    }
+    return s + i;
+}
+'@
+Assert-StatsContains "opt_loop_sum_dynamic_descending_stats" $dynamicLoopSumDescendingResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $dynamicLoopSumDescendingResult.Stdout) -ne 30) {
+    throw "opt_loop_sum_dynamic_descending_stats returned unexpected value"
+}
+
+Assert-OptReturn "opt_loop_sum_not_equal_step_semantics" @'
+int main(){
+    int i = 1;
+    int s = 0;
+    while(i != 10){
+        s = s + i * 2 + 1;
+        i = i + 3;
+    }
+    return s + i;
+}
+'@ 37
+
 Assert-OptReturn "opt_licm_shape" @'
 int id(int x){ return x; }
 int main(){int i=0; int s=0; int a=id(7); int b=id(9); while(i<100){s=s+a*b+3; i=i+1;} return s;}

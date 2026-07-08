@@ -99,7 +99,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createGlobalCopyPropPass());
         manager.add(createGlobalCsePass());
         manager.add(createInlineSmallPass());
-        for (int iteration = 0; iteration < 3; ++iteration) {
+        for (int iteration = 0; iteration < 4; ++iteration) {
             manager.add(createGlobalConstPropPass());
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
@@ -125,6 +125,17 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createSimplifyCfgPass());
         manager.add(createGlobalCopyPropPass());
         manager.add(createGlobalCsePass());
+        for (int iteration = 0; iteration < 2; ++iteration) {
+            manager.add(createGlobalConstPropPass());
+            manager.add(createConstPropPass());
+            manager.add(createAlgebraicSimplifyPass());
+            manager.add(createCopyPropPass());
+            manager.add(createCsePass());
+            manager.add(createInstCombinePass());
+            manager.add(createDcePass());
+            manager.add(createDsePass());
+            manager.add(createSimplifyCfgPass());
+        }
         manager.add(createSimplifyCfgPass());
     }
     return manager;

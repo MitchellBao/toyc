@@ -393,6 +393,20 @@ std::optional<int> tripCount(ir::BinaryOpcode op, std::int32_t start, std::int32
             return std::nullopt;
         }
         return ceilDivPositive(static_cast<std::int64_t>(start) - bound + 1, -static_cast<std::int64_t>(step));
+    case ir::BinaryOpcode::NotEqual: {
+        const std::int64_t diff = static_cast<std::int64_t>(bound) - start;
+        if (diff == 0) {
+            return 0;
+        }
+        if ((diff > 0) != (step > 0) || diff % step != 0) {
+            return std::nullopt;
+        }
+        const std::int64_t value = diff / step;
+        if (value <= 0 || value > 1000000000LL) {
+            return std::nullopt;
+        }
+        return static_cast<int>(value);
+    }
     default:
         return std::nullopt;
     }
@@ -471,6 +485,9 @@ ir::Operand appendMulByConst(std::vector<ir::Instruction>& instructions, ir::Fun
     if (factor == 1) {
         return value;
     }
+    if (factor == 0) {
+        return ir::Operand::imm(0);
+    }
     return appendBinary(instructions, function, ir::BinaryOpcode::Mul, value, ir::Operand::imm(static_cast<std::int32_t>(factor)));
 }
 
@@ -484,10 +501,60 @@ ir::Operand appendAddOperand(std::vector<ir::Instruction>& instructions, ir::Fun
     return *total;
 }
 
+std::optional<ir::Operand> appendDynamicTripCount(
+    std::vector<ir::Instruction>& instructions,
+    ir::Function& function,
+    ir::BinaryOpcode op,
+    std::int32_t start,
+    std::int32_t step,
+    ir::Operand bound)
+{
+    std::optional<ir::Operand> numerator;
+    std::int32_t denominator = 0;
+    switch (op) {
+    case ir::BinaryOpcode::Less:
+    case ir::BinaryOpcode::LessEqual:
+        if (step <= 0) {
+            return std::nullopt;
+        }
+        numerator = start == 0 ? bound : appendBinary(instructions, function, ir::BinaryOpcode::Sub, bound, ir::Operand::imm(start));
+        if (op == ir::BinaryOpcode::LessEqual) {
+            numerator = appendBinary(instructions, function, ir::BinaryOpcode::Add, *numerator, ir::Operand::imm(1));
+        }
+        denominator = step;
+        break;
+    case ir::BinaryOpcode::Greater:
+    case ir::BinaryOpcode::GreaterEqual:
+        if (step >= 0) {
+            return std::nullopt;
+        }
+        numerator = appendBinary(instructions, function, ir::BinaryOpcode::Sub, ir::Operand::imm(start), bound);
+        if (op == ir::BinaryOpcode::GreaterEqual) {
+            numerator = appendBinary(instructions, function, ir::BinaryOpcode::Add, *numerator, ir::Operand::imm(1));
+        }
+        denominator = -step;
+        break;
+    default:
+        return std::nullopt;
+    }
+    if (denominator <= 0) {
+        return std::nullopt;
+    }
+    const ir::Operand biased = appendBinary(
+        instructions,
+        function,
+        ir::BinaryOpcode::Add,
+        *numerator,
+        ir::Operand::imm(denominator - 1));
+    return appendBinary(instructions, function, ir::BinaryOpcode::Div, biased, ir::Operand::imm(denominator));
+}
+
 std::optional<ir::Operand> appendDynamicClosedFormSum(
     std::vector<ir::Instruction>& instructions,
     ir::Function& function,
     const Poly& increment,
+    std::int32_t start,
+    std::int32_t step,
     ir::Operand trips)
 {
     std::optional<ir::Operand> total;
@@ -499,12 +566,19 @@ std::optional<ir::Operand> appendDynamicClosedFormSum(
     if (increment.linear != 0 || increment.quadratic != 0) {
         const ir::Operand nMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Sub, trips, ir::Operand::imm(1));
         const ir::Operand product = appendBinary(instructions, function, ir::BinaryOpcode::Mul, trips, nMinusOne);
-        sumI = appendBinary(instructions, function, ir::BinaryOpcode::Div, product, ir::Operand::imm(2));
+        const ir::Operand triangular = appendBinary(instructions, function, ir::BinaryOpcode::Div, product, ir::Operand::imm(2));
+        std::optional<ir::Operand> sum;
+        if (start != 0) {
+            appendAddOperand(instructions, function, sum, appendMulByConst(instructions, function, trips, start));
+        }
+        if (step != 0) {
+            appendAddOperand(instructions, function, sum, appendMulByConst(instructions, function, triangular, step));
+        }
+        sumI = sum.value_or(ir::Operand::imm(0));
     }
     if (increment.linear != 0) {
         appendAddOperand(instructions, function, total, appendMulByConst(instructions, function, *sumI, increment.linear));
     }
-
     if (!total.has_value()) {
         return std::nullopt;
     }
@@ -992,6 +1066,9 @@ bool runOnLoop(ir::Function& function, int header)
                         case ir::BinaryOpcode::LessEqual:
                             cmpOp = ir::BinaryOpcode::GreaterEqual;
                             break;
+                        case ir::BinaryOpcode::NotEqual:
+                            cmpOp = ir::BinaryOpcode::NotEqual;
+                            break;
                         default:
                             return false;
                         }
@@ -1129,7 +1206,7 @@ bool runOnLoop(ir::Function& function, int header)
         trips = tripCount(*cmpOp, *start, *bound, step);
     }
     if (!trips.has_value()) {
-        if (*cmpOp != ir::BinaryOpcode::Less || *start != 0 || step != 1 || !dynamicBound.has_value()) {
+        if (!dynamicBound.has_value()) {
             return false;
         }
 
@@ -1144,6 +1221,10 @@ bool runOnLoop(ir::Function& function, int header)
         }
 
         std::vector<ir::Instruction> replacement;
+        const auto dynamicTrips = appendDynamicTripCount(replacement, function, *cmpOp, *start, step, *dynamicBound);
+        if (!dynamicTrips.has_value()) {
+            return false;
+        }
         bool changedAccumulator = false;
         for (const auto& [symbol, value] : finalLocal) {
             if (symbol == *induction || liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
@@ -1156,7 +1237,7 @@ bool runOnLoop(ir::Function& function, int header)
                 return false;
             }
             const ir::Operand current = appendLoadLocal(replacement, function, symbol);
-            const auto total = appendDynamicClosedFormSum(replacement, function, value.poly, *dynamicBound);
+            const auto total = appendDynamicClosedFormSum(replacement, function, value.poly, *start, step, *dynamicTrips);
             if (!total.has_value()) {
                 return false;
             }
@@ -1176,7 +1257,8 @@ bool runOnLoop(ir::Function& function, int header)
         ir::Instruction inductionStore;
         inductionStore.kind = ir::InstructionKind::StoreLocal;
         inductionStore.symbol = *induction;
-        inductionStore.operands = {*dynamicBound};
+        const ir::Operand stepTrips = appendMulByConst(replacement, function, *dynamicTrips, step);
+        inductionStore.operands = {appendBinary(replacement, function, ir::BinaryOpcode::Add, ir::Operand::imm(*start), stepTrips)};
         replacement.push_back(inductionStore);
 
         const int closedIndex = static_cast<int>(function.blocks.size());
