@@ -767,6 +767,28 @@ if ((Invoke-RiscVMain $inlineBranchResult.Stdout) -ne 190) {
     throw "opt_inline_small_branch_stats returned unexpected value"
 }
 
+$inlineStoreGlobalResult = Compile-OptSnippetWithStats "opt_inline_store_global_side_effect_stats" @'
+int g = 0;
+int sideEffect(int x) {
+    g = g + x;
+    return g;
+}
+int main() {
+    int i = 0;
+    while (i < 10) {
+        sideEffect(i);
+        i = i + 1;
+    }
+    return g;
+}
+'@
+Assert-StatsContains "opt_inline_store_global_side_effect_stats" $inlineStoreGlobalResult.Stderr "pass=inline-small changed=yes"
+Assert-AssemblyNotContains "opt_inline_store_global_side_effect_stats" $inlineStoreGlobalResult.Stdout "call sideEffect"
+Assert-AssemblyNotContains "opt_inline_store_global_side_effect_stats" $inlineStoreGlobalResult.Stdout ".globl sideEffect"
+if ((Invoke-RiscVMain $inlineStoreGlobalResult.Stdout) -ne 45) {
+    throw "opt_inline_store_global_side_effect_stats returned unexpected value"
+}
+
 $cfgBranchFoldResult = Compile-OptSnippetWithStats "opt_cfg_fold_next_jump_stats" @'
 int g = 0;
 int bump(int x) {

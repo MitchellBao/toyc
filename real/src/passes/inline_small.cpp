@@ -121,7 +121,7 @@ bool isInlineCandidate(const ir::Function& function, const std::unordered_set<st
             hasReturnValue = true;
         }
         for (const ir::Instruction& inst : block.instructions) {
-            if (inst.kind == ir::InstructionKind::Call || inst.kind == ir::InstructionKind::StoreGlobal) {
+            if (inst.kind == ir::InstructionKind::Call) {
                 return false;
             }
         }
