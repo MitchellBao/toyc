@@ -105,20 +105,22 @@ std::unordered_set<std::string> recursiveFunctions(const ir::Module& module)
 
 bool isInlineCandidate(const ir::Function& function, const std::unordered_set<std::string>& recursive)
 {
-    if (recursive.find(function.name) != recursive.end()
-        || function.returnType != ir::Type::Int) {
+    if (recursive.find(function.name) != recursive.end()) {
         return false;
     }
 
     std::size_t instructions = 0;
-    bool hasReturnValue = false;
+    bool hasReturn = false;
     for (const ir::BasicBlock& block : function.blocks) {
         instructions += block.instructions.size();
         if (block.terminator.kind == ir::TerminatorKind::Return) {
-            if (!block.terminator.hasReturnValue) {
+            if (function.returnType == ir::Type::Int && !block.terminator.hasReturnValue) {
                 return false;
             }
-            hasReturnValue = true;
+            if (function.returnType == ir::Type::Void && block.terminator.hasReturnValue) {
+                return false;
+            }
+            hasReturn = true;
         }
         for (const ir::Instruction& inst : block.instructions) {
             if (inst.kind == ir::InstructionKind::Call) {
@@ -126,7 +128,7 @@ bool isInlineCandidate(const ir::Function& function, const std::unordered_set<st
             }
         }
     }
-    if (instructions > kMaxInlineInstructions || !hasReturnValue) {
+    if (instructions > kMaxInlineInstructions || !hasReturn) {
         return false;
     }
 
@@ -247,7 +249,7 @@ void inlineCallAt(ir::Function& caller, int blockIndex, int instructionIndex, co
 
     std::unordered_map<int, ir::Value> values;
     std::unordered_map<std::string, std::string> symbols;
-    const std::string prefix = "__inl_" + callee.name + "_" + std::to_string(call.dst.id) + "_";
+    const std::string prefix = "__inl_" + callee.name + "_" + std::to_string(blockIndex) + "_" + std::to_string(instructionIndex) + "_";
     for (const ir::BasicBlock& block : callee.blocks) {
         for (const ir::Instruction& inst : block.instructions) {
             if (inst.dst.id >= 0) {
@@ -307,11 +309,13 @@ void inlineCallAt(ir::Function& caller, int blockIndex, int instructionIndex, co
     ir::BasicBlock continuation;
     continuation.label = prefix + "cont";
     continuation.instructions = std::move(suffix);
-    ir::Instruction loadReturn;
-    loadReturn.kind = ir::InstructionKind::LoadLocal;
-    loadReturn.dst = call.dst;
-    loadReturn.symbol = returnSymbol;
-    continuation.instructions.insert(continuation.instructions.begin(), std::move(loadReturn));
+    if (call.dst.id >= 0) {
+        ir::Instruction loadReturn;
+        loadReturn.kind = ir::InstructionKind::LoadLocal;
+        loadReturn.dst = call.dst;
+        loadReturn.symbol = returnSymbol;
+        continuation.instructions.insert(continuation.instructions.begin(), std::move(loadReturn));
+    }
     continuation.terminator = continuationTerminator;
     continuation.hasTerminator = continuationHasTerminator;
     newBlocks.push_back(std::move(continuation));
@@ -347,7 +351,7 @@ bool inlineFirstEligibleCall(ir::Module& module)
                 if (found == candidates.end()
                     || found->second->name == function.name
                     || inst.operands.size() != found->second->params.size()
-                    || inst.dst.id < 0) {
+                    || (found->second->returnType == ir::Type::Int && inst.dst.id < 0)) {
                     continue;
                 }
                 inlineCallAt(function, blockIndex, instructionIndex, *found->second);

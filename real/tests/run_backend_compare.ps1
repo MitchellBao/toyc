@@ -705,6 +705,44 @@ int main() {
 }
 '@ 1
 
+$voidInlineGlobalAsm = Compile-Source "backend_inline_void_store_global" @'
+int g = 0;
+void setg(int x) {
+    g = x;
+    return;
+}
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 8) {
+        setg(i);
+        s = s + g;
+        i = i + 1;
+    }
+    return s;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $voidInlineGlobalAsm) -ne 28) {
+    throw "backend_inline_void_store_global returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_inline_void_store_global" $voidInlineGlobalAsm "call" 0
+
+$globalStoreForwardAsm = Compile-Source "backend_global_store_load_forward" @'
+int g = 0;
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(9);
+    g = x;
+    return g;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $globalStoreForwardAsm) -ne 9) {
+    throw "backend_global_store_load_forward returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_global_store_load_forward" $globalStoreForwardAsm "lw" 0
+
 $irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
 int id(int x) {
     return x;
