@@ -663,20 +663,30 @@ private:
                     if (def.dst != result || def.kind != ir::InstructionKind::Binary || def.operands.size() != 2) {
                         continue;
                     }
-                    bool matched = false;
-                    for (const ir::Operand& operand : def.operands) {
-                        if (operand.isImmediate || operand.value.id < 0) {
-                            continue;
-                        }
-                        if (useCounts[operand.value.id] != 1) {
-                            continue;
-                        }
-                        if (isCurrentLoadOfLocal(block, operand.value, store.symbol, defIndex, storeIndex)) {
-                            skippedValueDefs_.insert(operand.value.id);
-                            matched = true;
-                        }
+                    // Only skip defs that emitLocalAddUpdate will actually emit
+                    // in place: `L = L + X` (either operand is the current load of
+                    // L) or `L = L - X` (L on the left). Skipping any other op
+                    // (e.g. `L = L * 2`) would drop the computation entirely,
+                    // since emitLocalAddUpdate refuses it and the generic store
+                    // path then reads a never-defined value.
+                    auto selfLoad = [&](const ir::Operand& operand) {
+                        return !operand.isImmediate
+                            && operand.value.id >= 0
+                            && useCounts[operand.value.id] == 1
+                            && isCurrentLoadOfLocal(block, operand.value, store.symbol, defIndex, storeIndex);
+                    };
+                    const bool lhsSelf = selfLoad(def.operands[0]);
+                    const bool rhsSelf = selfLoad(def.operands[1]);
+                    int selfOperand = -1;
+                    if (def.binaryOp == ir::BinaryOpcode::Add && lhsSelf) {
+                        selfOperand = 0;
+                    } else if (def.binaryOp == ir::BinaryOpcode::Add && rhsSelf) {
+                        selfOperand = 1;
+                    } else if (def.binaryOp == ir::BinaryOpcode::Sub && lhsSelf) {
+                        selfOperand = 0;
                     }
-                    if (matched) {
+                    if (selfOperand >= 0) {
+                        skippedValueDefs_.insert(def.operands[static_cast<std::size_t>(selfOperand)].value.id);
                         skippedValueDefs_.insert(def.dst.id);
                     }
                     break;
