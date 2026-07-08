@@ -1,0 +1,18 @@
+int scratch = 0;
+
+void touch(int x) {
+    scratch = x + 1;
+    scratch = x + 2;
+    return;
+}
+
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 360) {
+        touch(i);
+        sum = (sum + i) % 65521;
+        i = i + 1;
+    }
+    return sum % 256;
+}

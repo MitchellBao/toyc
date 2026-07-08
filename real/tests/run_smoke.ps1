@@ -943,6 +943,53 @@ if ((Invoke-RiscVMain $storeGlobalOverwriteResult.Stdout) -ne 132) {
     throw "opt_store_global_overwrite_dse_stats returned unexpected value"
 }
 
+$crossBlockGlobalForwardResult = Compile-OptSnippetWithStats "opt_cross_block_global_forward_stats" @'
+int g = 0;
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 20) {
+        if ((i % 2) == 0) {
+            g = i + 3;
+        } else {
+            g = i + 3;
+        }
+        sum = sum + g;
+        i = i + 1;
+    }
+    return sum;
+}
+'@
+Assert-StatsContains "opt_cross_block_global_forward_stats" $crossBlockGlobalForwardResult.Stderr "pass=global-copy-prop changed=yes"
+if ((Invoke-RiscVMain $crossBlockGlobalForwardResult.Stdout) -ne 250) {
+    throw "opt_cross_block_global_forward_stats returned unexpected value"
+}
+
+$inlineNeverReadGlobalResult = Compile-OptSnippetWithStats "opt_inline_never_read_global_dse_stats" @'
+int scratch = 0;
+void touch(int x) {
+    scratch = x + 1;
+    scratch = x + 2;
+    return;
+}
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 40) {
+        touch(i);
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+'@
+Assert-StatsContains "opt_inline_never_read_global_dse_stats" $inlineNeverReadGlobalResult.Stderr "pass=dse changed=yes"
+Assert-AssemblyNotContains "opt_inline_never_read_global_dse_stats" $inlineNeverReadGlobalResult.Stdout "call touch"
+Assert-AssemblyNotContains "opt_inline_never_read_global_dse_stats" $inlineNeverReadGlobalResult.Stdout ".globl touch"
+if ((Invoke-RiscVMain $inlineNeverReadGlobalResult.Stdout) -ne 780) {
+    throw "opt_inline_never_read_global_dse_stats returned unexpected value"
+}
+
 $cfgBranchFoldResult = Compile-OptSnippetWithStats "opt_cfg_fold_next_jump_stats" @'
 int g = 0;
 int bump(int x) {

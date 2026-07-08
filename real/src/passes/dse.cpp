@@ -83,12 +83,28 @@ std::vector<std::unordered_set<std::string>> computeLiveOut(const ir::Function& 
     return liveOut;
 }
 
+std::unordered_set<std::string> loadedGlobalsInModule(const ir::Module& module)
+{
+    std::unordered_set<std::string> loaded;
+    for (const ir::Function& function : module.functions) {
+        for (const ir::BasicBlock& block : function.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
+                    loaded.insert(inst.symbol);
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
 class DsePass final : public Pass {
 public:
     std::string name() const override { return "dse"; }
     bool run(ir::Module& module) override
     {
         bool changed = false;
+        const std::unordered_set<std::string> moduleLoadedGlobals = loadedGlobalsInModule(module);
         for (ir::Function& function : module.functions) {
             const std::vector<std::unordered_set<std::string>> liveOut = computeLiveOut(function);
             for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
@@ -110,6 +126,10 @@ public:
                     } else if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
                         pendingGlobalStore.erase(inst.symbol);
                     } else if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
+                        if (moduleLoadedGlobals.find(inst.symbol) == moduleLoadedGlobals.end()) {
+                            remove[i] = true;
+                            continue;
+                        }
                         const auto pending = pendingGlobalStore.find(inst.symbol);
                         if (pending != pendingGlobalStore.end()) {
                             remove[i] = true;
