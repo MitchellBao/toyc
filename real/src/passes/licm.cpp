@@ -12,6 +12,35 @@
 namespace toyc::passes {
 namespace {
 
+// Textbook loop-invariant code motion.
+//
+// For each natural loop that has a single dedicated preheader, hoist
+// loop-invariant instructions into the preheader. Only pure, non-faulting
+// instructions are hoisted (Const/Copy/Unary/Binary, and loads proven
+// invariant), so executing them once in the preheader is safe even for a
+// zero-trip loop -- hence no "dominates every exit" check is needed. Invariants
+// in the loop *header* (the condition block) are hoisted too, e.g. the `n` load
+// in `while (i < n)` that would otherwise be re-loaded every iteration. LICM
+// only moves loads, never folds them to constants, so a dynamic loop bound stays
+// dynamic and loop-sum still leaves such loops alone.
+
+bool isWhileHeader(const ir::BasicBlock& block)
+{
+    return block.label.find(".while.cond") == 0;
+}
+
+bool functionContainsCall(const ir::Function& function)
+{
+    for (const ir::BasicBlock& block : function.blocks) {
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::Call) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool definesValue(const ir::Instruction& inst)
 {
     return inst.dst.id >= 0
@@ -19,17 +48,14 @@ bool definesValue(const ir::Instruction& inst)
         && inst.kind != ir::InstructionKind::StoreLocal;
 }
 
-bool isHoistablePure(const ir::Instruction& inst, const std::unordered_set<std::string>& constGlobals)
+bool isPureHoistable(const ir::Instruction& inst)
 {
-    if (inst.hasSideEffect) {
+    if (inst.hasSideEffect || !definesValue(inst)) {
         return false;
     }
     if (inst.kind == ir::InstructionKind::Binary
         && (inst.binaryOp == ir::BinaryOpcode::Div || inst.binaryOp == ir::BinaryOpcode::Mod)) {
-        return definesValue(inst)
-            && inst.operands.size() == 2
-            && inst.operands[1].isImmediate
-            && inst.operands[1].immediate != 0;
+        return inst.operands.size() == 2 && inst.operands[1].isImmediate && inst.operands[1].immediate != 0;
     }
     switch (inst.kind) {
     case ir::InstructionKind::Const:
@@ -37,38 +63,18 @@ bool isHoistablePure(const ir::Instruction& inst, const std::unordered_set<std::
     case ir::InstructionKind::Unary:
     case ir::InstructionKind::Binary:
     case ir::InstructionKind::LoadLocal:
-        return definesValue(inst);
+        return true;
     case ir::InstructionKind::LoadGlobal:
-        return definesValue(inst) && constGlobals.find(inst.symbol) != constGlobals.end();
+        // Hoisting a global load produces an SSA value live across the loop
+        // back-edge, which the current backend mishandles (spurious rotation,
+        // uninitialised bound). Leave global loads in place.
+        return false;
     case ir::InstructionKind::StoreGlobal:
     case ir::InstructionKind::StoreLocal:
     case ir::InstructionKind::Call:
         return false;
     }
     return false;
-}
-
-void markOperandUse(const ir::Operand& operand, std::unordered_set<int>& used)
-{
-    if (!operand.isImmediate && operand.value.id >= 0) {
-        used.insert(operand.value.id);
-    }
-}
-
-std::vector<int> operandValueIds(const ir::Instruction& inst)
-{
-    std::vector<int> values;
-    for (const ir::Operand& operand : inst.operands) {
-        if (!operand.isImmediate && operand.value.id >= 0) {
-            values.push_back(operand.value.id);
-        }
-    }
-    return values;
-}
-
-bool isWhileHeader(const ir::BasicBlock& block)
-{
-    return block.label.find(".while.cond") == 0;
 }
 
 std::unordered_set<int> collectNaturalLoop(const analysis::Cfg& cfg, int header, int backedge)
@@ -78,7 +84,6 @@ std::unordered_set<int> collectNaturalLoop(const analysis::Cfg& cfg, int header,
     loop.insert(header);
     loop.insert(backedge);
     stack.push_back(backedge);
-
     while (!stack.empty()) {
         const int block = stack.back();
         stack.pop_back();
@@ -95,194 +100,100 @@ std::unordered_set<int> collectNaturalLoop(const analysis::Cfg& cfg, int header,
     return loop;
 }
 
-std::unordered_map<int, std::unordered_set<int>> computeLoopDominators(
-    const analysis::Cfg& cfg,
-    const std::unordered_set<int>& loop,
-    int header)
-{
-    std::unordered_map<int, std::unordered_set<int>> dominators;
-    for (int block : loop) {
-        auto& dom = dominators[block];
-        if (block == header) {
-            dom.insert(header);
-        } else {
-            dom.insert(loop.begin(), loop.end());
-        }
-    }
-
-    bool changed = true;
-    while (changed) {
-        changed = false;
-        for (int block : loop) {
-            if (block == header) {
-                continue;
-            }
-
-            std::unordered_set<int> next;
-            bool hasLoopPred = false;
-            for (int pred : cfg.predecessors[static_cast<std::size_t>(block)]) {
-                if (loop.find(pred) == loop.end()) {
-                    continue;
-                }
-                const auto predDom = dominators.find(pred);
-                if (predDom == dominators.end()) {
-                    continue;
-                }
-                if (!hasLoopPred) {
-                    next = predDom->second;
-                    hasLoopPred = true;
-                } else {
-                    for (auto iter = next.begin(); iter != next.end();) {
-                        if (predDom->second.find(*iter) == predDom->second.end()) {
-                            iter = next.erase(iter);
-                        } else {
-                            ++iter;
-                        }
-                    }
-                }
-            }
-            next.insert(block);
-            if (next != dominators[block]) {
-                dominators[block] = std::move(next);
-                changed = true;
-            }
-        }
-    }
-
-    return dominators;
-}
-
-std::unordered_set<int> collectLiveOutValues(const ir::Function& function, const std::unordered_set<int>& loop)
-{
-    std::unordered_set<int> liveOut;
-    for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
-        if (loop.find(i) != loop.end()) {
-            continue;
-        }
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(i)];
-        for (const ir::Instruction& inst : block.instructions) {
-            for (const ir::Operand& operand : inst.operands) {
-                markOperandUse(operand, liveOut);
-            }
-        }
-        markOperandUse(block.terminator.condition, liveOut);
-        markOperandUse(block.terminator.returnValue, liveOut);
-    }
-    return liveOut;
-}
-
-bool functionContainsCall(const ir::Function& function)
-{
-    for (const ir::BasicBlock& block : function.blocks) {
-        for (const ir::Instruction& inst : block.instructions) {
-            if (inst.kind == ir::InstructionKind::Call) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-bool runOnLoop(
-    ir::Function& function,
-    const analysis::Cfg& cfg,
-    const std::unordered_set<std::string>& constGlobals,
-    int header,
-    int backedge)
+bool runOnLoop(ir::Function& function, const analysis::Cfg& cfg, int header, int backedge)
 {
     const std::unordered_set<int> loop = collectNaturalLoop(cfg, header, backedge);
-    std::vector<int> outsidePredecessors;
+
+    std::vector<int> outside;
     for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
         if (loop.find(pred) == loop.end()) {
-            outsidePredecessors.push_back(pred);
+            outside.push_back(pred);
         }
     }
-    if (outsidePredecessors.size() != 1) {
+    if (outside.size() != 1) {
         return false;
     }
-
-    const int preheader = outsidePredecessors.front();
+    const int preheader = outside.front();
     if (preheader < 0 || preheader >= static_cast<int>(function.blocks.size())) {
         return false;
     }
-    const ir::Terminator& preheaderTerm = function.blocks[static_cast<std::size_t>(preheader)].terminator;
-    if (preheaderTerm.kind != ir::TerminatorKind::Jump || preheaderTerm.trueBlock != header) {
+    const ir::Terminator& preTerm = function.blocks[static_cast<std::size_t>(preheader)].terminator;
+    if (preTerm.kind != ir::TerminatorKind::Jump || preTerm.trueBlock != header) {
         return false;
     }
-    std::unordered_map<int, int> defCount;
+
+    std::unordered_set<int> valuesDefinedInLoop;
     std::unordered_set<std::string> storedLocals;
     std::unordered_set<std::string> storedGlobals;
     bool hasCall = false;
-    for (int blockIndex : loop) {
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];
-        for (const ir::Instruction& inst : block.instructions) {
+    for (int bi : loop) {
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(bi)].instructions) {
             if (definesValue(inst)) {
-                ++defCount[inst.dst.id];
-            }
-            if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
-                storedGlobals.insert(inst.symbol);
+                valuesDefinedInLoop.insert(inst.dst.id);
             }
             if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
                 storedLocals.insert(inst.symbol);
-            }
-            if (inst.kind == ir::InstructionKind::Call) {
+            } else if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
+                storedGlobals.insert(inst.symbol);
+            } else if (inst.kind == ir::InstructionKind::Call) {
                 hasCall = true;
             }
         }
     }
 
-    const std::unordered_set<int> liveOut = collectLiveOutValues(function, loop);
-    if (hasCall) {
-        return false;
-    }
-
-    std::unordered_set<int> invariantValues;
-    std::vector<std::pair<int, std::size_t>> toHoist;
-    const auto dominators = computeLoopDominators(cfg, loop, header);
-    std::unordered_set<int> requiredBlocks;
-    const auto backedgeDominators = dominators.find(backedge);
-    if (backedgeDominators == dominators.end()) {
-        return false;
-    }
-    requiredBlocks = backedgeDominators->second;
-
     std::vector<int> orderedBlocks(loop.begin(), loop.end());
     std::sort(orderedBlocks.begin(), orderedBlocks.end());
-    for (int blockIndex : orderedBlocks) {
-        if (blockIndex == header || requiredBlocks.find(blockIndex) == requiredBlocks.end()) {
-            continue;
+
+    std::unordered_set<int> invariant;
+    std::vector<std::pair<int, int>> toHoist;
+    std::unordered_set<long long> chosen;
+
+    auto operandInvariant = [&](const ir::Operand& operand) {
+        if (operand.isImmediate || operand.value.id < 0) {
+            return true;
         }
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];
-        for (std::size_t instIndex = 0; instIndex < block.instructions.size(); ++instIndex) {
-            const ir::Instruction& inst = block.instructions[instIndex];
-            if (!isHoistablePure(inst, constGlobals)) {
-                continue;
-            }
-            if (defCount[inst.dst.id] != 1 || liveOut.find(inst.dst.id) != liveOut.end()) {
-                continue;
-            }
-            if (inst.kind == ir::InstructionKind::LoadLocal && storedLocals.find(inst.symbol) != storedLocals.end()) {
-                continue;
-            }
-            if (inst.kind == ir::InstructionKind::LoadGlobal && (hasCall || storedGlobals.find(inst.symbol) != storedGlobals.end())) {
-                continue;
-            }
+        if (valuesDefinedInLoop.find(operand.value.id) == valuesDefinedInLoop.end()) {
+            return true;
+        }
+        return invariant.find(operand.value.id) != invariant.end();
+    };
 
-            bool operandsInvariant = true;
-            for (int value : operandValueIds(inst)) {
-                const auto found = defCount.find(value);
-                const bool definedInLoop = found != defCount.end() && found->second > 0;
-                if (definedInLoop && invariantValues.find(value) == invariantValues.end()) {
-                    operandsInvariant = false;
-                    break;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int bi : orderedBlocks) {
+            const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(bi)];
+            for (int ii = 0; ii < static_cast<int>(block.instructions.size()); ++ii) {
+                const long long key = static_cast<long long>(bi) * 1000000LL + ii;
+                if (chosen.find(key) != chosen.end()) {
+                    continue;
                 }
+                const ir::Instruction& inst = block.instructions[static_cast<std::size_t>(ii)];
+                if (!isPureHoistable(inst)) {
+                    continue;
+                }
+                if (inst.kind == ir::InstructionKind::LoadLocal && storedLocals.find(inst.symbol) != storedLocals.end()) {
+                    continue;
+                }
+                if (inst.kind == ir::InstructionKind::LoadGlobal
+                    && (hasCall || storedGlobals.find(inst.symbol) != storedGlobals.end())) {
+                    continue;
+                }
+                bool allInvariant = true;
+                for (const ir::Operand& operand : inst.operands) {
+                    if (!operandInvariant(operand)) {
+                        allInvariant = false;
+                        break;
+                    }
+                }
+                if (!allInvariant) {
+                    continue;
+                }
+                chosen.insert(key);
+                toHoist.emplace_back(bi, ii);
+                invariant.insert(inst.dst.id);
+                changed = true;
             }
-            if (!operandsInvariant) {
-                continue;
-            }
-
-            toHoist.emplace_back(blockIndex, instIndex);
-            invariantValues.insert(inst.dst.id);
         }
     }
 
@@ -290,19 +201,27 @@ bool runOnLoop(
         return false;
     }
 
+    std::sort(toHoist.begin(), toHoist.end());
     std::vector<ir::Instruction> hoisted;
     hoisted.reserve(toHoist.size());
-    for (const auto& [blockIndex, instIndex] : toHoist) {
-        hoisted.push_back(function.blocks[static_cast<std::size_t>(blockIndex)].instructions[instIndex]);
+    for (const auto& [bi, ii] : toHoist) {
+        hoisted.push_back(function.blocks[static_cast<std::size_t>(bi)].instructions[static_cast<std::size_t>(ii)]);
     }
 
-    for (auto iter = toHoist.rbegin(); iter != toHoist.rend(); ++iter) {
-        auto& instructions = function.blocks[static_cast<std::size_t>(iter->first)].instructions;
-        instructions.erase(instructions.begin() + static_cast<std::ptrdiff_t>(iter->second));
+    std::vector<std::pair<int, int>> descending = toHoist;
+    std::sort(descending.begin(), descending.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) {
+            return a.first > b.first;
+        }
+        return a.second > b.second;
+    });
+    for (const auto& [bi, ii] : descending) {
+        auto& instrs = function.blocks[static_cast<std::size_t>(bi)].instructions;
+        instrs.erase(instrs.begin() + static_cast<std::ptrdiff_t>(ii));
     }
 
-    auto& preheaderInstructions = function.blocks[static_cast<std::size_t>(preheader)].instructions;
-    preheaderInstructions.insert(preheaderInstructions.end(), std::make_move_iterator(hoisted.begin()), std::make_move_iterator(hoisted.end()));
+    auto& preInstrs = function.blocks[static_cast<std::size_t>(preheader)].instructions;
+    preInstrs.insert(preInstrs.end(), std::make_move_iterator(hoisted.begin()), std::make_move_iterator(hoisted.end()));
     return true;
 }
 
@@ -312,26 +231,19 @@ public:
     bool run(ir::Module& module) override
     {
         bool changed = false;
-        std::unordered_set<std::string> constGlobals;
-        for (const ir::Global& global : module.globals) {
-            if (global.isConst) {
-                constGlobals.insert(global.name);
+        for (ir::Function& function : module.functions) {
+            if (functionContainsCall(function)) {
+                continue;
             }
-        }
-        bool localChanged = true;
-        while (localChanged) {
-            localChanged = false;
-            for (ir::Function& function : module.functions) {
-                if (functionContainsCall(function)) {
-                    continue;
-                }
+            for (int guard = 0; guard < 256; ++guard) {
                 const analysis::Cfg cfg = analysis::buildCfg(function);
+                bool localChanged = false;
                 for (int header = 0; header < static_cast<int>(function.blocks.size()); ++header) {
                     if (!isWhileHeader(function.blocks[static_cast<std::size_t>(header)])) {
                         continue;
                     }
                     for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
-                        if (pred > header && runOnLoop(function, cfg, constGlobals, header, pred)) {
+                        if (pred > header && runOnLoop(function, cfg, header, pred)) {
                             localChanged = true;
                             changed = true;
                             break;
@@ -341,7 +253,7 @@ public:
                         break;
                     }
                 }
-                if (localChanged) {
+                if (!localChanged) {
                     break;
                 }
             }
