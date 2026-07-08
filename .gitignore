@@ -6,3 +6,4 @@ real/tests/*.tmp
 real/tests/debug_*.tc
 compiler
 compiler.exe
+toyc_cpp_compiler

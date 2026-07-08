@@ -1292,6 +1292,319 @@ bool runOnLoop(ir::Function& function, int header)
     return true;
 }
 
+// A comparison `local <op> const` recovered from the block that computes a
+// branch condition. `local` is on the left after normalization.
+struct CompareInfo {
+    std::string local;
+    std::int32_t bound = 0;
+    ir::BinaryOpcode op = ir::BinaryOpcode::Less;
+};
+
+std::optional<CompareInfo> analyzeCompare(const ir::BasicBlock& block, const ir::Operand& cond)
+{
+    if (cond.isImmediate || cond.value.id < 0) {
+        return std::nullopt;
+    }
+    std::unordered_map<int, std::int32_t> constants;
+    std::unordered_map<int, std::string> loadLocalOf;
+    struct Bin { ir::BinaryOpcode op; ir::Operand a; ir::Operand b; };
+    std::unordered_map<int, Bin> bins;
+    for (const ir::Instruction& inst : block.instructions) {
+        if (inst.kind == ir::InstructionKind::Const && inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
+            constants[inst.dst.id] = inst.operands[0].immediate;
+        } else if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+            loadLocalOf[inst.dst.id] = inst.symbol;
+        } else if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+            bins[inst.dst.id] = Bin{inst.binaryOp, inst.operands[0], inst.operands[1]};
+        }
+    }
+    const auto it = bins.find(cond.value.id);
+    if (it == bins.end()) {
+        return std::nullopt;
+    }
+    auto asConst = [&](const ir::Operand& o) -> std::optional<std::int32_t> {
+        if (o.isImmediate) return o.immediate;
+        const auto c = constants.find(o.value.id);
+        return c != constants.end() ? std::optional<std::int32_t>(c->second) : std::nullopt;
+    };
+    auto asLocal = [&](const ir::Operand& o) -> std::optional<std::string> {
+        if (o.isImmediate || o.value.id < 0) return std::nullopt;
+        const auto l = loadLocalOf.find(o.value.id);
+        return l != loadLocalOf.end() ? std::optional<std::string>(l->second) : std::nullopt;
+    };
+    if (const auto localL = asLocal(it->second.a), r = std::optional<std::string>{}; localL.has_value()) {
+        if (const auto rc = asConst(it->second.b); rc.has_value()) {
+            return CompareInfo{*localL, *rc, it->second.op};
+        }
+    }
+    const auto lc = asConst(it->second.a);
+    const auto rl = asLocal(it->second.b);
+    if (lc.has_value() && rl.has_value()) {
+        ir::BinaryOpcode sw;
+        switch (it->second.op) {
+        case ir::BinaryOpcode::Less: sw = ir::BinaryOpcode::Greater; break;
+        case ir::BinaryOpcode::LessEqual: sw = ir::BinaryOpcode::GreaterEqual; break;
+        case ir::BinaryOpcode::Greater: sw = ir::BinaryOpcode::Less; break;
+        case ir::BinaryOpcode::GreaterEqual: sw = ir::BinaryOpcode::LessEqual; break;
+        default: return std::nullopt;
+        }
+        return CompareInfo{*rl, *lc, sw};
+    }
+    return std::nullopt;
+}
+
+// Increment poly of a single-accumulation branch block: `acc = acc + poly(ind)`
+// and nothing else observable. Returns Poly{0} for a branch that leaves acc
+// untouched (e.g. an empty else). The accumulator is modelled as base "__acc__".
+std::optional<Poly> branchAccIncrement(const ir::BasicBlock& block, const std::string& induction, const std::string& acc)
+{
+    std::unordered_map<int, std::int32_t> constants;
+    std::unordered_map<int, PolyValue> polyValues;
+    std::optional<Poly> increment;
+    bool sawAccStore = false;
+    for (const ir::Instruction& inst : block.instructions) {
+        switch (inst.kind) {
+        case ir::InstructionKind::Const:
+            if (inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
+                constants[inst.dst.id] = inst.operands[0].immediate;
+                polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, inst.operands[0].immediate}};
+            } else {
+                return std::nullopt;
+            }
+            break;
+        case ir::InstructionKind::LoadLocal:
+            if (inst.dst.id < 0) return std::nullopt;
+            if (inst.symbol == acc) {
+                polyValues[inst.dst.id] = PolyValue{"__acc__", Poly{0, 0, 0}};
+            } else if (inst.symbol == induction) {
+                polyValues[inst.dst.id] = PolyValue{"", Poly{0, 1, 0}};
+            } else {
+                return std::nullopt;
+            }
+            break;
+        case ir::InstructionKind::Copy: {
+            if (inst.dst.id < 0 || inst.operands.empty()) return std::nullopt;
+            const auto v = polyOf(inst.operands[0], constants, polyValues);
+            if (!v.has_value()) return std::nullopt;
+            polyValues[inst.dst.id] = *v;
+            break;
+        }
+        case ir::InstructionKind::Binary: {
+            if (inst.dst.id < 0 || inst.operands.size() != 2) return std::nullopt;
+            const auto a = polyOf(inst.operands[0], constants, polyValues);
+            const auto b = polyOf(inst.operands[1], constants, polyValues);
+            if (!a.has_value() || !b.has_value()) return std::nullopt;
+            const auto r = evalPoly(inst.binaryOp, *a, *b);
+            if (!r.has_value()) return std::nullopt;
+            polyValues[inst.dst.id] = *r;
+            break;
+        }
+        case ir::InstructionKind::StoreLocal: {
+            if (inst.symbol != acc || inst.operands.empty()) return std::nullopt;
+            if (sawAccStore) return std::nullopt;
+            const auto v = polyOf(inst.operands[0], constants, polyValues);
+            if (!v.has_value() || v->base != "__acc__") return std::nullopt;
+            increment = v->poly;
+            sawAccStore = true;
+            break;
+        }
+        default:
+            return std::nullopt;
+        }
+    }
+    if (!sawAccStore) {
+        return Poly{0, 0, 0};
+    }
+    return increment;
+}
+
+// Close a counted loop whose body is a single if/else diamond, each branch a
+// pure accumulation `acc += poly(i)`, and the if-condition is `i <op> K` (K a
+// compile-time constant) that splits the iteration range. Backend-safe: emits
+// the same closed-form store loop-sum already produces.
+bool tryConditionalAccumulationLoop(ir::Function& function, int header)
+{
+    const int n = static_cast<int>(function.blocks.size());
+    if (header < 0 || header >= n) {
+        return false;
+    }
+    const ir::BasicBlock& H = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(H) || H.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const int ifIdx = H.terminator.trueBlock;
+    const int exitIdx = H.terminator.falseBlock;
+    if (ifIdx < 0 || ifIdx >= n || exitIdx < 0) {
+        return false;
+    }
+    const ir::BasicBlock& IF = function.blocks[static_cast<std::size_t>(ifIdx)];
+    if (IF.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    for (const ir::Instruction& inst : IF.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreLocal || inst.kind == ir::InstructionKind::StoreGlobal
+            || inst.kind == ir::InstructionKind::LoadGlobal || inst.kind == ir::InstructionKind::Call) {
+            return false;
+        }
+    }
+    const int thenIdx = IF.terminator.trueBlock;
+    const int elseIdx = IF.terminator.falseBlock;
+    if (thenIdx < 0 || elseIdx < 0 || thenIdx >= n || elseIdx >= n || thenIdx == elseIdx) {
+        return false;
+    }
+    const ir::BasicBlock& THEN = function.blocks[static_cast<std::size_t>(thenIdx)];
+    const ir::BasicBlock& ELSE = function.blocks[static_cast<std::size_t>(elseIdx)];
+    if (THEN.terminator.kind != ir::TerminatorKind::Jump || ELSE.terminator.kind != ir::TerminatorKind::Jump) {
+        return false;
+    }
+    const int latchIdx = THEN.terminator.trueBlock;
+    if (ELSE.terminator.trueBlock != latchIdx || latchIdx < 0 || latchIdx >= n) {
+        return false;
+    }
+    const ir::BasicBlock& LATCH = function.blocks[static_cast<std::size_t>(latchIdx)];
+    if (LATCH.terminator.kind != ir::TerminatorKind::Jump || LATCH.terminator.trueBlock != header) {
+        return false;
+    }
+
+    const auto hdr = analyzeCompare(H, H.terminator.condition);
+    if (!hdr.has_value()) {
+        return false;
+    }
+    const std::string induction = hdr->local;
+    const auto step = inductionStepInBody(LATCH, induction);
+    if (!step.has_value() || *step <= 0) {
+        return false;
+    }
+    for (const ir::Instruction& inst : LATCH.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal || inst.kind == ir::InstructionKind::LoadGlobal || inst.kind == ir::InstructionKind::Call) {
+            return false;
+        }
+        if (inst.kind == ir::InstructionKind::StoreLocal && inst.symbol != induction) {
+            return false;
+        }
+    }
+    const auto ifc = analyzeCompare(IF, IF.terminator.condition);
+    if (!ifc.has_value() || ifc->local != induction) {
+        return false;
+    }
+    const auto start = initialLocalConst(function, header, induction);
+    if (!start.has_value()) {
+        return false;
+    }
+    const auto total = tripCount(hdr->op, *start, hdr->bound, *step);
+    if (!total.has_value()) {
+        return false;
+    }
+
+    // Accumulator symbol: the single local stored across the two branches.
+    std::string acc;
+    for (const ir::BasicBlock* b : {&THEN, &ELSE}) {
+        for (const ir::Instruction& inst : b->instructions) {
+            if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+                if (!acc.empty() && acc != inst.symbol) {
+                    return false;
+                }
+                acc = inst.symbol;
+            }
+        }
+    }
+    if (acc.empty() || acc == induction) {
+        return false;
+    }
+    const auto thenInc = branchAccIncrement(THEN, induction, acc);
+    const auto elseInc = branchAccIncrement(ELSE, induction, acc);
+    if (!thenInc.has_value() || !elseInc.has_value()) {
+        return false;
+    }
+
+    const int totalTrips = *total;
+    auto clampTrips = [&](std::optional<int> t) {
+        int v = t.value_or(0);
+        if (v < 0) v = 0;
+        if (v > totalTrips) v = totalTrips;
+        return v;
+    };
+    int trueTrips = 0;
+    bool trueIsLow = true;
+    switch (ifc->op) {
+    case ir::BinaryOpcode::Less:
+        trueTrips = clampTrips(tripCount(ir::BinaryOpcode::Less, *start, ifc->bound, *step));
+        trueIsLow = true;
+        break;
+    case ir::BinaryOpcode::LessEqual:
+        trueTrips = clampTrips(tripCount(ir::BinaryOpcode::LessEqual, *start, ifc->bound, *step));
+        trueIsLow = true;
+        break;
+    case ir::BinaryOpcode::Greater:
+        trueTrips = totalTrips - clampTrips(tripCount(ir::BinaryOpcode::LessEqual, *start, ifc->bound, *step));
+        trueIsLow = false;
+        break;
+    case ir::BinaryOpcode::GreaterEqual:
+        trueTrips = totalTrips - clampTrips(tripCount(ir::BinaryOpcode::Less, *start, ifc->bound, *step));
+        trueIsLow = false;
+        break;
+    default:
+        return false;
+    }
+    if (trueTrips < 0 || trueTrips > totalTrips) {
+        return false;
+    }
+
+    // Sum each branch over its contiguous sub-range of iterations.
+    std::optional<std::int32_t> sumThen;
+    std::optional<std::int32_t> sumElse;
+    if (trueIsLow) {
+        const int lowT = trueTrips;
+        const int highT = totalTrips - trueTrips;
+        sumThen = closedFormSum(*thenInc, *start, *step, lowT);
+        sumElse = closedFormSum(*elseInc, static_cast<std::int32_t>(*start + static_cast<std::int64_t>(*step) * lowT), *step, highT);
+    } else {
+        const int falseT = totalTrips - trueTrips;
+        const int highT = trueTrips;
+        sumElse = closedFormSum(*elseInc, *start, *step, falseT);
+        sumThen = closedFormSum(*thenInc, static_cast<std::int32_t>(*start + static_cast<std::int64_t>(*step) * falseT), *step, highT);
+    }
+    if (!sumThen.has_value() || !sumElse.has_value()) {
+        return false;
+    }
+    const std::int32_t incTotal = wrapInt32(static_cast<std::int64_t>(*sumThen) + *sumElse);
+
+    // Emit `acc = acc + incTotal; induction = final;` in the header, jump to exit.
+    std::vector<ir::Instruction> replacement;
+    ir::Instruction load;
+    load.kind = ir::InstructionKind::LoadLocal;
+    load.symbol = acc;
+    load.dst = ir::Value{function.nextValue++};
+    replacement.push_back(load);
+
+    ir::Instruction add;
+    add.kind = ir::InstructionKind::Binary;
+    add.binaryOp = ir::BinaryOpcode::Add;
+    add.dst = ir::Value{function.nextValue++};
+    add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(incTotal)};
+    replacement.push_back(add);
+
+    ir::Instruction store;
+    store.kind = ir::InstructionKind::StoreLocal;
+    store.symbol = acc;
+    store.operands = {ir::Operand::ref(add.dst)};
+    replacement.push_back(store);
+
+    ir::Instruction indStore;
+    indStore.kind = ir::InstructionKind::StoreLocal;
+    indStore.symbol = induction;
+    indStore.operands = {ir::Operand::imm(static_cast<std::int32_t>(*start + static_cast<std::int64_t>(*step) * totalTrips))};
+    replacement.push_back(indStore);
+
+    ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+    mutableHeader.instructions = std::move(replacement);
+    mutableHeader.terminator = {};
+    mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
+    mutableHeader.terminator.trueBlock = exitIdx;
+    mutableHeader.hasTerminator = true;
+    return true;
+}
+
 class LoopSumPass final : public Pass {
 public:
     std::string name() const override { return "loop-sum"; }
@@ -1300,7 +1613,7 @@ public:
         bool changed = false;
         for (ir::Function& function : module.functions) {
             for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
-                if (runOnLoop(function, i)) {
+                if (runOnLoop(function, i) || tryConditionalAccumulationLoop(function, i)) {
                     changed = true;
                 }
             }
