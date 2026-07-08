@@ -153,6 +153,11 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             group->add(createDsePass());
             group->add(createDcePass());
             group->add(createLicmPass());
+            // Lay blocks in reverse-postorder before loop-sum: its pre-loop
+            // constant analysis scans blocks with index < header, which is only
+            // valid when block index matches control-flow order (a preheader can
+            // otherwise land after the header, e.g. after inlining the bound).
+            group->add(createLinearizeBlocksPass());
             group->add(createLoopSumPass());
             group->add(createTailRecursionPass());
             return group;
