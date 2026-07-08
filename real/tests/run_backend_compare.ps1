@@ -785,6 +785,38 @@ int main() {
 Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "seqz" 0
 Assert-OpcodeAtMost "backend_ir_algebra_simplify" $irAlgebraAsm "slt" 0
 
+$irAlgebraCancelAsm = Compile-Source "backend_ir_algebra_cancel" @'
+int g = 7;
+int main() {
+    int x = g;
+    int y = x - x;
+    int z = 0 - y;
+    return z + (x && 0) + (x || 1);
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irAlgebraCancelAsm) -ne 1) {
+    throw "backend_ir_algebra_cancel returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_algebra_cancel" $irAlgebraCancelAsm "sub" 0
+Assert-OpcodeAtMost "backend_ir_algebra_cancel" $irAlgebraCancelAsm "seqz" 0
+Assert-OpcodeAtMost "backend_ir_algebra_cancel" $irAlgebraCancelAsm "snez" 0
+
+$irReassociateConstAsm = Compile-Source "backend_ir_reassociate_constants" @'
+int g = 3;
+int main() {
+    int x = g;
+    int a = (x + 9) - 9;
+    int b = (a - 4) + 4;
+    int c = (b + 6) + 7;
+    return c - x;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irReassociateConstAsm) -ne 13) {
+    throw "backend_ir_reassociate_constants returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_reassociate_constants" $irReassociateConstAsm "add" 1
+Assert-OpcodeAtMost "backend_ir_reassociate_constants" $irReassociateConstAsm "sub" 0
+
 $localCseCommutativeAsm = Compile-Source "backend_local_cse_commutative" @'
 int calc(int a, int b) {
     int x = a * b;

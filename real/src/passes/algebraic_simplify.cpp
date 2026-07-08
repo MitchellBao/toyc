@@ -32,6 +32,24 @@ void replaceWithConst(ir::Instruction& inst, std::int32_t value)
     inst.hasSideEffect = false;
 }
 
+void replaceWithUnary(ir::Instruction& inst, ir::UnaryOpcode op, ir::Operand operand)
+{
+    inst.kind = ir::InstructionKind::Unary;
+    inst.unaryOp = op;
+    inst.operands = {operand};
+    inst.symbol.clear();
+    inst.hasSideEffect = false;
+}
+
+void replaceWithNotZero(ir::Instruction& inst, ir::Operand operand)
+{
+    inst.kind = ir::InstructionKind::Binary;
+    inst.binaryOp = ir::BinaryOpcode::NotEqual;
+    inst.operands = {operand, ir::Operand::imm(0)};
+    inst.symbol.clear();
+    inst.hasSideEffect = false;
+}
+
 bool simplifyBinary(ir::Instruction& inst)
 {
     if (inst.kind != ir::InstructionKind::Binary || inst.operands.size() != 2) {
@@ -54,6 +72,14 @@ bool simplifyBinary(ir::Instruction& inst)
     case ir::BinaryOpcode::Sub:
         if (isImm(rhs, 0)) {
             replaceWithCopy(inst, lhs);
+            return true;
+        }
+        if (samePureOperand(lhs, rhs)) {
+            replaceWithConst(inst, 0);
+            return true;
+        }
+        if (isImm(lhs, 0)) {
+            replaceWithUnary(inst, ir::UnaryOpcode::Minus, rhs);
             return true;
         }
         return false;
@@ -89,11 +115,11 @@ bool simplifyBinary(ir::Instruction& inst)
             return true;
         }
         if (isImm(lhs, 1)) {
-            replaceWithCopy(inst, rhs);
+            replaceWithNotZero(inst, rhs);
             return true;
         }
         if (isImm(rhs, 1)) {
-            replaceWithCopy(inst, lhs);
+            replaceWithNotZero(inst, lhs);
             return true;
         }
         return false;
@@ -103,11 +129,11 @@ bool simplifyBinary(ir::Instruction& inst)
             return true;
         }
         if (isImm(lhs, 0)) {
-            replaceWithCopy(inst, rhs);
+            replaceWithNotZero(inst, rhs);
             return true;
         }
         if (isImm(rhs, 0)) {
-            replaceWithCopy(inst, lhs);
+            replaceWithNotZero(inst, lhs);
             return true;
         }
         return false;
