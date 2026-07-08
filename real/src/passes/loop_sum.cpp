@@ -629,10 +629,35 @@ std::optional<std::int32_t> inductionStepInBody(const ir::BasicBlock& body, cons
     return step;
 }
 
+// Locals whose value is observed outside this loop. The loop occupies exactly
+// two blocks (header + body); a local is live after the loop if it is loaded by
+// any other block. Scanning by block set (not by index order) is required for
+// nested loops, where an inner loop's accumulator is consumed by the enclosing
+// loop whose blocks may have lower indices than the inner exit.
+std::unordered_set<std::string> computeLiveAfterLoop(
+    const ir::Function& function,
+    int header,
+    int bodyIndex)
+{
+    std::unordered_set<std::string> liveAfterLoop;
+    for (int b = 0; b < static_cast<int>(function.blocks.size()); ++b) {
+        if (b == header || b == bodyIndex) {
+            continue;
+        }
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(b)].instructions) {
+            if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
+                liveAfterLoop.insert(inst.symbol);
+            }
+        }
+    }
+    return liveAfterLoop;
+}
+
 bool tryInvariantAccumulationLoop(
     ir::Function& function,
     int header,
     int exitIndex,
+    int bodyIndex,
     ir::BasicBlock& body,
     const std::string& induction,
     std::int32_t start,
@@ -752,15 +777,7 @@ bool tryInvariantAccumulationLoop(
         return false;
     }
 
-    std::unordered_set<std::string> liveAfterLoop;
-    for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
-        for (const ir::Instruction& inst : block.instructions) {
-            if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
-                liveAfterLoop.insert(inst.symbol);
-            }
-        }
-    }
+    const std::unordered_set<std::string> liveAfterLoop = computeLiveAfterLoop(function, header, bodyIndex);
     if (liveAfterLoop.find(*accumulator) == liveAfterLoop.end()) {
         return false;
     }
@@ -1096,6 +1113,7 @@ bool runOnLoop(ir::Function& function, int header)
                         function,
                         header,
                         exitIndex,
+                        bodyIndex,
                         body,
                         *induction,
                         *start,
@@ -1212,21 +1230,13 @@ bool runOnLoop(ir::Function& function, int header)
     if (!trips.has_value()) {
         return false;
     }
-    if (tryInvariantAccumulationLoop(function, header, exitIndex, body, *induction, *start, step, *trips)) {
+    if (tryInvariantAccumulationLoop(function, header, exitIndex, bodyIndex, body, *induction, *start, step, *trips)) {
         return true;
     }
 
     std::vector<ir::Instruction> replacement;
     bool changedAccumulator = false;
-    std::unordered_set<std::string> liveAfterLoop;
-    for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
-        for (const ir::Instruction& inst : block.instructions) {
-            if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
-                liveAfterLoop.insert(inst.symbol);
-            }
-        }
-    }
+    const std::unordered_set<std::string> liveAfterLoop = computeLiveAfterLoop(function, header, bodyIndex);
 
     for (const auto& [symbol, value] : finalLocal) {
         if (symbol == *induction) {

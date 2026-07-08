@@ -49,6 +49,55 @@ bool constCallEvalDisabled()
     return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
+// Runs a group of sub-passes repeatedly until a full round makes no change, up
+// to maxRounds. This is what gives p08-style combined cases real convergence:
+// inline / const / copy / algebra / CSE / CFG / DCE / DSE / loop can each expose
+// new work for the others, and we keep iterating until the module is stable
+// instead of relying on a fixed hand-unrolled pass count. Per-pass stats are
+// still emitted so downstream tooling (and the smoke suite) see each pass.
+class FixedPointGroup final : public Pass {
+public:
+    FixedPointGroup(std::string name, int maxRounds, bool collectStats, std::ostream* statsOut)
+        : name_(std::move(name)), maxRounds_(maxRounds), collectStats_(collectStats), statsOut_(statsOut)
+    {
+    }
+
+    void add(std::unique_ptr<Pass> pass) { passes_.push_back(std::move(pass)); }
+
+    std::string name() const override { return name_; }
+
+    bool run(ir::Module& module) override
+    {
+        bool anyChanged = false;
+        for (int round = 0; round < maxRounds_; ++round) {
+            bool roundChanged = false;
+            for (const auto& pass : passes_) {
+                const IrStats before = collectStats_ && statsOut_ != nullptr ? measureIr(module) : IrStats{};
+                const bool passChanged = pass->run(module);
+                // Only emit a stats line when the pass actually changed the IR.
+                // A convergent group runs each pass many times; printing every
+                // no-op run would flood the log and inflate occurrence counts.
+                if (passChanged && collectStats_ && statsOut_ != nullptr) {
+                    printStatsLine(*statsOut_, pass->name(), before, measureIr(module), passChanged);
+                }
+                roundChanged = passChanged || roundChanged;
+            }
+            anyChanged = anyChanged || roundChanged;
+            if (!roundChanged) {
+                break;
+            }
+        }
+        return anyChanged;
+    }
+
+private:
+    std::vector<std::unique_ptr<Pass>> passes_;
+    std::string name_;
+    int maxRounds_ = 1;
+    bool collectStats_ = false;
+    std::ostream* statsOut_ = nullptr;
+};
+
 } // namespace
 
 PassManager::PassManager(bool collectStats, std::ostream* statsOut)
@@ -82,83 +131,41 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
     manager.add(createCanonicalizePass());
     manager.add(createSimplifyCfgPass());
     if (optimize) {
-        for (int iteration = 0; iteration < 4; ++iteration) {
-            manager.add(createGlobalConstPropPass());
-            manager.add(createConstPropPass());
-            manager.add(createAlgebraicSimplifyPass());
-            manager.add(createCopyPropPass());
-            manager.add(createLocalCoalescePass());
-            manager.add(createCsePass());
-            manager.add(createInstCombinePass());
-            manager.add(createSimplifyCfgPass());
-            manager.add(createDsePass());
-            manager.add(createDcePass());
-        }
-        manager.add(createLoopSumPass());
-        manager.add(createSimplifyCfgPass());
-        manager.add(createDsePass());
-        manager.add(createDcePass());
+        // One convergent optimization group. The order follows the intended
+        // combined pipeline: inline -> const/copy/algebra/CSE -> CFG cleanup ->
+        // DSE/DCE -> loop optimization -> tail-recursion. The group re-runs
+        // until a whole round changes nothing (bounded), so a pass that exposes
+        // work for an earlier pass (e.g. inline exposing a loop, or CFG cleanup
+        // exposing a dead store) is picked up on the next round.
+        auto makeCoreGroup = [&](std::string name) {
+            auto group = std::make_unique<FixedPointGroup>(std::move(name), 8, collectStats, statsOut);
+            group->add(createInlineSmallPass());
+            group->add(createGlobalConstPropPass());
+            group->add(createConstPropPass());
+            group->add(createAlgebraicSimplifyPass());
+            group->add(createCopyPropPass());
+            group->add(createLocalCoalescePass());
+            group->add(createCsePass());
+            group->add(createInstCombinePass());
+            group->add(createGlobalCopyPropPass());
+            group->add(createGlobalCsePass());
+            group->add(createSimplifyCfgPass());
+            group->add(createDsePass());
+            group->add(createDcePass());
+            group->add(createLicmPass());
+            group->add(createLoopSumPass());
+            group->add(createTailRecursionPass());
+            return group;
+        };
+
+        manager.add(makeCoreGroup("opt-converge"));
+        // const-call-eval can collapse a now-pure function/loop to a constant;
+        // run it once, then converge again so the constant propagates and the
+        // remaining dead code / CFG is cleaned up.
         if (!disableConstCallEval) {
             manager.add(createConstCallEvalPass());
         }
-        manager.add(createConstPropPass());
-        manager.add(createAlgebraicSimplifyPass());
-        manager.add(createCopyPropPass());
-        manager.add(createLocalCoalescePass());
-        manager.add(createCsePass());
-        manager.add(createInstCombinePass());
-        manager.add(createSimplifyCfgPass());
-        manager.add(createDsePass());
-        manager.add(createDcePass());
-        manager.add(createLicmPass());
-        manager.add(createLoopSumPass());
-        manager.add(createTailRecursionPass());
-        manager.add(createGlobalCopyPropPass());
-        manager.add(createGlobalCsePass());
-        manager.add(createInlineSmallPass());
-        manager.add(createGlobalCopyPropPass());
-        for (int iteration = 0; iteration < 4; ++iteration) {
-            manager.add(createGlobalConstPropPass());
-            manager.add(createConstPropPass());
-            manager.add(createAlgebraicSimplifyPass());
-            manager.add(createCopyPropPass());
-            manager.add(createLocalCoalescePass());
-            manager.add(createCsePass());
-            manager.add(createInstCombinePass());
-            manager.add(createDsePass());
-            manager.add(createDcePass());
-            manager.add(createLicmPass());
-            manager.add(createLoopSumPass());
-            manager.add(createSimplifyCfgPass());
-        }
-        if (!disableConstCallEval) {
-            manager.add(createConstCallEvalPass());
-        }
-        manager.add(createConstPropPass());
-        manager.add(createAlgebraicSimplifyPass());
-        manager.add(createCopyPropPass());
-        manager.add(createLocalCoalescePass());
-        manager.add(createCsePass());
-        manager.add(createInstCombinePass());
-        manager.add(createDsePass());
-        manager.add(createDcePass());
-        manager.add(createLicmPass());
-        manager.add(createLoopSumPass());
-        manager.add(createSimplifyCfgPass());
-        manager.add(createGlobalCopyPropPass());
-        manager.add(createGlobalCsePass());
-        for (int iteration = 0; iteration < 2; ++iteration) {
-            manager.add(createGlobalConstPropPass());
-            manager.add(createConstPropPass());
-            manager.add(createAlgebraicSimplifyPass());
-            manager.add(createCopyPropPass());
-            manager.add(createLocalCoalescePass());
-            manager.add(createCsePass());
-            manager.add(createInstCombinePass());
-            manager.add(createDsePass());
-            manager.add(createDcePass());
-            manager.add(createSimplifyCfgPass());
-        }
+        manager.add(makeCoreGroup("opt-converge-post"));
         manager.add(createDeadFunctionElimPass());
         manager.add(createSimplifyCfgPass());
     }
