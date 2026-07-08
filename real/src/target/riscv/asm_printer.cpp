@@ -893,11 +893,8 @@ private:
             return finish();
         }
 
-        if (divisor < 0) {
-            return false;
-        }
-
-        const DivMagic magic = computePositiveDivMagic(divisor);
+        const std::int32_t absDivisor = divisor < 0 ? -divisor : divisor;
+        const DivMagic magic = computePositiveDivMagic(absDivisor);
         out_ << "  li t1, " << magic.multiplier << "\n";
         out_ << "  mulh " << dstReg << ", t2, t1\n";
         if (magic.addDividend) {
@@ -908,6 +905,9 @@ private:
         }
         out_ << "  srli t1, t2, 31\n";
         out_ << "  add " << dstReg << ", " << dstReg << ", t1\n";
+        if (divisor < 0) {
+            out_ << "  neg " << dstReg << ", " << dstReg << "\n";
+        }
 
         if (isModulo) {
             out_ << "  li t1, " << divisor << "\n";

@@ -179,12 +179,15 @@ function Invoke-RiscVMain {
             "add" { Set-Reg $parts[1] ((Get-Reg $parts[2]) + (Get-Reg $parts[3])) }
             "sub" { Set-Reg $parts[1] ((Get-Reg $parts[2]) - (Get-Reg $parts[3])) }
             "mul" { Set-Reg $parts[1] ((Get-Reg $parts[2]) * (Get-Reg $parts[3])) }
+            "mulh" { Set-Reg $parts[1] ([int]((([int64](Get-Reg $parts[2])) * ([int64](Get-Reg $parts[3]))) -shr 32)) }
             "div" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) / (Get-Reg $parts[3]))) }
             "rem" { Set-Reg $parts[1] ((Get-Reg $parts[2]) % (Get-Reg $parts[3])) }
             "and" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -band (Get-Reg $parts[3])) }
             "or" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -bor (Get-Reg $parts[3])) }
             "xori" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -bxor [int]$parts[3]) }
             "slli" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shl [int]$parts[3]) }
+            "srai" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shr [int]$parts[3]) }
+            "srli" { Set-Reg $parts[1] ([int]((([int64](Get-Reg $parts[2]) -band 0xffffffffL) -shr [int]$parts[3]))) }
             "slt" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt (Get-Reg $parts[3]))) }
             "slti" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt [int]$parts[3])) }
             "seqz" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -eq 0)) }
@@ -550,6 +553,22 @@ int main() {
 '@ 45
 
 Assert-BackendsAgree "backend_many_variables" (New-ManyVariablesSource 700) 244650
+
+$negativeConstDivAsm = Compile-Source "backend_negative_const_div_mod" @'
+int seed = 123456;
+int get() {
+    return seed;
+}
+int main() {
+    int x = get();
+    return x / -7 + x % -7;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $negativeConstDivAsm) -ne -17632) {
+    throw "backend_negative_const_div_mod returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_negative_const_div_mod" $negativeConstDivAsm "div" 0
+Assert-OpcodeAtMost "backend_negative_const_div_mod" $negativeConstDivAsm "rem" 0
 
 $peepholeAsm = Compile-Source "backend_peephole" @'
 int main() {
