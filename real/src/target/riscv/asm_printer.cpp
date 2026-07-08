@@ -115,6 +115,12 @@ struct AssemblyStats {
     std::size_t addiZero = 0;
 };
 
+struct BranchCompare {
+    ir::BinaryOpcode op = ir::BinaryOpcode::Equal;
+    ir::Operand lhs;
+    ir::Operand rhs;
+};
+
 std::string trim(const std::string& text)
 {
     const std::size_t begin = text.find_first_not_of(" \t\r\n");
@@ -667,6 +673,59 @@ private:
                 }
             }
         }
+
+        collectBranchCompareDefs(useCounts);
+    }
+
+    bool isBranchCompareOpcode(ir::BinaryOpcode op) const
+    {
+        switch (op) {
+        case ir::BinaryOpcode::Equal:
+        case ir::BinaryOpcode::NotEqual:
+        case ir::BinaryOpcode::Less:
+        case ir::BinaryOpcode::LessEqual:
+        case ir::BinaryOpcode::Greater:
+        case ir::BinaryOpcode::GreaterEqual:
+            return true;
+        case ir::BinaryOpcode::Add:
+        case ir::BinaryOpcode::Sub:
+        case ir::BinaryOpcode::Mul:
+        case ir::BinaryOpcode::Div:
+        case ir::BinaryOpcode::Mod:
+        case ir::BinaryOpcode::LogicalAnd:
+        case ir::BinaryOpcode::LogicalOr:
+            return false;
+        }
+        return false;
+    }
+
+    void collectBranchCompareDefs(const std::unordered_map<int, int>& useCounts)
+    {
+        for (const ir::BasicBlock& block : function_.blocks) {
+            if (block.terminator.kind != ir::TerminatorKind::Branch
+                || block.terminator.condition.isImmediate
+                || block.terminator.condition.value.id < 0) {
+                continue;
+            }
+
+            const ir::Value condition = block.terminator.condition.value;
+            const auto useCount = useCounts.find(condition.id);
+            if (useCount == useCounts.end() || useCount->second != 1) {
+                continue;
+            }
+
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.dst != condition
+                    || inst.kind != ir::InstructionKind::Binary
+                    || inst.operands.size() != 2
+                    || !isBranchCompareOpcode(inst.binaryOp)) {
+                    continue;
+                }
+                branchCompareDefs_[condition.id] = BranchCompare{inst.binaryOp, inst.operands[0], inst.operands[1]};
+                skippedValueDefs_.insert(condition.id);
+                break;
+            }
+        }
     }
 
     void adjustStack(int amount)
@@ -1116,6 +1175,13 @@ private:
             break;
         case ir::TerminatorKind::Branch:
             {
+                if (!terminator.condition.isImmediate && terminator.condition.value.id >= 0) {
+                    const auto found = branchCompareDefs_.find(terminator.condition.value.id);
+                    if (found != branchCompareDefs_.end()) {
+                        emitBranchCompare(found->second, terminator.falseBlock, terminator.trueBlock);
+                        break;
+                    }
+                }
                 const std::string conditionReg = readOperand(terminator.condition, "t0");
                 out_ << "  beqz " << conditionReg << ", " << labelFor(terminator.falseBlock) << "\n";
                 out_ << "  j " << labelFor(terminator.trueBlock) << "\n";
@@ -1130,6 +1196,41 @@ private:
         }
     }
 
+    void emitBranchCompare(const BranchCompare& compare, int falseBlock, int trueBlock)
+    {
+        const std::string lhsReg = readOperand(compare.lhs, "t0");
+        const std::string rhsReg = readOperand(compare.rhs, lhsReg == "t1" ? "t2" : "t1");
+        switch (compare.op) {
+        case ir::BinaryOpcode::Equal:
+            out_ << "  bne " << lhsReg << ", " << rhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::NotEqual:
+            out_ << "  beq " << lhsReg << ", " << rhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::Less:
+            out_ << "  bge " << lhsReg << ", " << rhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::LessEqual:
+            out_ << "  blt " << rhsReg << ", " << lhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::Greater:
+            out_ << "  bge " << rhsReg << ", " << lhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::GreaterEqual:
+            out_ << "  blt " << lhsReg << ", " << rhsReg << ", " << labelFor(falseBlock) << "\n";
+            break;
+        case ir::BinaryOpcode::Add:
+        case ir::BinaryOpcode::Sub:
+        case ir::BinaryOpcode::Mul:
+        case ir::BinaryOpcode::Div:
+        case ir::BinaryOpcode::Mod:
+        case ir::BinaryOpcode::LogicalAnd:
+        case ir::BinaryOpcode::LogicalOr:
+            throw std::runtime_error("non-compare opcode in branch compare");
+        }
+        out_ << "  j " << labelFor(trueBlock) << "\n";
+    }
+
     const ir::Function& function_;
     const std::unordered_map<std::string, std::string>& globals_;
     std::ostream& out_;
@@ -1138,6 +1239,7 @@ private:
     std::unordered_map<int, std::string> allocatedValueRegs_;
     std::unordered_map<std::string, std::string> allocatedLocalRegs_;
     std::unordered_set<int> skippedValueDefs_;
+    std::unordered_map<int, BranchCompare> branchCompareDefs_;
     std::unordered_map<std::string, int> savedRegOffsets_;
     std::vector<std::string> savedRegs_;
     int outgoingArgBytes_ = 0;

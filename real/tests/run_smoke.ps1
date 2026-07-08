@@ -67,19 +67,25 @@ function Compile-Source {
 $basicInput = Join-Path $Root "basic.tc"
 $basicOutput = Join-Path $Root "basic.s"
 $asm = Compile-Source "basic" (Get-Content -LiteralPath $basicInput -Raw) $basicOutput
-foreach ($needle in @(".globl main", "main:", "call add", "call fact", "beqz")) {
+foreach ($needle in @(".globl main", "main:", "call add", "call fact")) {
     if (-not $asm.Contains($needle)) {
         throw "basic.s missing expected assembly fragment: $needle"
     }
+}
+if ($asm -notmatch "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "basic.s missing expected conditional branch"
 }
 
 $flowInput = Join-Path $Root "control_flow.tc"
 $flowOutput = Join-Path $Root "control_flow.s"
 $flowAsm = Compile-Source "control_flow" (Get-Content -LiteralPath $flowInput -Raw) $flowOutput
-foreach ($needle in @("call bump", "beqz", ".L_main_")) {
+foreach ($needle in @("call bump", ".L_main_")) {
     if (-not $flowAsm.Contains($needle)) {
         throw "control_flow.s missing expected assembly fragment: $needle"
     }
+}
+if ($flowAsm -notmatch "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "control_flow.s missing expected conditional branch"
 }
 
 $semanticInput = Join-Path $Root "semantic_error.tc"

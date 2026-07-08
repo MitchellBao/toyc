@@ -588,6 +588,31 @@ int main() {
 '@ -Optimize
 Assert-NoBranchOverJumpToNextLabel "backend_branch_peephole" $branchPeepholeAsm
 
+$branchCompareFuseAsm = Compile-Source "backend_branch_compare_fuse" @'
+int g = 0;
+int bump() {
+    g = g + 1;
+    return g;
+}
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 12) {
+        if (i != bump()) {
+            s = s + i;
+        }
+        i = i + 1;
+    }
+    return s;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $branchCompareFuseAsm) -ne 66) {
+    throw "backend_branch_compare_fuse returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_branch_compare_fuse" $branchCompareFuseAsm "slt" 0
+Assert-OpcodeAtMost "backend_branch_compare_fuse" $branchCompareFuseAsm "seqz" 0
+Assert-OpcodeAtMost "backend_branch_compare_fuse" $branchCompareFuseAsm "snez" 0
+
 $stackRoundTripAsm = Compile-Source "backend_stack_roundtrip_peephole" @'
 int id(int x) {
     return x;
