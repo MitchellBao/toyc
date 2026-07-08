@@ -86,6 +86,10 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createDsePass());
             manager.add(createDcePass());
         }
+        manager.add(createLoopSumPass());
+        manager.add(createSimplifyCfgPass());
+        manager.add(createDsePass());
+        manager.add(createDcePass());
         manager.add(createConstCallEvalPass());
         manager.add(createConstPropPass());
         manager.add(createAlgebraicSimplifyPass());

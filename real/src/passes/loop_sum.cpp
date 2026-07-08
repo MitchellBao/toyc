@@ -28,16 +28,6 @@ struct PolyValue {
     Poly poly;
 };
 
-struct BoundValue {
-    ir::Operand operand;
-    std::string reloadLocal;
-};
-
-ir::Value newValue(ir::Function& function)
-{
-    return ir::Value{function.nextValue++};
-}
-
 std::optional<std::int32_t> evalBinary(ir::BinaryOpcode op, std::int32_t lhs, std::int32_t rhs)
 {
     switch (op) {
@@ -100,6 +90,11 @@ std::optional<std::int32_t> int32Value(std::int64_t value)
         return std::nullopt;
     }
     return static_cast<std::int32_t>(value);
+}
+
+std::int32_t wrapInt32(std::int64_t value)
+{
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
 }
 
 std::optional<std::int64_t> checkedInt64(__int128 value)
@@ -339,7 +334,7 @@ bool isWhileCond(const ir::BasicBlock& block)
     return block.label.find(".while.cond") == 0;
 }
 
-bool isSafeBodyInstruction(const ir::Instruction& inst, const std::unordered_set<std::string>& deadStoreGlobals)
+bool isSafeBodyInstruction(const ir::Instruction& inst)
 {
     switch (inst.kind) {
     case ir::InstructionKind::Const:
@@ -350,7 +345,6 @@ bool isSafeBodyInstruction(const ir::Instruction& inst, const std::unordered_set
     case ir::InstructionKind::Binary:
         return true;
     case ir::InstructionKind::StoreGlobal:
-        return !inst.symbol.empty() && deadStoreGlobals.find(inst.symbol) != deadStoreGlobals.end();
     case ir::InstructionKind::LoadGlobal:
     case ir::InstructionKind::Call:
         return false;
@@ -453,262 +447,10 @@ std::optional<std::int32_t> closedFormSum(
         static_cast<__int128>(increment.quadratic) * *sumI2
         + static_cast<__int128>(increment.linear) * *sumI
         + static_cast<__int128>(increment.constant) * trips;
-    const auto safeTotal = checkedInt64(total);
-    if (!safeTotal.has_value()) {
+    if (total < LLONG_MIN || total > LLONG_MAX) {
         return std::nullopt;
     }
-    return int32Value(*safeTotal);
-}
-
-ir::Operand appendLoadLocal(std::vector<ir::Instruction>& instructions, ir::Function& function, const std::string& symbol)
-{
-    ir::Instruction load;
-    load.kind = ir::InstructionKind::LoadLocal;
-    load.symbol = symbol;
-    load.dst = newValue(function);
-    instructions.push_back(load);
-    return ir::Operand::ref(instructions.back().dst);
-}
-
-ir::Operand appendBinary(
-    std::vector<ir::Instruction>& instructions,
-    ir::Function& function,
-    ir::BinaryOpcode op,
-    ir::Operand lhs,
-    ir::Operand rhs)
-{
-    ir::Instruction inst;
-    inst.kind = ir::InstructionKind::Binary;
-    inst.binaryOp = op;
-    inst.dst = newValue(function);
-    inst.operands = {lhs, rhs};
-    instructions.push_back(inst);
-    return ir::Operand::ref(instructions.back().dst);
-}
-
-ir::Operand appendMulByConst(std::vector<ir::Instruction>& instructions, ir::Function& function, ir::Operand value, std::int64_t factor)
-{
-    if (factor == 1) {
-        return value;
-    }
-    if (factor == 0) {
-        return ir::Operand::imm(0);
-    }
-    return appendBinary(instructions, function, ir::BinaryOpcode::Mul, value, ir::Operand::imm(static_cast<std::int32_t>(factor)));
-}
-
-std::optional<ir::Operand> appendMulByConstSafe(
-    std::vector<ir::Instruction>& instructions,
-    ir::Function& function,
-    ir::Operand value,
-    std::int64_t factor)
-{
-    if (!int32Value(factor).has_value()) {
-        return std::nullopt;
-    }
-    return appendMulByConst(instructions, function, value, factor);
-}
-
-ir::Operand appendAddOperand(std::vector<ir::Instruction>& instructions, ir::Function& function, std::optional<ir::Operand>& total, ir::Operand term)
-{
-    if (!total.has_value()) {
-        total = term;
-        return term;
-    }
-    total = appendBinary(instructions, function, ir::BinaryOpcode::Add, *total, term);
-    return *total;
-}
-
-bool replacementUsesOnlyLocalDefs(const std::vector<ir::Instruction>& instructions)
-{
-    std::unordered_set<int> defined;
-    for (const ir::Instruction& inst : instructions) {
-        for (const ir::Operand& operand : inst.operands) {
-            if (!operand.isImmediate
-                && operand.value.id >= 0
-                && defined.find(operand.value.id) == defined.end()) {
-                return false;
-            }
-        }
-        if (inst.dst.id >= 0) {
-            defined.insert(inst.dst.id);
-        }
-    }
-    return true;
-}
-
-std::optional<ir::Operand> appendDynamicTripCount(
-    std::vector<ir::Instruction>& instructions,
-    ir::Function& function,
-    ir::BinaryOpcode op,
-    std::int32_t start,
-    std::int32_t step,
-    ir::Operand bound)
-{
-    std::optional<ir::Operand> numerator;
-    std::int32_t denominator = 0;
-    switch (op) {
-    case ir::BinaryOpcode::Less:
-    case ir::BinaryOpcode::LessEqual:
-        if (step <= 0) {
-            return std::nullopt;
-        }
-        numerator = start == 0 ? bound : appendBinary(instructions, function, ir::BinaryOpcode::Sub, bound, ir::Operand::imm(start));
-        if (op == ir::BinaryOpcode::LessEqual) {
-            numerator = appendBinary(instructions, function, ir::BinaryOpcode::Add, *numerator, ir::Operand::imm(1));
-        }
-        denominator = step;
-        break;
-    case ir::BinaryOpcode::Greater:
-    case ir::BinaryOpcode::GreaterEqual:
-        if (step >= 0) {
-            return std::nullopt;
-        }
-        numerator = appendBinary(instructions, function, ir::BinaryOpcode::Sub, ir::Operand::imm(start), bound);
-        if (op == ir::BinaryOpcode::GreaterEqual) {
-            numerator = appendBinary(instructions, function, ir::BinaryOpcode::Add, *numerator, ir::Operand::imm(1));
-        }
-        denominator = -step;
-        break;
-    case ir::BinaryOpcode::NotEqual:
-        if (step > 0) {
-            numerator = start == 0 ? bound : appendBinary(instructions, function, ir::BinaryOpcode::Sub, bound, ir::Operand::imm(start));
-            denominator = step;
-        } else if (step < 0) {
-            numerator = appendBinary(instructions, function, ir::BinaryOpcode::Sub, ir::Operand::imm(start), bound);
-            denominator = -step;
-        } else {
-            return std::nullopt;
-        }
-        if (denominator <= 0) {
-            return std::nullopt;
-        }
-        return appendBinary(instructions, function, ir::BinaryOpcode::Div, *numerator, ir::Operand::imm(denominator));
-    default:
-        return std::nullopt;
-    }
-    if (denominator <= 0) {
-        return std::nullopt;
-    }
-    const ir::Operand biased = appendBinary(
-        instructions,
-        function,
-        ir::BinaryOpcode::Add,
-        *numerator,
-        ir::Operand::imm(denominator - 1));
-    return appendBinary(instructions, function, ir::BinaryOpcode::Div, biased, ir::Operand::imm(denominator));
-}
-
-ir::Operand appendReloadedBound(std::vector<ir::Instruction>& instructions, ir::Function& function, const BoundValue& bound)
-{
-    if (!bound.reloadLocal.empty()) {
-        return appendLoadLocal(instructions, function, bound.reloadLocal);
-    }
-    return bound.operand;
-}
-
-std::optional<ir::Operand> appendDynamicClosedFormSum(
-    std::vector<ir::Instruction>& instructions,
-    ir::Function& function,
-    const Poly& increment,
-    std::int32_t start,
-    std::int32_t step,
-    ir::Operand trips)
-{
-    std::optional<ir::Operand> total;
-    if (increment.constant != 0) {
-        const auto term = appendMulByConstSafe(instructions, function, trips, increment.constant);
-        if (!term.has_value()) {
-            return std::nullopt;
-        }
-        appendAddOperand(instructions, function, total, *term);
-    }
-
-    std::optional<ir::Operand> sumI;
-    if (increment.linear != 0 || increment.quadratic != 0) {
-        const ir::Operand nMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Sub, trips, ir::Operand::imm(1));
-        const ir::Operand product = appendBinary(instructions, function, ir::BinaryOpcode::Mul, trips, nMinusOne);
-        const ir::Operand triangular = appendBinary(instructions, function, ir::BinaryOpcode::Div, product, ir::Operand::imm(2));
-        std::optional<ir::Operand> sum;
-        if (start != 0) {
-            const auto term = appendMulByConstSafe(instructions, function, trips, start);
-            if (!term.has_value()) {
-                return std::nullopt;
-            }
-            appendAddOperand(instructions, function, sum, *term);
-        }
-        if (step != 0) {
-            const auto term = appendMulByConstSafe(instructions, function, triangular, step);
-            if (!term.has_value()) {
-                return std::nullopt;
-            }
-            appendAddOperand(instructions, function, sum, *term);
-        }
-        sumI = sum.value_or(ir::Operand::imm(0));
-    }
-    if (increment.linear != 0) {
-        const auto term = appendMulByConstSafe(instructions, function, *sumI, increment.linear);
-        if (!term.has_value()) {
-            return std::nullopt;
-        }
-        appendAddOperand(instructions, function, total, *term);
-    }
-    if (increment.quadratic != 0) {
-        const ir::Operand nMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Sub, trips, ir::Operand::imm(1));
-        const ir::Operand twoN = appendMulByConst(instructions, function, trips, 2);
-        const ir::Operand twoNMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Sub, twoN, ir::Operand::imm(1));
-        const ir::Operand nTimesNMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Mul, trips, nMinusOne);
-        const ir::Operand squareProduct = appendBinary(instructions, function, ir::BinaryOpcode::Mul, nTimesNMinusOne, twoNMinusOne);
-        const ir::Operand sumK2 = appendBinary(instructions, function, ir::BinaryOpcode::Div, squareProduct, ir::Operand::imm(6));
-
-        std::optional<ir::Operand> sumI2;
-        if (start != 0) {
-            const auto term = appendMulByConstSafe(instructions, function, trips, static_cast<std::int64_t>(start) * start);
-            if (!term.has_value()) {
-                return std::nullopt;
-            }
-            appendAddOperand(
-                instructions,
-                function,
-                sumI2,
-                *term);
-        }
-        if (start != 0 && step != 0) {
-            const auto term = appendMulByConstSafe(
-                instructions,
-                function,
-                appendBinary(instructions, function, ir::BinaryOpcode::Div, nTimesNMinusOne, ir::Operand::imm(2)),
-                2LL * start * step);
-            if (!term.has_value()) {
-                return std::nullopt;
-            }
-            appendAddOperand(
-                instructions,
-                function,
-                sumI2,
-                *term);
-        }
-        if (step != 0) {
-            const auto term = appendMulByConstSafe(instructions, function, sumK2, static_cast<std::int64_t>(step) * step);
-            if (!term.has_value()) {
-                return std::nullopt;
-            }
-            appendAddOperand(
-                instructions,
-                function,
-                sumI2,
-                *term);
-        }
-        const auto term = appendMulByConstSafe(instructions, function, sumI2.value_or(ir::Operand::imm(0)), increment.quadratic);
-        if (!term.has_value()) {
-            return std::nullopt;
-        }
-        appendAddOperand(instructions, function, total, *term);
-    }
-    if (!total.has_value()) {
-        return std::nullopt;
-    }
-    return total;
+    return wrapInt32(static_cast<std::int64_t>(total));
 }
 
 std::optional<ir::Operand> resolveCopy(
@@ -1226,28 +968,8 @@ bool runOnLoop(ir::Function& function, int header)
     if (body.terminator.kind != ir::TerminatorKind::Jump || body.terminator.trueBlock != header) {
         return false;
     }
-    std::unordered_set<std::string> loadedGlobalsAfterLoop;
-    for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
-        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
-        for (const ir::Instruction& inst : block.instructions) {
-            if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
-                loadedGlobalsAfterLoop.insert(inst.symbol);
-            }
-            if (inst.kind == ir::InstructionKind::Call) {
-                return false;
-            }
-        }
-    }
-    std::unordered_set<std::string> deadStoreGlobals;
     for (const ir::Instruction& inst : body.instructions) {
-        if (inst.kind == ir::InstructionKind::StoreGlobal
-            && !inst.symbol.empty()
-            && loadedGlobalsAfterLoop.find(inst.symbol) == loadedGlobalsAfterLoop.end()) {
-            deadStoreGlobals.insert(inst.symbol);
-        }
-    }
-    for (const ir::Instruction& inst : body.instructions) {
-        if (!isSafeBodyInstruction(inst, deadStoreGlobals)) {
+        if (!isSafeBodyInstruction(inst)) {
             return false;
         }
     }
@@ -1266,7 +988,6 @@ bool runOnLoop(ir::Function& function, int header)
     std::optional<ir::BinaryOpcode> cmpOp;
     std::optional<std::string> induction;
     std::optional<std::int32_t> bound;
-    std::optional<BoundValue> dynamicBound;
 
     for (const ir::Instruction& inst : headerBlock.instructions) {
         switch (inst.kind) {
@@ -1315,65 +1036,12 @@ bool runOnLoop(ir::Function& function, int header)
                         return false;
                     }
                     if (!lhs->base.empty() && rhs->base.empty()) {
-                        const std::string rhsReload = reloadLocalOf(inst.operands[1], headerCopies, loadedLocal);
-                        if (!inst.operands[1].isImmediate && rhsReload.empty()) {
-                            return false;
-                        }
                         induction = lhs->base;
-                        if (inst.operands[1].isImmediate) {
-                            bound = rhs->offset;
-                        }
-                        dynamicBound = BoundValue{inst.operands[1], rhsReload};
+                        bound = rhs->offset;
                         cmpOp = inst.binaryOp;
-                    } else if (!lhs->base.empty()
-                        && !rhs->base.empty()
-                        && rhs->base != lhs->base
-                        && bodyStoredLocals.find(rhs->base) == bodyStoredLocals.end()) {
-                        induction = lhs->base;
-                        dynamicBound = BoundValue{inst.operands[1], reloadLocalOf(inst.operands[1], headerCopies, loadedLocal)};
-                        if (dynamicBound->reloadLocal.empty()) {
-                            dynamicBound->reloadLocal = rhs->base;
-                        }
-                        cmpOp = inst.binaryOp;
-                    } else if (!lhs->base.empty()
-                        && !rhs->base.empty()
-                        && lhs->base != rhs->base
-                        && bodyStoredLocals.find(lhs->base) == bodyStoredLocals.end()
-                        && bodyStoredLocals.find(rhs->base) != bodyStoredLocals.end()) {
-                        induction = rhs->base;
-                        dynamicBound = BoundValue{inst.operands[0], reloadLocalOf(inst.operands[0], headerCopies, loadedLocal)};
-                        if (dynamicBound->reloadLocal.empty()) {
-                            dynamicBound->reloadLocal = lhs->base;
-                        }
-                        switch (inst.binaryOp) {
-                        case ir::BinaryOpcode::Greater:
-                            cmpOp = ir::BinaryOpcode::Less;
-                            break;
-                        case ir::BinaryOpcode::GreaterEqual:
-                            cmpOp = ir::BinaryOpcode::LessEqual;
-                            break;
-                        case ir::BinaryOpcode::Less:
-                            cmpOp = ir::BinaryOpcode::Greater;
-                            break;
-                        case ir::BinaryOpcode::LessEqual:
-                            cmpOp = ir::BinaryOpcode::GreaterEqual;
-                            break;
-                        case ir::BinaryOpcode::NotEqual:
-                            cmpOp = ir::BinaryOpcode::NotEqual;
-                            break;
-                        default:
-                            return false;
-                        }
                     } else if (lhs->base.empty() && !rhs->base.empty()) {
-                        const std::string lhsReload = reloadLocalOf(inst.operands[0], headerCopies, loadedLocal);
-                        if (!inst.operands[0].isImmediate && lhsReload.empty()) {
-                            return false;
-                        }
                         induction = rhs->base;
-                        if (inst.operands[0].isImmediate) {
-                            bound = lhs->offset;
-                        }
-                        dynamicBound = BoundValue{inst.operands[0], lhsReload};
+                        bound = lhs->offset;
                         switch (inst.binaryOp) {
                         case ir::BinaryOpcode::Greater:
                             cmpOp = ir::BinaryOpcode::Less;
@@ -1413,7 +1081,7 @@ bool runOnLoop(ir::Function& function, int header)
         }
     }
 
-    if (!cmpOp.has_value() || !induction.has_value() || (!bound.has_value() && !dynamicBound.has_value())) {
+    if (!cmpOp.has_value() || !induction.has_value() || !bound.has_value()) {
         return false;
     }
     const auto start = initialLocalConst(function, header, *induction);
@@ -1447,11 +1115,6 @@ bool runOnLoop(ir::Function& function, int header)
     std::unordered_map<std::string, PolyValue> currentLocal;
     std::unordered_map<std::string, PolyValue> finalLocal;
     for (const ir::Instruction& inst : body.instructions) {
-        if (inst.kind == ir::InstructionKind::StoreGlobal
-            && !inst.symbol.empty()
-            && deadStoreGlobals.find(inst.symbol) != deadStoreGlobals.end()) {
-            continue;
-        }
         switch (inst.kind) {
         case ir::InstructionKind::Const:
             if (inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
@@ -1545,86 +1208,9 @@ bool runOnLoop(ir::Function& function, int header)
         return false;
     }
     const std::int32_t step = *stepValue;
-    std::optional<int> trips;
-    if (bound.has_value()) {
-        trips = tripCount(*cmpOp, *start, *bound, step);
-    }
+    const std::optional<int> trips = tripCount(*cmpOp, *start, *bound, step);
     if (!trips.has_value()) {
-        if (!dynamicBound.has_value()) {
-            return false;
-        }
-        if (dynamicBound->reloadLocal.empty()) {
-            return false;
-        }
-
-        std::unordered_set<std::string> liveAfterLoop;
-        for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
-            const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
-            for (const ir::Instruction& inst : block.instructions) {
-                if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
-                    liveAfterLoop.insert(inst.symbol);
-                }
-            }
-        }
-
-        std::vector<ir::Instruction> replacement;
-        const ir::Operand reloadedBound = appendReloadedBound(replacement, function, *dynamicBound);
-        const auto dynamicTrips = appendDynamicTripCount(replacement, function, *cmpOp, *start, step, reloadedBound);
-        if (!dynamicTrips.has_value()) {
-            return false;
-        }
-        bool changedAccumulator = false;
-        for (const auto& [symbol, value] : finalLocal) {
-            if (symbol == *induction || liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
-                continue;
-            }
-            if (value.base != symbol || isZero(value.poly)) {
-                return false;
-            }
-            const ir::Operand current = appendLoadLocal(replacement, function, symbol);
-            const auto total = appendDynamicClosedFormSum(replacement, function, value.poly, *start, step, *dynamicTrips);
-            if (!total.has_value()) {
-                return false;
-            }
-            const ir::Operand updated = appendBinary(replacement, function, ir::BinaryOpcode::Add, current, *total);
-
-            ir::Instruction store;
-            store.kind = ir::InstructionKind::StoreLocal;
-            store.symbol = symbol;
-            store.operands = {updated};
-            replacement.push_back(store);
-            changedAccumulator = true;
-        }
-        if (!changedAccumulator) {
-            return false;
-        }
-
-        ir::Instruction inductionStore;
-        inductionStore.kind = ir::InstructionKind::StoreLocal;
-        inductionStore.symbol = *induction;
-        const ir::Operand stepTrips = appendMulByConst(replacement, function, *dynamicTrips, step);
-        inductionStore.operands = {appendBinary(replacement, function, ir::BinaryOpcode::Add, ir::Operand::imm(*start), stepTrips)};
-        replacement.push_back(inductionStore);
-        if (!replacementUsesOnlyLocalDefs(replacement)) {
-            return false;
-        }
-
-        const int closedIndex = static_cast<int>(function.blocks.size());
-        ir::BasicBlock closedBlock;
-        closedBlock.label = ".while.closed";
-        closedBlock.instructions = std::move(replacement);
-        closedBlock.terminator.kind = ir::TerminatorKind::Jump;
-        closedBlock.terminator.trueBlock = exitIndex;
-        closedBlock.hasTerminator = true;
-        function.blocks.push_back(std::move(closedBlock));
-
-        ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
-        mutableHeader.instructions.clear();
-        mutableHeader.terminator = {};
-        mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
-        mutableHeader.terminator.trueBlock = closedIndex;
-        mutableHeader.hasTerminator = true;
-        return true;
+        return false;
     }
     if (tryInvariantAccumulationLoop(function, header, exitIndex, body, *induction, *start, step, *trips)) {
         return true;

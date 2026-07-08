@@ -383,6 +383,18 @@ function Assert-StatsContains {
     }
 }
 
+function Assert-StatsNotContains {
+    param(
+        [string]$Name,
+        [string]$Stats,
+        [string]$Needle
+    )
+
+    if ($Stats.Contains($Needle)) {
+        throw "$Name stats unexpectedly contains fragment: $Needle"
+    }
+}
+
 function Assert-AssemblyNotContains {
     param(
         [string]$Name,
@@ -602,9 +614,302 @@ int choose(){ return 1; }
 int main(){int x=0; if(choose()){x=5;} else {x=5;} return x+1;}
 '@ 6
 
+$p02ReturnAfterResult = Compile-OptSnippetWithStats "opt_p02_return_after_long_loop_stats" @'
+int g = 0;
+void touch() {
+    g = g + 1;
+    return;
+}
+int main() {
+    int x = 1;
+    return 7;
+    touch();
+    while (x < 100000000) {
+        x = x + 1;
+    }
+    return x;
+}
+'@
+if ((Invoke-RiscVMain $p02ReturnAfterResult.Stdout 100) -ne 7) {
+    throw "opt_p02_return_after_long_loop_stats returned unexpected value"
+}
+Assert-AssemblyNotContains "opt_p02_return_after_long_loop_stats" $p02ReturnAfterResult.Stdout "call touch"
+
+$p02BreakAfterResult = Compile-OptSnippetWithStats "opt_p02_break_after_dead_work_stats" @'
+int main() {
+    int i = 0;
+    int x = 0;
+    while (i < 10) {
+        i = i + 1;
+        break;
+        x = x + 100000000;
+    }
+    return x + i;
+}
+'@
+if ((Invoke-RiscVMain $p02BreakAfterResult.Stdout 1000) -ne 1) {
+    throw "opt_p02_break_after_dead_work_stats returned unexpected value"
+}
+
+$p02ContinueAfterResult = Compile-OptSnippetWithStats "opt_p02_continue_after_dead_work_stats" @'
+int main() {
+    int i = 0;
+    int x = 0;
+    while (i < 10) {
+        i = i + 1;
+        continue;
+        x = x + 100000000;
+    }
+    return x + i;
+}
+'@
+if ((Invoke-RiscVMain $p02ContinueAfterResult.Stdout 1000) -ne 10) {
+    throw "opt_p02_continue_after_dead_work_stats returned unexpected value"
+}
+
+$p02IfZeroResult = Compile-OptSnippetWithStats "opt_p02_if_zero_long_loop_stats" @'
+int main() {
+    int x = 1;
+    if (0) {
+        while (x < 100000000) {
+            x = x + 1;
+        }
+    } else {
+        x = 7;
+    }
+    return x;
+}
+'@
+if ((Invoke-RiscVMain $p02IfZeroResult.Stdout 100) -ne 7) {
+    throw "opt_p02_if_zero_long_loop_stats returned unexpected value"
+}
+Assert-StatsContains "opt_p02_if_zero_long_loop_stats" $p02IfZeroResult.Stderr "pass=simplify-cfg changed=yes"
+
+$p02CopyAlgebraBranchResult = Compile-OptSnippetWithStats "opt_p02_copy_algebra_dead_branch_stats" @'
+int main() {
+    int n = 100000000;
+    int a = 1;
+    int b = a;
+    int c = b - 1;
+    if (c) {
+        while (n > 0) {
+            n = n - 1;
+        }
+    }
+    return 7;
+}
+'@
+if ((Invoke-RiscVMain $p02CopyAlgebraBranchResult.Stdout 100) -ne 7) {
+    throw "opt_p02_copy_algebra_dead_branch_stats returned unexpected value"
+}
+Assert-StatsContains "opt_p02_copy_algebra_dead_branch_stats" $p02CopyAlgebraBranchResult.Stderr "pass=simplify-cfg changed=yes"
+
+$p02WhileZeroResult = Compile-OptSnippetWithStats "opt_p02_while_const_zero_stats" @'
+int main() {
+    int x = 1;
+    int z = x - 1;
+    while (z) {
+        x = x + 1;
+    }
+    return x;
+}
+'@
+if ((Invoke-RiscVMain $p02WhileZeroResult.Stdout 100) -ne 1) {
+    throw "opt_p02_while_const_zero_stats returned unexpected value"
+}
+
+$p02DeadLocalChainResult = Compile-OptSnippetWithStats "opt_p02_dead_local_chain_stats" @'
+int main() {
+    int x = 1;
+    int y = 0;
+    y = x + 100000000;
+    y = y * 200;
+    y = y + 300;
+    return x;
+}
+'@
+if ((Invoke-RiscVMain $p02DeadLocalChainResult.Stdout 100) -ne 1) {
+    throw "opt_p02_dead_local_chain_stats returned unexpected value"
+}
+Assert-StatsContains "opt_p02_dead_local_chain_stats" $p02DeadLocalChainResult.Stderr "pass=dce changed=yes"
+
+$p02UnreachableSideEffectResult = Compile-OptSnippetWithStats "opt_p02_unreachable_side_effect_block_stats" @'
+int g = 0;
+void touch() {
+    g = g + 100;
+    return;
+}
+int main() {
+    if (0) {
+        touch();
+        g = 7;
+    }
+    return g;
+}
+'@
+if ((Invoke-RiscVMain $p02UnreachableSideEffectResult.Stdout 100) -ne 0) {
+    throw "opt_p02_unreachable_side_effect_block_stats returned unexpected value"
+}
+Assert-AssemblyNotContains "opt_p02_unreachable_side_effect_block_stats" $p02UnreachableSideEffectResult.Stdout "call touch"
+
+$p02ReachableStoreGlobalResult = Compile-OptSnippetWithStats "opt_p02_reachable_store_global_kept_stats" @'
+int g = 0;
+int main() {
+    g = 5;
+    return 1;
+}
+'@
+if ((Invoke-RiscVMain $p02ReachableStoreGlobalResult.Stdout 100) -ne 1) {
+    throw "opt_p02_reachable_store_global_kept_stats returned unexpected value"
+}
+if ((Count-AssemblyOpcode $p02ReachableStoreGlobalResult.Stdout "sw") -lt 1) {
+    throw "opt_p02_reachable_store_global_kept_stats lost reachable StoreGlobal"
+}
+
 Assert-OptReturn "opt_loop_sum_closed_form" @'
 int main(){int i=0; int s=0; while(i<10){i=i+1; s=s+i;} return s;}
 '@ 55
+
+$p07FixedBoundResult = Compile-OptSnippetWithStats "opt_p07_fixed_bound_step_one_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000000) {
+        s = s + i;
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_fixed_bound_step_one_stats" $p07FixedBoundResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07FixedBoundResult.Stdout 1000) -ne 224) {
+    throw "opt_p07_fixed_bound_step_one_stats returned unexpected value"
+}
+
+$p07LeStepResult = Compile-OptSnippetWithStats "opt_p07_le_non_unit_step_stats" @'
+int main() {
+    int i = 3;
+    int s = 0;
+    while (i <= 999999) {
+        s = s + 3 * i + 5;
+        i = i + 2;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_le_non_unit_step_stats" $p07LeStepResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07LeStepResult.Stdout 1000) -ne -104) {
+    throw "opt_p07_le_non_unit_step_stats returned unexpected value"
+}
+
+$p07DescendingResult = Compile-OptSnippetWithStats "opt_p07_descending_loop_stats" @'
+int main() {
+    int i = 1000000;
+    int s = 0;
+    while (i > 0) {
+        s = s + i;
+        i = i - 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_descending_loop_stats" $p07DescendingResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07DescendingResult.Stdout 1000) -ne 32) {
+    throw "opt_p07_descending_loop_stats returned unexpected value"
+}
+
+$p07MultiAccResult = Compile-OptSnippetWithStats "opt_p07_multi_accumulator_stats" @'
+int main() {
+    int i = 0;
+    int s1 = 0;
+    int s2 = 0;
+    while (i < 1000000) {
+        s1 = s1 + i;
+        s2 = s2 + i * i;
+        i = i + 1;
+    }
+    return (s1 + s2) % 256;
+}
+'@
+Assert-StatsContains "opt_p07_multi_accumulator_stats" $p07MultiAccResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07MultiAccResult.Stdout 1000) -ne -192) {
+    throw "opt_p07_multi_accumulator_stats returned unexpected value"
+}
+
+$p07QuadraticResult = Compile-OptSnippetWithStats "opt_p07_quadratic_accumulator_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000000) {
+        s = s + i * i + 3 * i + 5;
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_quadratic_accumulator_stats" $p07QuadraticResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07QuadraticResult.Stdout 1000) -ne 64) {
+    throw "opt_p07_quadratic_accumulator_stats returned unexpected value"
+}
+
+$p07CallInsideResult = Compile-OptSnippetWithStats "opt_p07_call_inside_loop_not_optimized_stats" @'
+int f(int x) {
+    return x + 1;
+}
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        s = s + f(i);
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsNotContains "opt_p07_call_inside_loop_not_optimized_stats" $p07CallInsideResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07CallInsideResult.Stdout 200000) -ne 20) {
+    throw "opt_p07_call_inside_loop_not_optimized_stats returned unexpected value"
+}
+
+$p07StoreGlobalInsideResult = Compile-OptSnippetWithStats "opt_p07_store_global_inside_loop_not_optimized_stats" @'
+int g = 0;
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        g = g + i;
+        s = s + i;
+        i = i + 1;
+    }
+    return (s + g) % 256;
+}
+'@
+Assert-StatsNotContains "opt_p07_store_global_inside_loop_not_optimized_stats" $p07StoreGlobalInsideResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07StoreGlobalInsideResult.Stdout 200000) -ne 88) {
+    throw "opt_p07_store_global_inside_loop_not_optimized_stats returned unexpected value"
+}
+
+$p07BreakContinueResult = Compile-OptSnippetWithStats "opt_p07_break_continue_not_optimized_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        i = i + 1;
+        if (i == 3) {
+            continue;
+        }
+        if (i == 8) {
+            break;
+        }
+        s = s + i;
+    }
+    return s;
+}
+'@
+Assert-StatsNotContains "opt_p07_break_continue_not_optimized_stats" $p07BreakContinueResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07BreakContinueResult.Stdout 200000) -ne 25) {
+    throw "opt_p07_break_continue_not_optimized_stats returned unexpected value"
+}
 
 $dynamicLoopSumResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_bound_stats" @'
 int limitSeed = 100;
@@ -623,6 +928,7 @@ int main(){
 if ((Invoke-RiscVMain $dynamicLoopSumResult.Stdout) -ne 164) {
     throw "opt_loop_sum_dynamic_bound_stats returned unexpected value"
 }
+Assert-StatsNotContains "opt_loop_sum_dynamic_bound_stats" $dynamicLoopSumResult.Stderr "pass=loop-sum changed=yes"
 
 $polyLoopSumResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_poly_stats" @'
 int limitSeed = 100;
@@ -643,6 +949,7 @@ int main(){
 if ((Invoke-RiscVMain $polyLoopSumResult.Stdout) -ne 136) {
     throw "opt_loop_sum_dynamic_poly_stats returned unexpected value"
 }
+Assert-StatsNotContains "opt_loop_sum_dynamic_poly_stats" $polyLoopSumResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumLeStepResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_le_step_linear_stats" @'
 int limitSeed = 9;
@@ -663,6 +970,7 @@ int main(){
 if ((Invoke-RiscVMain $dynamicLoopSumLeStepResult.Stdout) -ne 211) {
     throw "opt_loop_sum_dynamic_le_step_linear_stats returned unexpected value"
 }
+Assert-StatsNotContains "opt_loop_sum_dynamic_le_step_linear_stats" $dynamicLoopSumLeStepResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumReloadBoundResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_reload_bound_stats" @'
 int limit = 157;
@@ -683,7 +991,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumReloadBoundResult.Stdout) -ne 166) {
     throw "opt_loop_sum_dynamic_reload_bound_stats returned unexpected value"
 }
-Assert-StatsContains "opt_loop_sum_dynamic_reload_bound_stats" $dynamicLoopSumReloadBoundResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsNotContains "opt_loop_sum_dynamic_reload_bound_stats" $dynamicLoopSumReloadBoundResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumQuadraticResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_quadratic_stats" @'
 int limit = 23;
@@ -701,7 +1009,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumQuadraticResult.Stdout) -ne 624) {
     throw "opt_loop_sum_dynamic_quadratic_stats returned unexpected value"
 }
-Assert-StatsContains "opt_loop_sum_dynamic_quadratic_stats" $dynamicLoopSumQuadraticResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsNotContains "opt_loop_sum_dynamic_quadratic_stats" $dynamicLoopSumQuadraticResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumNotEqualResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_not_equal_stats" @'
 int limit = 21;
@@ -719,7 +1027,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumNotEqualResult.Stdout) -ne 140) {
     throw "opt_loop_sum_dynamic_not_equal_stats returned unexpected value"
 }
-Assert-StatsContains "opt_loop_sum_dynamic_not_equal_stats" $dynamicLoopSumNotEqualResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsNotContains "opt_loop_sum_dynamic_not_equal_stats" $dynamicLoopSumNotEqualResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumDescendingResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_descending_stats" @'
 int floorSeed = 2;
@@ -738,6 +1046,7 @@ int main(){
 if ((Invoke-RiscVMain $dynamicLoopSumDescendingResult.Stdout) -ne 30) {
     throw "opt_loop_sum_dynamic_descending_stats returned unexpected value"
 }
+Assert-StatsNotContains "opt_loop_sum_dynamic_descending_stats" $dynamicLoopSumDescendingResult.Stderr "pass=loop-sum changed=yes"
 
 Assert-OptReturn "opt_loop_sum_not_equal_step_semantics" @'
 int main(){
@@ -938,9 +1247,12 @@ int main() {
     return sum % 256;
 }
 '@
-Assert-StatsContains "opt_store_global_overwrite_dse_stats" $storeGlobalOverwriteResult.Stderr "pass=dse changed=yes"
+Assert-StatsNotContains "opt_store_global_overwrite_dse_stats" $storeGlobalOverwriteResult.Stderr "pass=dse changed=yes"
 if ((Invoke-RiscVMain $storeGlobalOverwriteResult.Stdout) -ne 132) {
     throw "opt_store_global_overwrite_dse_stats returned unexpected value"
+}
+if ((Count-AssemblyOpcode $storeGlobalOverwriteResult.Stdout "sw") -lt 1) {
+    throw "opt_store_global_overwrite_dse_stats lost reachable StoreGlobal"
 }
 
 $crossBlockGlobalForwardResult = Compile-OptSnippetWithStats "opt_cross_block_global_forward_stats" @'
