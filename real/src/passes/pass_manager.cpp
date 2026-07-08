@@ -1,6 +1,7 @@
 #include "pass_manager.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <ostream>
 #include <utility>
@@ -42,6 +43,12 @@ void printStatsLine(std::ostream& out, const std::string& passName, const IrStat
         << '\n';
 }
 
+bool constCallEvalDisabled()
+{
+    const char* value = std::getenv("TOYC_DISABLE_CONST_CALL_EVAL");
+    return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
 } // namespace
 
 PassManager::PassManager(bool collectStats, std::ostream* statsOut)
@@ -71,6 +78,7 @@ bool PassManager::run(ir::Module& module)
 PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsOut)
 {
     PassManager manager(collectStats, statsOut);
+    const bool disableConstCallEval = constCallEvalDisabled();
     manager.add(createCanonicalizePass());
     manager.add(createSimplifyCfgPass());
     if (optimize) {
@@ -90,7 +98,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createSimplifyCfgPass());
         manager.add(createDsePass());
         manager.add(createDcePass());
-        manager.add(createConstCallEvalPass());
+        if (!disableConstCallEval) {
+            manager.add(createConstCallEvalPass());
+        }
         manager.add(createConstPropPass());
         manager.add(createAlgebraicSimplifyPass());
         manager.add(createCopyPropPass());
@@ -121,7 +131,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createLoopSumPass());
             manager.add(createSimplifyCfgPass());
         }
-        manager.add(createConstCallEvalPass());
+        if (!disableConstCallEval) {
+            manager.add(createConstCallEvalPass());
+        }
         manager.add(createConstPropPass());
         manager.add(createAlgebraicSimplifyPass());
         manager.add(createCopyPropPass());

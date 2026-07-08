@@ -12,6 +12,8 @@
 namespace toyc::passes {
 namespace {
 
+using LocalConstants = std::unordered_map<std::string, std::int32_t>;
+
 std::optional<std::int32_t> evalUnary(ir::UnaryOpcode op, std::int32_t value)
 {
     switch (op) {
@@ -120,13 +122,153 @@ void updateKnownConstants(
     constants.erase(inst.dst.id);
 }
 
+void applyInstructionConstants(
+    std::unordered_map<int, std::int32_t>& valueConstants,
+    LocalConstants& localConstants,
+    const LocalConstants& invariantLocalConstants,
+    const ir::Instruction& inst)
+{
+    if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+        if (const auto found = localConstants.find(inst.symbol); found != localConstants.end()) {
+            valueConstants[inst.dst.id] = found->second;
+        } else if (const auto invariant = invariantLocalConstants.find(inst.symbol); invariant != invariantLocalConstants.end()) {
+            valueConstants[inst.dst.id] = invariant->second;
+        } else {
+            valueConstants.erase(inst.dst.id);
+        }
+        return;
+    }
+
+    updateKnownConstants(valueConstants, inst);
+
+    if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty() && !inst.operands.empty()) {
+        if (const auto value = knownOperand(inst.operands[0], valueConstants); value.has_value()) {
+            localConstants[inst.symbol] = *value;
+        } else {
+            localConstants.erase(inst.symbol);
+        }
+    }
+}
+
+LocalConstants transferLocalConstants(
+    const LocalConstants& input,
+    const LocalConstants& invariantLocalConstants,
+    const ir::BasicBlock& block)
+{
+    LocalConstants locals = input;
+    std::unordered_map<int, std::int32_t> values;
+    for (const ir::Instruction& inst : block.instructions) {
+        applyInstructionConstants(values, locals, invariantLocalConstants, inst);
+    }
+    return locals;
+}
+
+LocalConstants mergePredecessorConstants(
+    const std::vector<int>& predecessors,
+    const std::vector<LocalConstants>& outConstants)
+{
+    if (predecessors.empty()) {
+        return {};
+    }
+
+    LocalConstants merged = outConstants[static_cast<std::size_t>(predecessors.front())];
+    for (std::size_t i = 1; i < predecessors.size(); ++i) {
+        const LocalConstants& current = outConstants[static_cast<std::size_t>(predecessors[i])];
+        for (auto iter = merged.begin(); iter != merged.end();) {
+            const auto found = current.find(iter->first);
+            if (found == current.end() || found->second != iter->second) {
+                iter = merged.erase(iter);
+            } else {
+                ++iter;
+            }
+        }
+    }
+    return merged;
+}
+
+LocalConstants computeSingleStoreLocalConstants(const ir::Function& function)
+{
+    std::unordered_map<std::string, int> storeCounts;
+    for (const ir::BasicBlock& block : function.blocks) {
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+                ++storeCounts[inst.symbol];
+            }
+        }
+    }
+
+    LocalConstants localConstants;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const ir::BasicBlock& block : function.blocks) {
+            std::unordered_map<int, std::int32_t> values;
+            for (const ir::Instruction& inst : block.instructions) {
+                applyInstructionConstants(values, localConstants, localConstants, inst);
+                if (inst.kind != ir::InstructionKind::StoreLocal
+                    || inst.symbol.empty()
+                    || storeCounts[inst.symbol] != 1
+                    || inst.operands.empty()) {
+                    continue;
+                }
+                const auto value = knownOperand(inst.operands[0], values);
+                if (value.has_value() && localConstants[inst.symbol] != *value) {
+                    localConstants[inst.symbol] = *value;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    for (auto iter = localConstants.begin(); iter != localConstants.end();) {
+        if (storeCounts[iter->first] != 1) {
+            iter = localConstants.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+    return localConstants;
+}
+
+std::vector<LocalConstants> computeEntryLocalConstants(
+    const ir::Function& function,
+    const LocalConstants& invariantLocalConstants)
+{
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<LocalConstants> inConstants(function.blocks.size());
+    std::vector<LocalConstants> outConstants(function.blocks.size());
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (std::size_t index = 0; index < function.blocks.size(); ++index) {
+            LocalConstants nextIn;
+            if (index != 0) {
+                nextIn = mergePredecessorConstants(cfg.predecessors[index], outConstants);
+            }
+            LocalConstants nextOut = transferLocalConstants(nextIn, invariantLocalConstants, function.blocks[index]);
+            if (nextIn != inConstants[index] || nextOut != outConstants[index]) {
+                inConstants[index] = std::move(nextIn);
+                outConstants[index] = std::move(nextOut);
+                changed = true;
+            }
+        }
+    }
+
+    return inConstants;
+}
+
 bool simplifyBranch(ir::Function& function)
 {
     bool changed = false;
-    for (ir::BasicBlock& block : function.blocks) {
+    const LocalConstants invariantLocalConstants = computeSingleStoreLocalConstants(function);
+    const std::vector<LocalConstants> entryLocalConstants = computeEntryLocalConstants(function, invariantLocalConstants);
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        ir::BasicBlock& block = function.blocks[blockIndex];
         std::unordered_map<int, std::int32_t> constants;
+        LocalConstants localConstants = entryLocalConstants[blockIndex];
         for (const ir::Instruction& inst : block.instructions) {
-            updateKnownConstants(constants, inst);
+            applyInstructionConstants(constants, localConstants, invariantLocalConstants, inst);
         }
 
         if (!block.hasTerminator || block.terminator.kind != ir::TerminatorKind::Branch) {
