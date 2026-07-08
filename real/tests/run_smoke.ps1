@@ -264,6 +264,8 @@ function Invoke-RiscVMain {
             "or" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -bor (Get-Reg $parts[3])) }
             "xori" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -bxor [int]$parts[3]) }
             "slli" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shl [int]$parts[3]) }
+            "srai" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shr [int]$parts[3]) }
+            "srli" { Set-Reg $parts[1] ([int](([uint32](Get-Reg $parts[2])) -shr [int]$parts[3])) }
             "slt" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt (Get-Reg $parts[3]))) }
             "slti" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt [int]$parts[3])) }
             "seqz" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -eq 0)) }
@@ -596,6 +598,46 @@ int main(){int x=0; if(choose()){x=5;} else {x=5;} return x+1;}
 Assert-OptReturn "opt_loop_sum_closed_form" @'
 int main(){int i=0; int s=0; while(i<10){i=i+1; s=s+i;} return s;}
 '@ 55
+
+$dynamicLoopSumResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_bound_stats" @'
+int limitSeed = 100;
+int getLimit(){ limitSeed = limitSeed + 0; return limitSeed; }
+int main(){
+    int n = getLimit();
+    int i = 0;
+    int s = 0;
+    while(i < n){
+        s = s + 81;
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_loop_sum_dynamic_bound_stats" $dynamicLoopSumResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $dynamicLoopSumResult.Stdout) -ne 164) {
+    throw "opt_loop_sum_dynamic_bound_stats returned unexpected value"
+}
+
+$polyLoopSumResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_poly_stats" @'
+int limitSeed = 100;
+int getLimit(){ limitSeed = limitSeed + 0; return limitSeed; }
+int main(){
+    int n = getLimit();
+    int i = 0;
+    int s = 0;
+    int t = 0;
+    while(i < n){
+        s = s + 7 * i + 5;
+        t = t + 3 * i - 2;
+        i = i + 1;
+    }
+    return (s + t) % 256;
+}
+'@
+Assert-StatsContains "opt_loop_sum_dynamic_poly_stats" $polyLoopSumResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $polyLoopSumResult.Stdout) -ne 136) {
+    throw "opt_loop_sum_dynamic_poly_stats returned unexpected value"
+}
 
 Assert-OptReturn "opt_licm_shape" @'
 int id(int x){ return x; }

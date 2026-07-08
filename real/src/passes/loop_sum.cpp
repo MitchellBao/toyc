@@ -28,6 +28,11 @@ struct PolyValue {
     Poly poly;
 };
 
+ir::Value newValue(ir::Function& function)
+{
+    return ir::Value{function.nextValue++};
+}
+
 std::optional<std::int32_t> evalBinary(ir::BinaryOpcode op, std::int32_t lhs, std::int32_t rhs)
 {
     switch (op) {
@@ -433,6 +438,77 @@ std::optional<std::int32_t> closedFormSum(
         return std::nullopt;
     }
     return int32Value(*safeTotal);
+}
+
+ir::Operand appendLoadLocal(std::vector<ir::Instruction>& instructions, ir::Function& function, const std::string& symbol)
+{
+    ir::Instruction load;
+    load.kind = ir::InstructionKind::LoadLocal;
+    load.symbol = symbol;
+    load.dst = newValue(function);
+    instructions.push_back(load);
+    return ir::Operand::ref(instructions.back().dst);
+}
+
+ir::Operand appendBinary(
+    std::vector<ir::Instruction>& instructions,
+    ir::Function& function,
+    ir::BinaryOpcode op,
+    ir::Operand lhs,
+    ir::Operand rhs)
+{
+    ir::Instruction inst;
+    inst.kind = ir::InstructionKind::Binary;
+    inst.binaryOp = op;
+    inst.dst = newValue(function);
+    inst.operands = {lhs, rhs};
+    instructions.push_back(inst);
+    return ir::Operand::ref(instructions.back().dst);
+}
+
+ir::Operand appendMulByConst(std::vector<ir::Instruction>& instructions, ir::Function& function, ir::Operand value, std::int64_t factor)
+{
+    if (factor == 1) {
+        return value;
+    }
+    return appendBinary(instructions, function, ir::BinaryOpcode::Mul, value, ir::Operand::imm(static_cast<std::int32_t>(factor)));
+}
+
+ir::Operand appendAddOperand(std::vector<ir::Instruction>& instructions, ir::Function& function, std::optional<ir::Operand>& total, ir::Operand term)
+{
+    if (!total.has_value()) {
+        total = term;
+        return term;
+    }
+    total = appendBinary(instructions, function, ir::BinaryOpcode::Add, *total, term);
+    return *total;
+}
+
+std::optional<ir::Operand> appendDynamicClosedFormSum(
+    std::vector<ir::Instruction>& instructions,
+    ir::Function& function,
+    const Poly& increment,
+    ir::Operand trips)
+{
+    std::optional<ir::Operand> total;
+    if (increment.constant != 0) {
+        appendAddOperand(instructions, function, total, appendMulByConst(instructions, function, trips, increment.constant));
+    }
+
+    std::optional<ir::Operand> sumI;
+    if (increment.linear != 0 || increment.quadratic != 0) {
+        const ir::Operand nMinusOne = appendBinary(instructions, function, ir::BinaryOpcode::Sub, trips, ir::Operand::imm(1));
+        const ir::Operand product = appendBinary(instructions, function, ir::BinaryOpcode::Mul, trips, nMinusOne);
+        sumI = appendBinary(instructions, function, ir::BinaryOpcode::Div, product, ir::Operand::imm(2));
+    }
+    if (increment.linear != 0) {
+        appendAddOperand(instructions, function, total, appendMulByConst(instructions, function, *sumI, increment.linear));
+    }
+
+    if (!total.has_value()) {
+        return std::nullopt;
+    }
+    return total;
 }
 
 std::optional<ir::Operand> resolveCopy(
@@ -844,6 +920,7 @@ bool runOnLoop(ir::Function& function, int header)
     std::optional<ir::BinaryOpcode> cmpOp;
     std::optional<std::string> induction;
     std::optional<std::int32_t> bound;
+    std::optional<ir::Operand> dynamicBound;
 
     for (const ir::Instruction& inst : headerBlock.instructions) {
         switch (inst.kind) {
@@ -889,10 +966,19 @@ bool runOnLoop(ir::Function& function, int header)
                     if (!lhs->base.empty() && rhs->base.empty()) {
                         induction = lhs->base;
                         bound = rhs->offset;
+                        dynamicBound = inst.operands[1];
+                        cmpOp = inst.binaryOp;
+                    } else if (!lhs->base.empty()
+                        && !rhs->base.empty()
+                        && rhs->base != lhs->base
+                        && bodyStoredLocals.find(rhs->base) == bodyStoredLocals.end()) {
+                        induction = lhs->base;
+                        dynamicBound = inst.operands[1];
                         cmpOp = inst.binaryOp;
                     } else if (lhs->base.empty() && !rhs->base.empty()) {
                         induction = rhs->base;
                         bound = lhs->offset;
+                        dynamicBound = inst.operands[0];
                         switch (inst.binaryOp) {
                         case ir::BinaryOpcode::Greater:
                             cmpOp = ir::BinaryOpcode::Less;
@@ -929,7 +1015,7 @@ bool runOnLoop(ir::Function& function, int header)
         }
     }
 
-    if (!cmpOp.has_value() || !induction.has_value() || !bound.has_value()) {
+    if (!cmpOp.has_value() || !induction.has_value() || (!bound.has_value() && !dynamicBound.has_value())) {
         return false;
     }
     const auto start = initialLocalConst(function, header, *induction);
@@ -1038,9 +1124,73 @@ bool runOnLoop(ir::Function& function, int header)
         return false;
     }
     const std::int32_t step = *stepValue;
-    const auto trips = tripCount(*cmpOp, *start, *bound, step);
+    std::optional<int> trips;
+    if (bound.has_value()) {
+        trips = tripCount(*cmpOp, *start, *bound, step);
+    }
     if (!trips.has_value()) {
-        return false;
+        if (*cmpOp != ir::BinaryOpcode::Less || *start != 0 || step != 1 || !dynamicBound.has_value()) {
+            return false;
+        }
+
+        std::unordered_set<std::string> liveAfterLoop;
+        for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
+            const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.kind == ir::InstructionKind::LoadLocal && !inst.symbol.empty()) {
+                    liveAfterLoop.insert(inst.symbol);
+                }
+            }
+        }
+
+        std::vector<ir::Instruction> replacement;
+        bool changedAccumulator = false;
+        for (const auto& [symbol, value] : finalLocal) {
+            if (symbol == *induction || liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
+                continue;
+            }
+            if (value.base != symbol || isZero(value.poly)) {
+                return false;
+            }
+            if (value.poly.quadratic != 0) {
+                return false;
+            }
+            const ir::Operand current = appendLoadLocal(replacement, function, symbol);
+            const auto total = appendDynamicClosedFormSum(replacement, function, value.poly, *dynamicBound);
+            if (!total.has_value()) {
+                return false;
+            }
+            const ir::Operand updated = appendBinary(replacement, function, ir::BinaryOpcode::Add, current, *total);
+
+            ir::Instruction store;
+            store.kind = ir::InstructionKind::StoreLocal;
+            store.symbol = symbol;
+            store.operands = {updated};
+            replacement.push_back(store);
+            changedAccumulator = true;
+        }
+        if (!changedAccumulator) {
+            return false;
+        }
+
+        ir::Instruction inductionStore;
+        inductionStore.kind = ir::InstructionKind::StoreLocal;
+        inductionStore.symbol = *induction;
+        inductionStore.operands = {*dynamicBound};
+        replacement.push_back(inductionStore);
+
+        const int closedIndex = static_cast<int>(function.blocks.size());
+        ir::BasicBlock closedBlock;
+        closedBlock.label = ".while.closed";
+        closedBlock.instructions = std::move(replacement);
+        closedBlock.terminator.kind = ir::TerminatorKind::Jump;
+        closedBlock.terminator.trueBlock = exitIndex;
+        closedBlock.hasTerminator = true;
+        function.blocks.push_back(std::move(closedBlock));
+
+        ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+        mutableHeader.terminator.trueBlock = closedIndex;
+        return true;
     }
     if (tryInvariantAccumulationLoop(function, header, exitIndex, body, *induction, *start, step, *trips)) {
         return true;
