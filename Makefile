@@ -30,6 +30,7 @@ SOURCES := \
 	real/src/passes/inst_combine.cpp \
 	real/src/passes/dce.cpp \
 	real/src/passes/dse.cpp \
+	real/src/passes/dead_function_elim.cpp \
 	real/src/passes/licm.cpp \
 	real/src/passes/loop_sum.cpp \
 	real/src/passes/inline_small.cpp \

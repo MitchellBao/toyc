@@ -801,6 +801,28 @@ if ((Invoke-RiscVMain $inlineResult.Stdout) -ne 11) {
     throw "opt_iterative_inline_chain_stats returned unexpected value"
 }
 
+$deadFunctionResult = Compile-OptSnippetWithStats "opt_dead_function_elim_stats" @'
+int g = 1;
+int unused_large(int x) {
+    int i = 0;
+    int s = x;
+    while (i < 100) {
+        s = s * 3 + i;
+        i = i + 1;
+    }
+    g = s;
+    return g;
+}
+int main() {
+    return g;
+}
+'@
+Assert-StatsContains "opt_dead_function_elim_stats" $deadFunctionResult.Stderr "pass=dead-function-elim changed=yes"
+Assert-AssemblyNotContains "opt_dead_function_elim_stats" $deadFunctionResult.Stdout ".globl unused_large"
+if ((Invoke-RiscVMain $deadFunctionResult.Stdout) -ne 1) {
+    throw "opt_dead_function_elim_stats returned unexpected value"
+}
+
 $inlineBranchResult = Compile-OptSnippetWithStats "opt_inline_small_branch_stats" @'
 int pick(int x) {
     if (x < 10) {

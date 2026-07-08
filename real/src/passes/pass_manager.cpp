@@ -83,7 +83,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
             manager.add(createSimplifyCfgPass());
+            manager.add(createDsePass());
             manager.add(createDcePass());
+            manager.add(createDeadFunctionElimPass());
         }
         manager.add(createConstCallEvalPass());
         manager.add(createConstPropPass());
@@ -93,8 +95,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createCsePass());
         manager.add(createInstCombinePass());
         manager.add(createSimplifyCfgPass());
-        manager.add(createDcePass());
         manager.add(createDsePass());
+        manager.add(createDcePass());
+        manager.add(createDeadFunctionElimPass());
         manager.add(createLicmPass());
         manager.add(createLoopSumPass());
         manager.add(createTailRecursionPass());
@@ -109,8 +112,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createLocalCoalescePass());
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
-            manager.add(createDcePass());
             manager.add(createDsePass());
+            manager.add(createDcePass());
+            manager.add(createDeadFunctionElimPass());
             manager.add(createLicmPass());
             manager.add(createLoopSumPass());
             manager.add(createSimplifyCfgPass());
@@ -122,8 +126,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createLocalCoalescePass());
         manager.add(createCsePass());
         manager.add(createInstCombinePass());
-        manager.add(createDcePass());
         manager.add(createDsePass());
+        manager.add(createDcePass());
+        manager.add(createDeadFunctionElimPass());
         manager.add(createLicmPass());
         manager.add(createLoopSumPass());
         manager.add(createSimplifyCfgPass());
@@ -137,8 +142,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createLocalCoalescePass());
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
-            manager.add(createDcePass());
             manager.add(createDsePass());
+            manager.add(createDcePass());
+            manager.add(createDeadFunctionElimPass());
             manager.add(createSimplifyCfgPass());
         }
         manager.add(createSimplifyCfgPass());

@@ -1,6 +1,7 @@
 #include "pass_manager.h"
 
 #include <algorithm>
+#include <vector>
 #include <unordered_set>
 
 namespace toyc::passes {
@@ -21,6 +22,11 @@ bool isPure(const ir::Instruction& inst)
         && inst.kind != ir::InstructionKind::Call;
 }
 
+bool isRoot(const ir::Instruction& inst)
+{
+    return !isPure(inst) || inst.dst.id < 0;
+}
+
 class DcePass final : public Pass {
 public:
     std::string name() const override { return "dce"; }
@@ -29,21 +35,46 @@ public:
     {
         bool changed = false;
         for (ir::Function& function : module.functions) {
-            std::unordered_set<int> used;
+            std::unordered_set<int> liveValues;
+            std::vector<int> worklist;
+            auto markLive = [&](const ir::Operand& operand) {
+                if (!operand.isImmediate && operand.value.id >= 0 && liveValues.insert(operand.value.id).second) {
+                    worklist.push_back(operand.value.id);
+                }
+            };
+
             for (const ir::BasicBlock& block : function.blocks) {
                 for (const ir::Instruction& inst : block.instructions) {
-                    for (const ir::Operand& operand : inst.operands) {
-                        markOperand(operand, used);
+                    if (isRoot(inst)) {
+                        for (const ir::Operand& operand : inst.operands) {
+                            markLive(operand);
+                        }
                     }
                 }
-                markOperand(block.terminator.condition, used);
-                markOperand(block.terminator.returnValue, used);
+                markLive(block.terminator.condition);
+                markLive(block.terminator.returnValue);
             }
+
+            while (!worklist.empty()) {
+                const int value = worklist.back();
+                worklist.pop_back();
+                for (const ir::BasicBlock& block : function.blocks) {
+                    for (const ir::Instruction& inst : block.instructions) {
+                        if (inst.dst.id != value) {
+                            continue;
+                        }
+                        for (const ir::Operand& operand : inst.operands) {
+                            markLive(operand);
+                        }
+                    }
+                }
+            }
+
             for (ir::BasicBlock& block : function.blocks) {
                 const auto oldSize = block.instructions.size();
                 block.instructions.erase(
                     std::remove_if(block.instructions.begin(), block.instructions.end(), [&](const ir::Instruction& inst) {
-                        return inst.dst.id >= 0 && used.find(inst.dst.id) == used.end() && isPure(inst);
+                        return inst.dst.id >= 0 && liveValues.find(inst.dst.id) == liveValues.end() && isPure(inst);
                     }),
                     block.instructions.end());
                 changed = changed || block.instructions.size() != oldSize;

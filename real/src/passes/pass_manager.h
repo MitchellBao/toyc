@@ -45,6 +45,7 @@ std::unique_ptr<Pass> createCsePass();
 std::unique_ptr<Pass> createInstCombinePass();
 std::unique_ptr<Pass> createDcePass();
 std::unique_ptr<Pass> createDsePass();
+std::unique_ptr<Pass> createDeadFunctionElimPass();
 std::unique_ptr<Pass> createLicmPass();
 std::unique_ptr<Pass> createLoopSumPass();
 std::unique_ptr<Pass> createInlineSmallPass();
