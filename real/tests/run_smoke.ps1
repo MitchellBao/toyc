@@ -107,6 +107,29 @@ function Count-Fragment {
     return ([regex]::Matches($Text, [regex]::Escape($Fragment))).Count
 }
 
+function Count-AssemblyOpcode {
+    param(
+        [string]$Text,
+        [string]$Opcode
+    )
+
+    return ([regex]::Matches($Text, "(?m)^\s*$([regex]::Escape($Opcode))\b")).Count
+}
+
+function FunctionAssembly {
+    param(
+        [string]$Assembly,
+        [string]$FunctionName
+    )
+
+    $pattern = "(?ms)^\.globl\s+$([regex]::Escape($FunctionName))\s*\r?\n$([regex]::Escape($FunctionName)):\r?\n(.*?)(?=^\.globl\s+|\z)"
+    $match = [regex]::Match($Assembly, $pattern)
+    if (-not $match.Success) {
+        throw "assembly missing function: $FunctionName"
+    }
+    return $match.Groups[1].Value
+}
+
 function Invoke-RiscVMain {
     param(
         [string]$Asm,
@@ -583,6 +606,28 @@ Assert-OptReturn "opt_tail_recursion_semantics" @'
 int sum(int n, int acc){ if(n==0) return acc; return sum(n-1, acc+n); }
 int main(){ return sum(100,0); }
 '@ 5050
+
+$tailRecursionAsm = Compile-OptSnippet "opt_tail_recursion_no_self_call" @'
+int seed = 100;
+int get(){ seed = seed + 0; return seed; }
+int sum(int n, int acc){ if(n==0) return acc; return sum(n-1, acc+n); }
+int main(){ int n = get(); return sum(n,0); }
+'@
+$tailRecursionSumAsm = FunctionAssembly $tailRecursionAsm "sum"
+Assert-AssemblyNotContains "opt_tail_recursion_no_self_call" $tailRecursionSumAsm "call sum"
+if ((Count-AssemblyOpcode $tailRecursionSumAsm "lw") -gt 3) {
+    throw "opt_tail_recursion_no_self_call kept too many stack loads"
+}
+if ((Count-AssemblyOpcode $tailRecursionSumAsm "sw") -gt 3) {
+    throw "opt_tail_recursion_no_self_call kept too many stack stores"
+}
+
+Assert-OptReturn "opt_tail_recursion_parallel_params" @'
+int flipSeed = 3;
+int getFlipCount(){ flipSeed = flipSeed + 0; return flipSeed; }
+int flip(int a, int b, int n){ if(n==0) return a*10+b; return flip(b, a, n-1); }
+int main(){ return flip(1,2,getFlipCount()); }
+'@ 21
 
 Assert-OptReturn "opt_value_register_semantics" @'
 int id(int x){ return x; }

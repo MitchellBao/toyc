@@ -222,7 +222,7 @@ private:
             }
         }
 
-        allocateLocalRegs(locals, hasCall);
+        allocateLocalRegs(locals, hasCall, hasEntryBackedge());
         std::unordered_set<std::string> reservedRegs;
         for (const auto& [local, reg] : allocatedLocalRegs_) {
             (void)local;
@@ -455,9 +455,23 @@ private:
         return liveAcrossCalls;
     }
 
-    void allocateLocalRegs(const std::unordered_set<std::string>& locals, bool hasCall)
+    bool hasEntryBackedge() const
     {
-        if (hasCall || !function_.params.empty()) {
+        for (int i = 1; i < static_cast<int>(function_.blocks.size()); ++i) {
+            const ir::Terminator& term = function_.blocks[static_cast<std::size_t>(i)].terminator;
+            if (term.kind == ir::TerminatorKind::Jump && term.trueBlock == 0) {
+                return true;
+            }
+            if (term.kind == ir::TerminatorKind::Branch && (term.trueBlock == 0 || term.falseBlock == 0)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void allocateLocalRegs(const std::unordered_set<std::string>& locals, bool hasCall, bool hasLoop)
+    {
+        if (hasCall || (!hasLoop && !function_.params.empty())) {
             return;
         }
 
