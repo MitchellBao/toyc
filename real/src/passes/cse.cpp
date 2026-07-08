@@ -73,7 +73,7 @@ std::string instructionKey(const ir::Instruction& inst, const std::unordered_map
     } else if (inst.kind == ir::InstructionKind::LoadLocal) {
         key << ":local:" << memoryVersionedSymbol(inst.symbol, localVersions);
     } else if (inst.kind == ir::InstructionKind::LoadGlobal) {
-        key << ":global:" << inst.symbol << '@' << globalVersion;
+        return {};
     } else {
         key << ':' << static_cast<int>(inst.binaryOp) << ':' << static_cast<int>(inst.unaryOp) << ':' << inst.symbol;
     }

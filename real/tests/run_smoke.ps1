@@ -11,7 +11,8 @@ function Invoke-Compiler {
         [string]$Name,
         [string]$Source,
         [switch]$Optimize,
-        [switch]$Stats
+        [switch]$Stats,
+        [switch]$DisableConstCallEval
     )
 
     $mode = if ($Optimize) { "opt" } else { "plain" }
@@ -32,6 +33,9 @@ function Invoke-Compiler {
     $psi.FileName = $env:ComSpec
     $psi.Arguments = "/d /s /c `"$cmdLine`""
     $psi.UseShellExecute = $false
+    if ($DisableConstCallEval) {
+        $psi.Environment["TOYC_DISABLE_CONST_CALL_EVAL"] = "1"
+    }
     $process = [System.Diagnostics.Process]::Start($psi)
     $process.WaitForExit()
 
@@ -371,6 +375,19 @@ function Compile-OptSnippetWithStats {
     return $result
 }
 
+function Compile-OptSnippetWithStatsNoConstCallEval {
+    param(
+        [string]$Name,
+        [string]$Source
+    )
+
+    $result = Invoke-Compiler $Name $Source -Optimize -Stats -DisableConstCallEval
+    if ($result.ExitCode -ne 0) {
+        throw "$Name compilation failed: $($result.Stderr)"
+    }
+    return $result
+}
+
 function Assert-StatsContains {
     param(
         [string]$Name,
@@ -613,6 +630,141 @@ Assert-OptReturn "opt_cross_block" @'
 int choose(){ return 1; }
 int main(){int x=0; if(choose()){x=5;} else {x=5;} return x+1;}
 '@ 6
+
+$targetAlgebraChain = Compile-OptSnippetWithStatsNoConstCallEval "target_algebra_chain_stats" @'
+int main() {
+    int x = 9;
+    int a = x + 0;
+    int b = 0 + a;
+    int c = b * 1;
+    int d = 1 * c;
+    int e = d - d;
+    int f = (x + 3) + 4;
+    int g = (f - 2) - 5;
+    int h = (g * 2) * 3;
+    int z = h * 0;
+    return z + e + x;
+}
+'@
+Assert-StatsContains "target_algebra_chain_stats" $targetAlgebraChain.Stderr "pass=algebraic-simplify changed=yes"
+Assert-StatsContains "target_algebra_chain_stats" $targetAlgebraChain.Stderr "pass=inst-combine changed=yes"
+if ((Invoke-RiscVMain $targetAlgebraChain.Stdout 100) -ne 9) {
+    throw "target_algebra_chain_stats returned unexpected value"
+}
+
+$targetCopyChain = Compile-OptSnippetWithStatsNoConstCallEval "target_copy_chain_stats" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int b = id(42);
+    int a = b;
+    int c = a;
+    int d = c;
+    return d;
+}
+'@
+Assert-StatsContains "target_copy_chain_stats" $targetCopyChain.Stderr "pass=copy-prop changed=yes"
+Assert-StatsContains "target_copy_chain_stats" $targetCopyChain.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $targetCopyChain.Stdout 1000) -ne 42) {
+    throw "target_copy_chain_stats returned unexpected value"
+}
+
+$targetCopyCoalesceExpr = Compile-OptSnippetWithStatsNoConstCallEval "target_copy_coalesce_expr_stats" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(3);
+    int y = id(4);
+    int t = x * y + y;
+    int z = t;
+    return z;
+}
+'@
+Assert-StatsContains "target_copy_coalesce_expr_stats" $targetCopyCoalesceExpr.Stderr "pass=copy-prop changed=yes"
+Assert-StatsContains "target_copy_coalesce_expr_stats" $targetCopyCoalesceExpr.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $targetCopyCoalesceExpr.Stdout 1000) -ne 16) {
+    throw "target_copy_coalesce_expr_stats returned unexpected value"
+}
+
+$targetLocalCse = Compile-OptSnippetWithStatsNoConstCallEval "target_local_cse_basic_stats" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(6);
+    int y = id(7);
+    int z = id(5);
+    int a = x * y + z;
+    int b = x * y + z;
+    int c = x * y + z;
+    return a + b + c;
+}
+'@
+Assert-StatsContains "target_local_cse_basic_stats" $targetLocalCse.Stderr "pass=local-cse changed=yes"
+if ((Count-AssemblyOpcode $targetLocalCse.Stdout "mul") -gt 1) {
+    throw "target_local_cse_basic_stats kept repeated multiply"
+}
+if ((Invoke-RiscVMain $targetLocalCse.Stdout 1000) -ne 141) {
+    throw "target_local_cse_basic_stats returned unexpected value"
+}
+
+$targetCseKill = Compile-OptSnippetWithStatsNoConstCallEval "target_cse_kill_case_stats" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(2);
+    int y = id(3);
+    int a = x * y;
+    x = id(4);
+    int b = x * y;
+    return a + b;
+}
+'@
+if ((Invoke-RiscVMain $targetCseKill.Stdout 1000) -ne 18) {
+    throw "target_cse_kill_case_stats returned unexpected value"
+}
+
+$targetCseCallBarrier = Compile-OptSnippetWithStatsNoConstCallEval "target_cse_call_barrier_stats" @'
+int g = 0;
+int bump(int x) {
+    if (x < 0) {
+        return bump(x);
+    }
+    g = g + x;
+    return x;
+}
+int main() {
+    int x = bump(3);
+    int a = x * g;
+    bump(4);
+    int b = x * g;
+    return a + b;
+}
+'@
+if ((Invoke-RiscVMain $targetCseCallBarrier.Stdout 2000) -ne 30) {
+    throw "target_cse_call_barrier_stats returned unexpected value"
+}
+
+$targetTailRecursion = Compile-OptSnippetWithStatsNoConstCallEval "target_tail_recursion_simple_stats" @'
+int sum(int n, int acc) {
+    if (n == 0) {
+        return acc;
+    }
+    return sum(n - 1, acc + n);
+}
+int main() {
+    return sum(200, 0) % 256;
+}
+'@
+Assert-StatsContains "target_tail_recursion_simple_stats" $targetTailRecursion.Stderr "pass=tail-recursion changed=yes"
+$targetTailSumAsm = FunctionAssembly $targetTailRecursion.Stdout "sum"
+Assert-AssemblyNotContains "target_tail_recursion_simple_stats" $targetTailSumAsm "call sum"
+if ((Invoke-RiscVMain $targetTailRecursion.Stdout 5000) -ne 132) {
+    throw "target_tail_recursion_simple_stats returned unexpected value"
+}
 
 $p02ReturnAfterResult = Compile-OptSnippetWithStats "opt_p02_return_after_long_loop_stats" @'
 int g = 0;

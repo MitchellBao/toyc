@@ -10,12 +10,32 @@ bool replaceOperand(ir::Operand& operand, const std::unordered_map<int, ir::Oper
     if (operand.isImmediate) {
         return false;
     }
-    const auto found = copies.find(operand.value.id);
-    if (found == copies.end()) {
+    ir::Operand resolved = operand;
+    for (int depth = 0; depth < 16 && !resolved.isImmediate && resolved.value.id >= 0; ++depth) {
+        const auto found = copies.find(resolved.value.id);
+        if (found == copies.end()) {
+            break;
+        }
+        resolved = found->second;
+    }
+    if ((resolved.isImmediate && operand.isImmediate)
+        || (!resolved.isImmediate && !operand.isImmediate && resolved.value.id == operand.value.id)) {
         return false;
     }
-    operand = found->second;
+    operand = resolved;
     return true;
+}
+
+ir::Operand resolveCopy(ir::Operand operand, const std::unordered_map<int, ir::Operand>& copies)
+{
+    for (int depth = 0; depth < 16 && !operand.isImmediate && operand.value.id >= 0; ++depth) {
+        const auto found = copies.find(operand.value.id);
+        if (found == copies.end()) {
+            break;
+        }
+        operand = found->second;
+    }
+    return operand;
 }
 
 bool mayClobberLocals(const ir::Instruction& inst)
@@ -58,7 +78,7 @@ public:
                     }
 
                     if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
-                        copies[inst.dst.id] = inst.operands[0];
+                        copies[inst.dst.id] = resolveCopy(inst.operands[0], copies);
                     } else if (inst.dst.id >= 0) {
                         copies.erase(inst.dst.id);
                     }
