@@ -120,6 +120,59 @@ bool redirectEmptyJumpBlocks(ir::Function& function)
     return changed;
 }
 
+bool mergeJumpToNextBlocks(ir::Function& function)
+{
+    bool changed = false;
+    while (true) {
+        const analysis::Cfg cfg = analysis::buildCfg(function);
+        int mergeIndex = -1;
+        for (int i = 0; i + 1 < static_cast<int>(function.blocks.size()); ++i) {
+            const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(i)];
+            const int next = i + 1;
+            if (!block.hasTerminator
+                || block.terminator.kind != ir::TerminatorKind::Jump
+                || block.terminator.trueBlock != next
+                || cfg.predecessors[static_cast<std::size_t>(next)].size() != 1
+                || cfg.predecessors[static_cast<std::size_t>(next)].front() != i) {
+                continue;
+            }
+            mergeIndex = i;
+            break;
+        }
+
+        if (mergeIndex < 0) {
+            break;
+        }
+
+        const int removed = mergeIndex + 1;
+        ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(mergeIndex)];
+        ir::BasicBlock& nextBlock = function.blocks[static_cast<std::size_t>(removed)];
+        block.instructions.insert(
+            block.instructions.end(),
+            std::make_move_iterator(nextBlock.instructions.begin()),
+            std::make_move_iterator(nextBlock.instructions.end()));
+        block.terminator = nextBlock.terminator;
+        block.hasTerminator = nextBlock.hasTerminator;
+
+        function.blocks.erase(function.blocks.begin() + removed);
+        for (ir::BasicBlock& current : function.blocks) {
+            auto remap = [removed](int& target) {
+                if (target > removed) {
+                    --target;
+                }
+            };
+            if (current.terminator.kind == ir::TerminatorKind::Jump || current.terminator.kind == ir::TerminatorKind::Branch) {
+                remap(current.terminator.trueBlock);
+            }
+            if (current.terminator.kind == ir::TerminatorKind::Branch) {
+                remap(current.terminator.falseBlock);
+            }
+        }
+        changed = true;
+    }
+    return changed;
+}
+
 class SimplifyCfgPass final : public Pass {
 public:
     std::string name() const override { return "simplify-cfg"; }
@@ -132,6 +185,7 @@ public:
                 localChanged = false;
                 localChanged = simplifyBranch(function) || localChanged;
                 localChanged = redirectEmptyJumpBlocks(function) || localChanged;
+                localChanged = mergeJumpToNextBlocks(function) || localChanged;
                 localChanged = removeUnreachableBlocks(function) || localChanged;
                 changed = localChanged || changed;
             } while (localChanged);

@@ -10,7 +10,8 @@ function Invoke-Compiler {
     param(
         [string]$Name,
         [string]$Source,
-        [switch]$Optimize
+        [switch]$Optimize,
+        [switch]$Stats
     )
 
     $mode = if ($Optimize) { "opt" } else { "plain" }
@@ -22,6 +23,9 @@ function Invoke-Compiler {
     $compilerCommand = '"' + $CompilerPath.Path + '"'
     if ($Optimize) {
         $compilerCommand += " -opt"
+    }
+    if ($Stats) {
+        $compilerCommand += " --stats"
     }
     $cmdLine = "$compilerCommand < `"$inputPath`" > `"$stdoutPath`" 2> `"$stderrPath`""
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -322,6 +326,75 @@ function Assert-OptReturn {
     }
 }
 
+function Compile-OptSnippetWithStats {
+    param(
+        [string]$Name,
+        [string]$Source
+    )
+
+    $result = Invoke-Compiler $Name $Source -Optimize -Stats
+    if ($result.ExitCode -ne 0) {
+        throw "$Name compilation failed: $($result.Stderr)"
+    }
+    return $result
+}
+
+function Assert-StatsContains {
+    param(
+        [string]$Name,
+        [string]$Stats,
+        [string]$Needle
+    )
+
+    if (-not $Stats.Contains($Needle)) {
+        throw "$Name stats missing expected fragment: $Needle"
+    }
+}
+
+function Assert-AssemblyNotContains {
+    param(
+        [string]$Name,
+        [string]$Assembly,
+        [string]$Needle
+    )
+
+    if ($Assembly.Contains($Needle)) {
+        throw "$Name assembly unexpectedly contains: $Needle"
+    }
+}
+
+function Assert-StatsMatches {
+    param(
+        [string]$Name,
+        [string]$Stats,
+        [string]$Pattern
+    )
+
+    if ($Stats -notmatch $Pattern) {
+        throw "$Name stats missing expected pattern: $Pattern"
+    }
+}
+
+function Assert-NoJumpToNextLabel {
+    param(
+        [string]$Name,
+        [string]$Assembly
+    )
+
+    $lines = @($Assembly -split "`r?`n")
+    for ($i = 0; $i -lt $lines.Count - 1; ++$i) {
+        $line = $lines[$i].Trim()
+        if ($line -notmatch '^j\s+(\S+)$') {
+            continue
+        }
+        $target = $Matches[1]
+        $next = $lines[$i + 1].Trim()
+        if ($next -eq "$target`:") {
+            throw "$Name assembly contains no-op jump to next label: $target"
+        }
+    }
+}
+
 Assert-OptReturn "opt_call_then_global_load" @'
 int g = 1;
 int set() {
@@ -487,5 +560,124 @@ Assert-OptReturn "opt_value_register_semantics" @'
 int id(int x){ return x; }
 int main(){int x=id(7); int y=x*x; int z=x*x; return y+z;}
 '@ 98
+
+$globalCopyResult = Compile-OptSnippetWithStats "opt_global_copy_across_blocks_stats" @'
+int pick(int x) { return x; }
+int main() {
+    int a = pick(9);
+    int b = a;
+    int c = 0;
+    if (pick(1)) {
+        c = b + 1;
+    } else {
+        c = b + 2;
+    }
+    return c + b;
+}
+'@
+Assert-StatsContains "opt_global_copy_across_blocks_stats" $globalCopyResult.Stderr "pass=global-copy-prop changed=yes"
+if ((Invoke-RiscVMain $globalCopyResult.Stdout) -ne 19) {
+    throw "opt_global_copy_across_blocks_stats returned unexpected value"
+}
+
+$globalCseResult = Compile-OptSnippetWithStats "opt_global_cse_across_blocks_stats" @'
+int pick(int x) { return x; }
+int main() {
+    int a = pick(3);
+    int b = pick(4);
+    int x = a + b;
+    int y = 0;
+    if (pick(1)) {
+        y = a + b;
+    } else {
+        y = a + b;
+    }
+    return x + y;
+}
+'@
+Assert-StatsContains "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse changed=yes"
+if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 14) {
+    throw "opt_global_cse_across_blocks_stats returned unexpected value"
+}
+
+$inlineResult = Compile-OptSnippetWithStats "opt_iterative_inline_chain_stats" @'
+int seed = 5;
+int one(int x) { return x + 1; }
+int two(int y) { return one(y) + seed; }
+int main() {
+    int a = seed;
+    return two(a);
+}
+'@
+Assert-StatsContains "opt_iterative_inline_chain_stats" $inlineResult.Stderr "pass=inline-small changed=yes"
+Assert-AssemblyNotContains "opt_iterative_inline_chain_stats" $inlineResult.Stdout "call two"
+Assert-AssemblyNotContains "opt_iterative_inline_chain_stats" $inlineResult.Stdout "call one"
+if ((Invoke-RiscVMain $inlineResult.Stdout) -ne 11) {
+    throw "opt_iterative_inline_chain_stats returned unexpected value"
+}
+
+$cfgBranchFoldResult = Compile-OptSnippetWithStats "opt_cfg_fold_next_jump_stats" @'
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
+int main() {
+    if (1) {
+        bump(3);
+    }
+    return g;
+}
+'@
+Assert-StatsMatches "opt_cfg_fold_next_jump_stats" $cfgBranchFoldResult.Stderr 'pass=simplify-cfg changed=yes.*blocks=\d+->([0-9])'
+Assert-NoJumpToNextLabel "opt_cfg_fold_next_jump_stats" $cfgBranchFoldResult.Stdout
+if ((Invoke-RiscVMain $cfgBranchFoldResult.Stdout) -ne 3) {
+    throw "opt_cfg_fold_next_jump_stats returned unexpected value"
+}
+
+$cfgEmptyBridgeResult = Compile-OptSnippetWithStats "opt_cfg_empty_bridge_stats" @'
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
+int main() {
+    if (0) {
+        bump(1);
+    } else {
+        if (1) {
+            bump(4);
+        }
+    }
+    return g;
+}
+'@
+Assert-StatsMatches "opt_cfg_empty_bridge_stats" $cfgEmptyBridgeResult.Stderr 'pass=simplify-cfg changed=yes.*blocks=\d+->([0-9])'
+Assert-NoJumpToNextLabel "opt_cfg_empty_bridge_stats" $cfgEmptyBridgeResult.Stdout
+if ((Invoke-RiscVMain $cfgEmptyBridgeResult.Stdout) -ne 4) {
+    throw "opt_cfg_empty_bridge_stats returned unexpected value"
+}
+
+$cfgMergeNextResult = Compile-OptSnippetWithStats "opt_cfg_merge_next_block_stats" @'
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
+int main() {
+    int i = 0;
+    while (i < 2) {
+        if (1) {
+            bump(i + 1);
+        }
+        i = i + 1;
+    }
+    return g;
+}
+'@
+Assert-StatsContains "opt_cfg_merge_next_block_stats" $cfgMergeNextResult.Stderr "blocks=7->5"
+if ((Invoke-RiscVMain $cfgMergeNextResult.Stdout) -ne 3) {
+    throw "opt_cfg_merge_next_block_stats returned unexpected value"
+}
 
 Write-Host "ToyC smoke tests passed"

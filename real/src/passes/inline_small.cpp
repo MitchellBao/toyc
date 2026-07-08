@@ -1,8 +1,10 @@
 #include "pass_manager.h"
 
 #include <cstddef>
+#include <algorithm>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -10,15 +12,99 @@ namespace toyc::passes {
 namespace {
 
 constexpr std::size_t kMaxInlineInstructions = 400;
+constexpr int kMaxInlineRounds = 6;
 
 ir::Value newValue(ir::Function& function)
 {
     return ir::Value{function.nextValue++};
 }
 
-bool isInlineCandidate(const ir::Function& function)
+std::vector<std::string> calleesOf(const ir::Function& function)
 {
-    if (function.blocks.size() != 1 || function.returnType != ir::Type::Int) {
+    std::vector<std::string> result;
+    for (const ir::BasicBlock& block : function.blocks) {
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::Call && !inst.symbol.empty()) {
+                result.push_back(inst.symbol);
+            }
+        }
+    }
+    return result;
+}
+
+std::unordered_set<std::string> recursiveFunctions(const ir::Module& module)
+{
+    std::unordered_map<std::string, std::vector<std::string>> graph;
+    for (const ir::Function& function : module.functions) {
+        graph[function.name] = calleesOf(function);
+    }
+
+    std::unordered_map<std::string, int> index;
+    std::unordered_map<std::string, int> lowlink;
+    std::vector<std::string> stack;
+    std::unordered_set<std::string> onStack;
+    std::unordered_set<std::string> recursive;
+    int nextIndex = 0;
+
+    auto strongConnect = [&](auto&& self, const std::string& name) -> void {
+        index[name] = nextIndex;
+        lowlink[name] = nextIndex;
+        ++nextIndex;
+        stack.push_back(name);
+        onStack.insert(name);
+
+        for (const std::string& callee : graph[name]) {
+            if (graph.find(callee) == graph.end()) {
+                continue;
+            }
+            if (index.find(callee) == index.end()) {
+                self(self, callee);
+                lowlink[name] = std::min(lowlink[name], lowlink[callee]);
+            } else if (onStack.find(callee) != onStack.end()) {
+                lowlink[name] = std::min(lowlink[name], index[callee]);
+            }
+        }
+
+        if (lowlink[name] != index[name]) {
+            return;
+        }
+
+        std::vector<std::string> component;
+        while (!stack.empty()) {
+            const std::string member = stack.back();
+            stack.pop_back();
+            onStack.erase(member);
+            component.push_back(member);
+            if (member == name) {
+                break;
+            }
+        }
+
+        if (component.size() > 1) {
+            recursive.insert(component.begin(), component.end());
+            return;
+        }
+        const std::string& only = component.front();
+        const auto found = graph.find(only);
+        if (found != graph.end()
+            && std::find(found->second.begin(), found->second.end(), only) != found->second.end()) {
+            recursive.insert(only);
+        }
+    };
+
+    for (const ir::Function& function : module.functions) {
+        if (index.find(function.name) == index.end()) {
+            strongConnect(strongConnect, function.name);
+        }
+    }
+    return recursive;
+}
+
+bool isInlineCandidate(const ir::Function& function, const std::unordered_set<std::string>& recursive)
+{
+    if (recursive.find(function.name) != recursive.end()
+        || function.blocks.size() != 1
+        || function.returnType != ir::Type::Int) {
         return false;
     }
     const ir::BasicBlock& block = function.blocks.front();
@@ -103,39 +189,95 @@ std::vector<ir::Instruction> inlineCall(ir::Function& caller, const ir::Instruct
     return result;
 }
 
+std::unordered_map<std::string, const ir::Function*> collectCandidates(const ir::Module& module)
+{
+    const std::unordered_set<std::string> recursive = recursiveFunctions(module);
+    std::unordered_map<std::string, const ir::Function*> candidates;
+    for (const ir::Function& function : module.functions) {
+        if (isInlineCandidate(function, recursive)) {
+            candidates.emplace(function.name, &function);
+        }
+    }
+    return candidates;
+}
+
+bool inlineOneRound(ir::Module& module)
+{
+    const std::unordered_map<std::string, const ir::Function*> candidates = collectCandidates(module);
+    bool changed = false;
+    for (ir::Function& function : module.functions) {
+        for (ir::BasicBlock& block : function.blocks) {
+            std::vector<ir::Instruction> rewritten;
+            rewritten.reserve(block.instructions.size());
+            for (const ir::Instruction& inst : block.instructions) {
+                const auto found = inst.kind == ir::InstructionKind::Call ? candidates.find(inst.symbol) : candidates.end();
+                if (found == candidates.end()
+                    || found->second->name == function.name
+                    || inst.operands.size() != found->second->params.size()
+                    || inst.dst.id < 0) {
+                    rewritten.push_back(inst);
+                    continue;
+                }
+                std::vector<ir::Instruction> expanded = inlineCall(function, inst, *found->second);
+                rewritten.insert(rewritten.end(), expanded.begin(), expanded.end());
+                changed = true;
+            }
+            block.instructions = std::move(rewritten);
+        }
+    }
+    return changed;
+}
+
+bool eliminateDeadFunctions(ir::Module& module)
+{
+    std::unordered_map<std::string, const ir::Function*> byName;
+    for (const ir::Function& function : module.functions) {
+        byName.emplace(function.name, &function);
+    }
+
+    std::unordered_set<std::string> reachable;
+    std::vector<std::string> worklist;
+    if (byName.find("main") != byName.end()) {
+        reachable.insert("main");
+        worklist.push_back("main");
+    }
+
+    while (!worklist.empty()) {
+        const std::string current = worklist.back();
+        worklist.pop_back();
+        const auto found = byName.find(current);
+        if (found == byName.end()) {
+            continue;
+        }
+        for (const std::string& callee : calleesOf(*found->second)) {
+            if (byName.find(callee) != byName.end() && reachable.insert(callee).second) {
+                worklist.push_back(callee);
+            }
+        }
+    }
+
+    const std::size_t before = module.functions.size();
+    module.functions.erase(
+        std::remove_if(module.functions.begin(), module.functions.end(), [&](const ir::Function& function) {
+            return function.name != "main" && reachable.find(function.name) == reachable.end();
+        }),
+        module.functions.end());
+    return module.functions.size() != before;
+}
+
 class InlineSmallPass final : public Pass {
 public:
     std::string name() const override { return "inline-small"; }
     bool run(ir::Module& module) override
     {
-        std::unordered_map<std::string, const ir::Function*> candidates;
-        for (const ir::Function& function : module.functions) {
-            if (isInlineCandidate(function)) {
-                candidates.emplace(function.name, &function);
-            }
-        }
-
         bool changed = false;
-        for (ir::Function& function : module.functions) {
-            for (ir::BasicBlock& block : function.blocks) {
-                std::vector<ir::Instruction> rewritten;
-                rewritten.reserve(block.instructions.size());
-                for (const ir::Instruction& inst : block.instructions) {
-                    const auto found = inst.kind == ir::InstructionKind::Call ? candidates.find(inst.symbol) : candidates.end();
-                    if (found == candidates.end()
-                        || found->second->name == function.name
-                        || inst.operands.size() != found->second->params.size()
-                        || inst.dst.id < 0) {
-                        rewritten.push_back(inst);
-                        continue;
-                    }
-                    std::vector<ir::Instruction> expanded = inlineCall(function, inst, *found->second);
-                    rewritten.insert(rewritten.end(), expanded.begin(), expanded.end());
-                    changed = true;
-                }
-                block.instructions = std::move(rewritten);
+        for (int round = 0; round < kMaxInlineRounds; ++round) {
+            if (!inlineOneRound(module)) {
+                break;
             }
+            changed = true;
         }
+        changed = eliminateDeadFunctions(module) || changed;
         return changed;
     }
 };
