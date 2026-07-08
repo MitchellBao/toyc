@@ -658,6 +658,53 @@ int main() {
 }
 '@ 45
 
+$deadLocalStoreAsm = Compile-Source "backend_dead_local_store_cleanup" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 5) {
+        int dead = i + 2;
+        dead = dead * 3;
+        dead = dead + 4;
+        s = s + i;
+        i = i + 1;
+    }
+    return s;
+}
+'@ -Optimize
+Assert-OpcodeAtMost "backend_dead_local_store_cleanup" $deadLocalStoreAsm "mul" 0
+Assert-LoopOpcodeAtMost "backend_dead_local_store_cleanup" $deadLocalStoreAsm "mul" 0
+
+$deadAfterLastLoadAsm = Compile-Source "backend_dead_store_after_last_load" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = id(5);
+    int y = x;
+    x = y + 37;
+    x = x * 3;
+    return y;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $deadAfterLastLoadAsm) -ne 5) {
+    throw "backend_dead_store_after_last_load returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_dead_store_after_last_load" $deadAfterLastLoadAsm "mul" 0
+
+Assert-BackendsAgree "backend_dead_local_store_preserve_global" @'
+int g = 0;
+int bump() {
+    g = g + 1;
+    return g;
+}
+int main() {
+    int x = bump();
+    x = 0;
+    return g;
+}
+'@ 1
+
 $irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
 int id(int x) {
     return x;
