@@ -33,6 +33,7 @@ SOURCES := \
 	real/src/passes/dead_function_elim.cpp \
 	real/src/passes/licm.cpp \
 	real/src/passes/loop_sum.cpp \
+	real/src/passes/linearize_blocks.cpp \
 	real/src/passes/inline_small.cpp \
 	real/src/passes/tail_recursion.cpp \
 	real/src/target/riscv/isel.cpp \

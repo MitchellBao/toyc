@@ -48,6 +48,7 @@ std::unique_ptr<Pass> createDsePass();
 std::unique_ptr<Pass> createDeadFunctionElimPass();
 std::unique_ptr<Pass> createLicmPass();
 std::unique_ptr<Pass> createLoopSumPass();
+std::unique_ptr<Pass> createLinearizeBlocksPass();
 std::unique_ptr<Pass> createInlineSmallPass();
 std::unique_ptr<Pass> createTailRecursionPass();
 

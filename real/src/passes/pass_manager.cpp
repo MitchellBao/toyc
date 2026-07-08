@@ -169,6 +169,9 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createDeadFunctionElimPass());
         manager.add(createSimplifyCfgPass());
     }
+    // Lay blocks out in reverse-postorder so the backend's linear live-interval
+    // scan matches control-flow order. Runs in both plain and optimized modes.
+    manager.add(createLinearizeBlocksPass());
     return manager;
 }
 
