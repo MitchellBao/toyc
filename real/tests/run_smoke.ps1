@@ -409,6 +409,20 @@ function Assert-StatsOccurrenceAtMost {
     }
 }
 
+function First-StatsLine {
+    param(
+        [string]$Stats,
+        [string]$PassName
+    )
+
+    foreach ($line in ($Stats -split "`r?`n")) {
+        if ($line.Contains("pass=$PassName")) {
+            return $line
+        }
+    }
+    return ""
+}
+
 Assert-OptReturn "opt_call_then_global_load" @'
 int g = 1;
 int set() {
@@ -703,6 +717,29 @@ int main() {
 Assert-StatsContains "opt_cfg_merge_next_block_stats" $cfgMergeNextResult.Stderr "blocks=7->5"
 if ((Invoke-RiscVMain $cfgMergeNextResult.Stdout) -ne 3) {
     throw "opt_cfg_merge_next_block_stats returned unexpected value"
+}
+
+$cfgLocalConstBranchResult = Compile-OptSnippetWithStats "opt_cfg_local_const_branch_stats" @'
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
+int main() {
+    if ((1 + 2) == 3) {
+        bump(5);
+    } else {
+        bump(9);
+    }
+    return g;
+}
+'@
+$firstSimplifyCfg = First-StatsLine $cfgLocalConstBranchResult.Stderr "simplify-cfg"
+if (-not $firstSimplifyCfg.Contains("changed=yes")) {
+    throw "opt_cfg_local_const_branch_stats first simplify-cfg did not fold local constant branch: $firstSimplifyCfg"
+}
+if ((Invoke-RiscVMain $cfgLocalConstBranchResult.Stdout) -ne 5) {
+    throw "opt_cfg_local_const_branch_stats returned unexpected value"
 }
 
 Write-Host "ToyC smoke tests passed"

@@ -4,19 +4,140 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace toyc::passes {
 namespace {
 
+std::optional<std::int32_t> evalUnary(ir::UnaryOpcode op, std::int32_t value)
+{
+    switch (op) {
+    case ir::UnaryOpcode::Plus:
+        return value;
+    case ir::UnaryOpcode::Minus:
+        return -value;
+    case ir::UnaryOpcode::Not:
+        return value == 0 ? 1 : 0;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int32_t> evalBinary(ir::BinaryOpcode op, std::int32_t lhs, std::int32_t rhs)
+{
+    switch (op) {
+    case ir::BinaryOpcode::Add:
+        return lhs + rhs;
+    case ir::BinaryOpcode::Sub:
+        return lhs - rhs;
+    case ir::BinaryOpcode::Mul:
+        return lhs * rhs;
+    case ir::BinaryOpcode::Div:
+        return rhs == 0 ? std::nullopt : std::optional<std::int32_t>{lhs / rhs};
+    case ir::BinaryOpcode::Mod:
+        return rhs == 0 ? std::nullopt : std::optional<std::int32_t>{lhs % rhs};
+    case ir::BinaryOpcode::Equal:
+        return lhs == rhs ? 1 : 0;
+    case ir::BinaryOpcode::NotEqual:
+        return lhs != rhs ? 1 : 0;
+    case ir::BinaryOpcode::Less:
+        return lhs < rhs ? 1 : 0;
+    case ir::BinaryOpcode::LessEqual:
+        return lhs <= rhs ? 1 : 0;
+    case ir::BinaryOpcode::Greater:
+        return lhs > rhs ? 1 : 0;
+    case ir::BinaryOpcode::GreaterEqual:
+        return lhs >= rhs ? 1 : 0;
+    case ir::BinaryOpcode::LogicalAnd:
+        return (lhs != 0 && rhs != 0) ? 1 : 0;
+    case ir::BinaryOpcode::LogicalOr:
+        return (lhs != 0 || rhs != 0) ? 1 : 0;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int32_t> knownOperand(
+    const ir::Operand& operand,
+    const std::unordered_map<int, std::int32_t>& constants)
+{
+    if (operand.isImmediate) {
+        return operand.immediate;
+    }
+    const auto found = constants.find(operand.value.id);
+    if (found == constants.end()) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+void updateKnownConstants(
+    std::unordered_map<int, std::int32_t>& constants,
+    const ir::Instruction& inst)
+{
+    if (inst.dst.id < 0) {
+        return;
+    }
+
+    if (inst.kind == ir::InstructionKind::Const && !inst.operands.empty() && inst.operands[0].isImmediate) {
+        constants[inst.dst.id] = inst.operands[0].immediate;
+        return;
+    }
+
+    if (inst.kind == ir::InstructionKind::Copy && inst.operands.size() == 1) {
+        if (const auto value = knownOperand(inst.operands[0], constants); value.has_value()) {
+            constants[inst.dst.id] = *value;
+        } else {
+            constants.erase(inst.dst.id);
+        }
+        return;
+    }
+
+    if (inst.kind == ir::InstructionKind::Unary && inst.operands.size() == 1) {
+        const auto value = knownOperand(inst.operands[0], constants);
+        const auto folded = value.has_value() ? evalUnary(inst.unaryOp, *value) : std::nullopt;
+        if (folded.has_value()) {
+            constants[inst.dst.id] = *folded;
+        } else {
+            constants.erase(inst.dst.id);
+        }
+        return;
+    }
+
+    if (inst.kind == ir::InstructionKind::Binary && inst.operands.size() == 2) {
+        const auto lhs = knownOperand(inst.operands[0], constants);
+        const auto rhs = knownOperand(inst.operands[1], constants);
+        const auto folded = lhs.has_value() && rhs.has_value() ? evalBinary(inst.binaryOp, *lhs, *rhs) : std::nullopt;
+        if (folded.has_value()) {
+            constants[inst.dst.id] = *folded;
+        } else {
+            constants.erase(inst.dst.id);
+        }
+        return;
+    }
+
+    constants.erase(inst.dst.id);
+}
+
 bool simplifyBranch(ir::Function& function)
 {
     bool changed = false;
     for (ir::BasicBlock& block : function.blocks) {
+        std::unordered_map<int, std::int32_t> constants;
+        for (const ir::Instruction& inst : block.instructions) {
+            updateKnownConstants(constants, inst);
+        }
+
         if (!block.hasTerminator || block.terminator.kind != ir::TerminatorKind::Branch) {
             continue;
         }
         ir::Terminator& term = block.terminator;
+        if (!term.condition.isImmediate) {
+            if (const auto known = knownOperand(term.condition, constants); known.has_value()) {
+                term.condition = ir::Operand::imm(*known);
+            }
+        }
         if (term.trueBlock == term.falseBlock) {
             term.kind = ir::TerminatorKind::Jump;
             term.condition = {};
