@@ -817,6 +817,22 @@ if ((Invoke-RiscVMain $irReassociateConstAsm) -ne 13) {
 Assert-OpcodeAtMost "backend_ir_reassociate_constants" $irReassociateConstAsm "add" 1
 Assert-OpcodeAtMost "backend_ir_reassociate_constants" $irReassociateConstAsm "sub" 0
 
+$irAffineCancelAsm = Compile-Source "backend_ir_affine_cancel" @'
+int g = 7;
+int main() {
+    int x = g;
+    int a = (x + 3) * 4;
+    int b = x * 4;
+    int c = (x + 11) - x;
+    return (a - b) + c;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irAffineCancelAsm) -ne 23) {
+    throw "backend_ir_affine_cancel returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_affine_cancel" $irAffineCancelAsm "mul" 0
+Assert-OpcodeAtMost "backend_ir_affine_cancel" $irAffineCancelAsm "sub" 0
+
 $localCseCommutativeAsm = Compile-Source "backend_local_cse_commutative" @'
 int calc(int a, int b) {
     int x = a * b;

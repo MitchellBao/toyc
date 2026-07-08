@@ -83,6 +83,12 @@ struct AddConstExpr {
     std::int32_t constant = 0;
 };
 
+struct AffineExpr {
+    ir::Operand base;
+    std::int32_t scale = 1;
+    std::int32_t constant = 0;
+};
+
 std::optional<AddConstExpr> addConstExprOf(
     const ir::Operand& operand,
     const std::unordered_map<int, AddConstExpr>& addConstExprs)
@@ -119,6 +125,112 @@ void rewriteAddConst(ir::Instruction& inst, const AddConstExpr& expr)
     inst.hasSideEffect = false;
 }
 
+std::optional<AffineExpr> affineExprOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, AffineExpr>& affineExprs)
+{
+    if (operand.isImmediate) {
+        return AffineExpr{ir::Operand::imm(0), 0, operand.immediate};
+    }
+    const auto found = affineExprs.find(operand.value.id);
+    if (found == affineExprs.end()) {
+        return AffineExpr{operand, 1, 0};
+    }
+    return found->second;
+}
+
+std::optional<std::int32_t> mulConst(std::int32_t lhs, std::int32_t rhs)
+{
+    const std::int64_t value = static_cast<std::int64_t>(lhs) * rhs;
+    if (value < INT32_MIN || value > INT32_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(value);
+}
+
+std::optional<AffineExpr> combineAffine(ir::BinaryOpcode op, const AffineExpr& lhs, const AffineExpr& rhs)
+{
+    if (lhs.base.isImmediate && rhs.base.isImmediate) {
+        if (op == ir::BinaryOpcode::Add) {
+            if (const auto constant = addConst(lhs.constant, rhs.constant); constant.has_value()) {
+                return AffineExpr{ir::Operand::imm(0), 0, *constant};
+            }
+        }
+        if (op == ir::BinaryOpcode::Sub) {
+            if (const auto constant = subConst(lhs.constant, rhs.constant); constant.has_value()) {
+                return AffineExpr{ir::Operand::imm(0), 0, *constant};
+            }
+        }
+        return std::nullopt;
+    }
+    if (lhs.base.isImmediate) {
+        if (op != ir::BinaryOpcode::Add) {
+            return std::nullopt;
+        }
+        if (const auto constant = addConst(lhs.constant, rhs.constant); constant.has_value()) {
+            return AffineExpr{rhs.base, rhs.scale, *constant};
+        }
+        return std::nullopt;
+    }
+    if (rhs.base.isImmediate) {
+        const auto constant = op == ir::BinaryOpcode::Add
+            ? addConst(lhs.constant, rhs.constant)
+            : subConst(lhs.constant, rhs.constant);
+        if (constant.has_value()) {
+            return AffineExpr{lhs.base, lhs.scale, *constant};
+        }
+        return std::nullopt;
+    }
+    if (!sameOperand(lhs.base, rhs.base)) {
+        return std::nullopt;
+    }
+
+    const auto scale = op == ir::BinaryOpcode::Add
+        ? addConst(lhs.scale, rhs.scale)
+        : subConst(lhs.scale, rhs.scale);
+    const auto constant = op == ir::BinaryOpcode::Add
+        ? addConst(lhs.constant, rhs.constant)
+        : subConst(lhs.constant, rhs.constant);
+    if (!scale.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    return AffineExpr{lhs.base, *scale, *constant};
+}
+
+std::optional<AffineExpr> mulAffineByConst(const AffineExpr& expr, std::int32_t factor)
+{
+    const auto scale = mulConst(expr.scale, factor);
+    const auto constant = mulConst(expr.constant, factor);
+    if (!scale.has_value() || !constant.has_value()) {
+        return std::nullopt;
+    }
+    return AffineExpr{expr.base, *scale, *constant};
+}
+
+bool rewriteAffine(ir::Instruction& inst, const AffineExpr& expr)
+{
+    if (expr.base.isImmediate || expr.scale == 0) {
+        inst.kind = ir::InstructionKind::Const;
+        inst.operands = {ir::Operand::imm(expr.constant)};
+        inst.symbol.clear();
+        inst.hasSideEffect = false;
+        return true;
+    }
+    if (expr.scale == 1) {
+        rewriteAddConst(inst, AddConstExpr{expr.base, expr.constant});
+        return true;
+    }
+    if (expr.constant == 0) {
+        inst.kind = ir::InstructionKind::Binary;
+        inst.binaryOp = ir::BinaryOpcode::Mul;
+        inst.operands = {expr.base, ir::Operand::imm(expr.scale)};
+        inst.symbol.clear();
+        inst.hasSideEffect = false;
+        return true;
+    }
+    return false;
+}
+
 class InstCombinePass final : public Pass {
 public:
     std::string name() const override { return "inst-combine"; }
@@ -131,6 +243,7 @@ public:
             for (ir::BasicBlock& block : function.blocks) {
                 std::unordered_map<int, std::int32_t> constants;
                 std::unordered_map<int, AddConstExpr> addConstExprs;
+                std::unordered_map<int, AffineExpr> affineExprs;
                 int chainTip = -1;
                 ir::Instruction* chainStart = nullptr;
                 std::int32_t chainDelta = 0;
@@ -148,14 +261,69 @@ public:
                         && inst.operands[0].isImmediate) {
                         constants[inst.dst.id] = inst.operands[0].immediate;
                         addConstExprs.erase(inst.dst.id);
+                        affineExprs.erase(inst.dst.id);
                     } else if (inst.dst.id >= 0) {
                         constants.erase(inst.dst.id);
                         addConstExprs.erase(inst.dst.id);
+                        affineExprs.erase(inst.dst.id);
                     }
 
                     const bool isAddSub = inst.kind == ir::InstructionKind::Binary
                         && inst.operands.size() == 2
                         && (inst.binaryOp == ir::BinaryOpcode::Add || inst.binaryOp == ir::BinaryOpcode::Sub);
+
+                    const bool isAffineBinary = inst.kind == ir::InstructionKind::Binary
+                        && inst.operands.size() == 2
+                        && (inst.binaryOp == ir::BinaryOpcode::Add
+                            || inst.binaryOp == ir::BinaryOpcode::Sub
+                            || inst.binaryOp == ir::BinaryOpcode::Mul);
+
+                    if (isAffineBinary && inst.dst.id >= 0) {
+                        std::optional<AffineExpr> affine;
+                        if (inst.binaryOp == ir::BinaryOpcode::Add || inst.binaryOp == ir::BinaryOpcode::Sub) {
+                            const auto lhs = affineExprOf(inst.operands[0], affineExprs);
+                            const auto rhs = affineExprOf(inst.operands[1], affineExprs);
+                            if (lhs.has_value() && rhs.has_value()) {
+                                affine = combineAffine(inst.binaryOp, *lhs, *rhs);
+                            }
+                        } else if (inst.binaryOp == ir::BinaryOpcode::Mul) {
+                            const auto rhs = operandConst(inst.operands[1], constants);
+                            if (rhs.has_value()) {
+                                const auto lhs = affineExprOf(inst.operands[0], affineExprs);
+                                if (lhs.has_value()) {
+                                    affine = mulAffineByConst(*lhs, *rhs);
+                                }
+                            } else if (const auto lhs = operandConst(inst.operands[0], constants); lhs.has_value()) {
+                                const auto rhsExpr = affineExprOf(inst.operands[1], affineExprs);
+                                if (rhsExpr.has_value()) {
+                                    affine = mulAffineByConst(*rhsExpr, *lhs);
+                                }
+                            }
+                        }
+                        if (affine.has_value()) {
+                            affineExprs[inst.dst.id] = *affine;
+                            const bool shouldRewrite =
+                                affine->base.isImmediate
+                                || affine->scale == 0
+                                || (affine->scale == 1 && (inst.binaryOp != ir::BinaryOpcode::Add || !inst.operands[1].isImmediate || inst.operands[1].immediate != affine->constant))
+                                || (affine->constant == 0 && affine->scale != 1 && inst.binaryOp != ir::BinaryOpcode::Mul);
+                            if (shouldRewrite && rewriteAffine(inst, *affine)) {
+                                if (inst.kind == ir::InstructionKind::Const && !inst.operands.empty()) {
+                                    constants[inst.dst.id] = inst.operands[0].immediate;
+                                    addConstExprs.erase(inst.dst.id);
+                                } else if (inst.kind == ir::InstructionKind::Copy) {
+                                    constants.erase(inst.dst.id);
+                                    if (!inst.operands.empty()) {
+                                        addConstExprs[inst.dst.id] = AddConstExpr{inst.operands[0], 0};
+                                    }
+                                } else if (inst.kind == ir::InstructionKind::Binary && inst.binaryOp == ir::BinaryOpcode::Add && inst.operands.size() == 2 && inst.operands[1].isImmediate) {
+                                    addConstExprs[inst.dst.id] = AddConstExpr{inst.operands[0], inst.operands[1].immediate};
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
 
                     if (isAddSub && inst.dst.id >= 0) {
                         const auto lhsExpr = addConstExprOf(inst.operands[0], addConstExprs);
@@ -189,6 +357,7 @@ public:
                                     inst.hasSideEffect = false;
                                     constants[inst.dst.id] = *diff;
                                     addConstExprs.erase(inst.dst.id);
+                                    affineExprs.erase(inst.dst.id);
                                     changed = true;
                                     continue;
                                 }
@@ -214,6 +383,7 @@ public:
                                 rewriteAsCopy(inst, ir::Value{chainTip});
                                 constants.erase(inst.dst.id);
                                 addConstExprs.erase(inst.dst.id);
+                                affineExprs.erase(inst.dst.id);
                                 chainTip = inst.dst.id;
                                 changed = true;
                                 continue;
@@ -248,6 +418,7 @@ public:
                     if (inst.kind == ir::InstructionKind::Call || inst.kind == ir::InstructionKind::StoreGlobal || inst.hasSideEffect) {
                         constants.clear();
                         addConstExprs.clear();
+                        affineExprs.clear();
                         resetChain();
                     }
                 }
