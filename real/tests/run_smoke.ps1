@@ -638,6 +638,7 @@ if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 27) {
 
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-copy-prop" 2
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse" 2
+Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=const-call-eval" 2
 
 $inlineResult = Compile-OptSnippetWithStats "opt_iterative_inline_chain_stats" @'
 int seed = 5;

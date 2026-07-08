@@ -76,7 +76,6 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
     if (optimize) {
         for (int iteration = 0; iteration < 4; ++iteration) {
             manager.add(createGlobalConstPropPass());
-            manager.add(createConstCallEvalPass());
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
@@ -85,6 +84,14 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createSimplifyCfgPass());
             manager.add(createDcePass());
         }
+        manager.add(createConstCallEvalPass());
+        manager.add(createConstPropPass());
+        manager.add(createAlgebraicSimplifyPass());
+        manager.add(createCopyPropPass());
+        manager.add(createCsePass());
+        manager.add(createInstCombinePass());
+        manager.add(createSimplifyCfgPass());
+        manager.add(createDcePass());
         manager.add(createDsePass());
         manager.add(createLicmPass());
         manager.add(createLoopSumPass());
@@ -94,7 +101,6 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createInlineSmallPass());
         for (int iteration = 0; iteration < 3; ++iteration) {
             manager.add(createGlobalConstPropPass());
-            manager.add(createConstCallEvalPass());
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
@@ -106,6 +112,17 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createLoopSumPass());
             manager.add(createSimplifyCfgPass());
         }
+        manager.add(createConstCallEvalPass());
+        manager.add(createConstPropPass());
+        manager.add(createAlgebraicSimplifyPass());
+        manager.add(createCopyPropPass());
+        manager.add(createCsePass());
+        manager.add(createInstCombinePass());
+        manager.add(createDcePass());
+        manager.add(createDsePass());
+        manager.add(createLicmPass());
+        manager.add(createLoopSumPass());
+        manager.add(createSimplifyCfgPass());
         manager.add(createGlobalCopyPropPass());
         manager.add(createGlobalCsePass());
         manager.add(createSimplifyCfgPass());
