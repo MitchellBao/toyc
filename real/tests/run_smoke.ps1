@@ -395,6 +395,20 @@ function Assert-NoJumpToNextLabel {
     }
 }
 
+function Assert-StatsOccurrenceAtMost {
+    param(
+        [string]$Name,
+        [string]$Stats,
+        [string]$Needle,
+        [int]$MaxCount
+    )
+
+    $count = ([regex]::Matches($Stats, [regex]::Escape($Needle))).Count
+    if ($count -gt $MaxCount) {
+        throw "$Name stats contains '$Needle' $count times, expected at most $MaxCount"
+    }
+}
+
 Assert-OptReturn "opt_call_then_global_load" @'
 int g = 1;
 int set() {
@@ -562,43 +576,54 @@ int main(){int x=id(7); int y=x*x; int z=x*x; return y+z;}
 '@ 98
 
 $globalCopyResult = Compile-OptSnippetWithStats "opt_global_copy_across_blocks_stats" @'
-int pick(int x) { return x; }
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
 int main() {
-    int a = pick(9);
+    int a = bump(1);
     int b = a;
     int c = 0;
-    if (pick(1)) {
+    if (g) {
         c = b + 1;
     } else {
         c = b + 2;
     }
-    return c + b;
+    return c + b + g;
 }
 '@
 Assert-StatsContains "opt_global_copy_across_blocks_stats" $globalCopyResult.Stderr "pass=global-copy-prop changed=yes"
-if ((Invoke-RiscVMain $globalCopyResult.Stdout) -ne 19) {
+if ((Invoke-RiscVMain $globalCopyResult.Stdout) -ne 4) {
     throw "opt_global_copy_across_blocks_stats returned unexpected value"
 }
 
 $globalCseResult = Compile-OptSnippetWithStats "opt_global_cse_across_blocks_stats" @'
-int pick(int x) { return x; }
+int g = 0;
+int bump(int x) {
+    g = g + x;
+    return g;
+}
 int main() {
-    int a = pick(3);
-    int b = pick(4);
+    int a = bump(3);
+    int b = bump(4);
     int x = a + b;
     int y = 0;
-    if (pick(1)) {
+    if (g) {
         y = a + b;
     } else {
         y = a + b;
     }
-    return x + y;
+    return x + y + g;
 }
 '@
 Assert-StatsContains "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse changed=yes"
-if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 14) {
+if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 27) {
     throw "opt_global_cse_across_blocks_stats returned unexpected value"
 }
+
+Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-copy-prop" 2
+Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse" 2
 
 $inlineResult = Compile-OptSnippetWithStats "opt_iterative_inline_chain_stats" @'
 int seed = 5;
