@@ -1,5 +1,7 @@
 #include "pass_manager.h"
 
+#include "analysis/cfg.h"
+
 #include <cstddef>
 #include <algorithm>
 #include <string>
@@ -13,6 +15,7 @@ namespace {
 
 constexpr std::size_t kMaxInlineInstructions = 400;
 constexpr int kMaxInlineRounds = 6;
+constexpr int kMaxInlineSitesPerRound = 1024;
 
 ir::Value newValue(ir::Function& function)
 {
@@ -103,21 +106,56 @@ std::unordered_set<std::string> recursiveFunctions(const ir::Module& module)
 bool isInlineCandidate(const ir::Function& function, const std::unordered_set<std::string>& recursive)
 {
     if (recursive.find(function.name) != recursive.end()
-        || function.blocks.size() != 1
         || function.returnType != ir::Type::Int) {
         return false;
     }
-    const ir::BasicBlock& block = function.blocks.front();
-    if (block.instructions.size() > kMaxInlineInstructions
-        || block.terminator.kind != ir::TerminatorKind::Return
-        || !block.terminator.hasReturnValue) {
+
+    std::size_t instructions = 0;
+    bool hasReturnValue = false;
+    for (const ir::BasicBlock& block : function.blocks) {
+        instructions += block.instructions.size();
+        if (block.terminator.kind == ir::TerminatorKind::Return) {
+            if (!block.terminator.hasReturnValue) {
+                return false;
+            }
+            hasReturnValue = true;
+        }
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::Call || inst.kind == ir::InstructionKind::StoreGlobal) {
+                return false;
+            }
+        }
+    }
+    if (instructions > kMaxInlineInstructions || !hasReturnValue) {
         return false;
     }
-    for (const ir::Instruction& inst : block.instructions) {
-        if (inst.kind == ir::InstructionKind::Call || inst.kind == ir::InstructionKind::StoreGlobal) {
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    enum class VisitState { Unvisited, Visiting, Done };
+    std::vector<VisitState> states(function.blocks.size(), VisitState::Unvisited);
+    auto hasCycle = [&](auto&& self, int block) -> bool {
+        states[static_cast<std::size_t>(block)] = VisitState::Visiting;
+        for (int succ : cfg.successors[static_cast<std::size_t>(block)]) {
+            if (succ < 0 || succ >= static_cast<int>(function.blocks.size())) {
+                continue;
+            }
+            const auto state = states[static_cast<std::size_t>(succ)];
+            if (state == VisitState::Visiting) {
+                return true;
+            }
+            if (state == VisitState::Unvisited && self(self, succ)) {
+                return true;
+            }
+        }
+        states[static_cast<std::size_t>(block)] = VisitState::Done;
+        return false;
+    };
+    for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
+        if (states[static_cast<std::size_t>(i)] == VisitState::Unvisited && hasCycle(hasCycle, i)) {
             return false;
         }
     }
+
     return true;
 }
 
@@ -150,43 +188,138 @@ std::string remapSymbol(
     return renamed;
 }
 
-std::vector<ir::Instruction> inlineCall(ir::Function& caller, const ir::Instruction& call, const ir::Function& callee)
+ir::Terminator remapTerminator(
+    const ir::Terminator& term,
+    int inlineBase,
+    int continuationIndex,
+    const std::string& returnSymbol,
+    const std::unordered_map<int, ir::Value>& values,
+    std::vector<ir::Instruction>& instructions)
 {
-    std::vector<ir::Instruction> result;
+    ir::Terminator remapped = term;
+    if (term.kind == ir::TerminatorKind::Jump) {
+        remapped.trueBlock = inlineBase + term.trueBlock;
+        return remapped;
+    }
+    if (term.kind == ir::TerminatorKind::Branch) {
+        remapped.condition = remapOperand(term.condition, values);
+        remapped.trueBlock = inlineBase + term.trueBlock;
+        remapped.falseBlock = inlineBase + term.falseBlock;
+        return remapped;
+    }
+
+    if (term.hasReturnValue) {
+        ir::Instruction storeReturn;
+        storeReturn.kind = ir::InstructionKind::StoreLocal;
+        storeReturn.symbol = returnSymbol;
+        storeReturn.operands = {remapOperand(term.returnValue, values)};
+        instructions.push_back(std::move(storeReturn));
+    }
+    remapped.kind = ir::TerminatorKind::Jump;
+    remapped.trueBlock = continuationIndex;
+    remapped.falseBlock = -1;
+    remapped.condition = {};
+    remapped.returnValue = {};
+    remapped.hasReturnValue = false;
+    return remapped;
+}
+
+void inlineCallAt(ir::Function& caller, int blockIndex, int instructionIndex, const ir::Function& callee)
+{
+    ir::BasicBlock& callBlock = caller.blocks[static_cast<std::size_t>(blockIndex)];
+    const ir::Instruction call = callBlock.instructions[static_cast<std::size_t>(instructionIndex)];
+    std::vector<ir::Instruction> suffix(
+        std::make_move_iterator(callBlock.instructions.begin() + instructionIndex + 1),
+        std::make_move_iterator(callBlock.instructions.end()));
+    callBlock.instructions.erase(callBlock.instructions.begin() + instructionIndex, callBlock.instructions.end());
+    const ir::Terminator continuationTerminator = callBlock.terminator;
+    const bool continuationHasTerminator = callBlock.hasTerminator;
+
+    const int inlineBase = static_cast<int>(caller.blocks.size());
+    const int continuationIndex = inlineBase + static_cast<int>(callee.blocks.size());
+    callBlock.terminator.kind = ir::TerminatorKind::Jump;
+    callBlock.terminator.trueBlock = inlineBase;
+    callBlock.terminator.falseBlock = -1;
+    callBlock.terminator.condition = {};
+    callBlock.terminator.returnValue = {};
+    callBlock.terminator.hasReturnValue = false;
+    callBlock.hasTerminator = true;
+
     std::unordered_map<int, ir::Value> values;
     std::unordered_map<std::string, std::string> symbols;
     const std::string prefix = "__inl_" + callee.name + "_" + std::to_string(call.dst.id) + "_";
+    for (const ir::BasicBlock& block : callee.blocks) {
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.dst.id >= 0) {
+                values.emplace(inst.dst.id, newValue(caller));
+            }
+        }
+    }
 
-    result.reserve(callee.params.size() + callee.blocks.front().instructions.size() + 1);
+    std::vector<ir::Instruction> paramStores;
+    paramStores.reserve(callee.params.size());
     for (std::size_t i = 0; i < callee.params.size(); ++i) {
         ir::Instruction store;
         store.kind = ir::InstructionKind::StoreLocal;
         store.symbol = remapSymbol(callee.params[i], prefix, symbols);
         store.operands = {call.operands[i]};
-        result.push_back(std::move(store));
+        paramStores.push_back(std::move(store));
+    }
+    const std::string returnSymbol = prefix + "__return";
+
+    std::vector<ir::BasicBlock> newBlocks;
+    newBlocks.reserve(callee.blocks.size() + 1);
+    for (int i = 0; i < static_cast<int>(callee.blocks.size()); ++i) {
+        const ir::BasicBlock& block = callee.blocks[static_cast<std::size_t>(i)];
+        ir::BasicBlock clonedBlock;
+        clonedBlock.label = prefix + block.label;
+        if (i == 0) {
+            clonedBlock.instructions.insert(
+                clonedBlock.instructions.end(),
+                std::make_move_iterator(paramStores.begin()),
+                std::make_move_iterator(paramStores.end()));
+        }
+        clonedBlock.instructions.reserve(clonedBlock.instructions.size() + block.instructions.size() + 1);
+        for (const ir::Instruction& inst : block.instructions) {
+            ir::Instruction cloned = inst;
+            if (cloned.dst.id >= 0) {
+                cloned.dst = values.at(inst.dst.id);
+            }
+            for (ir::Operand& operand : cloned.operands) {
+                operand = remapOperand(operand, values);
+            }
+            if (cloned.kind == ir::InstructionKind::LoadLocal || cloned.kind == ir::InstructionKind::StoreLocal) {
+                cloned.symbol = remapSymbol(cloned.symbol, prefix, symbols);
+            }
+            clonedBlock.instructions.push_back(std::move(cloned));
+        }
+        clonedBlock.terminator = remapTerminator(
+            block.terminator,
+            inlineBase,
+            continuationIndex,
+            returnSymbol,
+            values,
+            clonedBlock.instructions);
+        clonedBlock.hasTerminator = true;
+        newBlocks.push_back(std::move(clonedBlock));
     }
 
-    for (const ir::Instruction& inst : callee.blocks.front().instructions) {
-        ir::Instruction cloned = inst;
-        if (cloned.dst.id >= 0) {
-            cloned.dst = newValue(caller);
-            values.emplace(inst.dst.id, cloned.dst);
-        }
-        for (ir::Operand& operand : cloned.operands) {
-            operand = remapOperand(operand, values);
-        }
-        if (cloned.kind == ir::InstructionKind::LoadLocal || cloned.kind == ir::InstructionKind::StoreLocal) {
-            cloned.symbol = remapSymbol(cloned.symbol, prefix, symbols);
-        }
-        result.push_back(std::move(cloned));
-    }
+    ir::BasicBlock continuation;
+    continuation.label = prefix + "cont";
+    continuation.instructions = std::move(suffix);
+    ir::Instruction loadReturn;
+    loadReturn.kind = ir::InstructionKind::LoadLocal;
+    loadReturn.dst = call.dst;
+    loadReturn.symbol = returnSymbol;
+    continuation.instructions.insert(continuation.instructions.begin(), std::move(loadReturn));
+    continuation.terminator = continuationTerminator;
+    continuation.hasTerminator = continuationHasTerminator;
+    newBlocks.push_back(std::move(continuation));
 
-    ir::Instruction copyReturn;
-    copyReturn.kind = ir::InstructionKind::Copy;
-    copyReturn.dst = call.dst;
-    copyReturn.operands = {remapOperand(callee.blocks.front().terminator.returnValue, values)};
-    result.push_back(std::move(copyReturn));
-    return result;
+    caller.blocks.insert(
+        caller.blocks.end(),
+        std::make_move_iterator(newBlocks.begin()),
+        std::make_move_iterator(newBlocks.end()));
 }
 
 std::unordered_map<std::string, const ir::Function*> collectCandidates(const ir::Module& module)
@@ -201,29 +334,38 @@ std::unordered_map<std::string, const ir::Function*> collectCandidates(const ir:
     return candidates;
 }
 
-bool inlineOneRound(ir::Module& module)
+bool inlineFirstEligibleCall(ir::Module& module)
 {
     const std::unordered_map<std::string, const ir::Function*> candidates = collectCandidates(module);
-    bool changed = false;
     for (ir::Function& function : module.functions) {
-        for (ir::BasicBlock& block : function.blocks) {
-            std::vector<ir::Instruction> rewritten;
-            rewritten.reserve(block.instructions.size());
-            for (const ir::Instruction& inst : block.instructions) {
+        const int blockCount = static_cast<int>(function.blocks.size());
+        for (int blockIndex = 0; blockIndex < blockCount; ++blockIndex) {
+            ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];
+            for (int instructionIndex = 0; instructionIndex < static_cast<int>(block.instructions.size()); ++instructionIndex) {
+                const ir::Instruction& inst = block.instructions[static_cast<std::size_t>(instructionIndex)];
                 const auto found = inst.kind == ir::InstructionKind::Call ? candidates.find(inst.symbol) : candidates.end();
                 if (found == candidates.end()
                     || found->second->name == function.name
                     || inst.operands.size() != found->second->params.size()
                     || inst.dst.id < 0) {
-                    rewritten.push_back(inst);
                     continue;
                 }
-                std::vector<ir::Instruction> expanded = inlineCall(function, inst, *found->second);
-                rewritten.insert(rewritten.end(), expanded.begin(), expanded.end());
-                changed = true;
+                inlineCallAt(function, blockIndex, instructionIndex, *found->second);
+                return true;
             }
-            block.instructions = std::move(rewritten);
         }
+    }
+    return false;
+}
+
+bool inlineOneRound(ir::Module& module)
+{
+    bool changed = false;
+    for (int sites = 0; sites < kMaxInlineSitesPerRound; ++sites) {
+        if (!inlineFirstEligibleCall(module)) {
+            break;
+        }
+        changed = true;
     }
     return changed;
 }

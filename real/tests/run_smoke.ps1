@@ -743,6 +743,30 @@ if ((Invoke-RiscVMain $inlineResult.Stdout) -ne 11) {
     throw "opt_iterative_inline_chain_stats returned unexpected value"
 }
 
+$inlineBranchResult = Compile-OptSnippetWithStats "opt_inline_small_branch_stats" @'
+int pick(int x) {
+    if (x < 10) {
+        return x + 1;
+    }
+    return x - 1;
+}
+int main() {
+    int s = 0;
+    int i = 0;
+    while (i < 20) {
+        s = s + pick(i);
+        i = i + 1;
+    }
+    return s;
+}
+'@
+Assert-StatsContains "opt_inline_small_branch_stats" $inlineBranchResult.Stderr "pass=inline-small changed=yes"
+Assert-AssemblyNotContains "opt_inline_small_branch_stats" $inlineBranchResult.Stdout "call pick"
+Assert-AssemblyNotContains "opt_inline_small_branch_stats" $inlineBranchResult.Stdout ".globl pick"
+if ((Invoke-RiscVMain $inlineBranchResult.Stdout) -ne 190) {
+    throw "opt_inline_small_branch_stats returned unexpected value"
+}
+
 $cfgBranchFoldResult = Compile-OptSnippetWithStats "opt_cfg_fold_next_jump_stats" @'
 int g = 0;
 int bump(int x) {
