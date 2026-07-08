@@ -1,9 +1,11 @@
 #include "pass_manager.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace toyc::passes {
 namespace {
@@ -89,6 +91,18 @@ struct AffineExpr {
     std::int32_t constant = 0;
 };
 
+struct LinearTerm {
+    ir::Operand base;
+    std::int32_t coeff = 0;
+};
+
+struct LinearExpr {
+    std::vector<LinearTerm> terms;
+    std::int32_t constant = 0;
+};
+
+constexpr std::size_t kMaxLinearTerms = 6;
+
 std::optional<AddConstExpr> addConstExprOf(
     const ir::Operand& operand,
     const std::unordered_map<int, AddConstExpr>& addConstExprs)
@@ -146,6 +160,181 @@ std::optional<std::int32_t> mulConst(std::int32_t lhs, std::int32_t rhs)
         return std::nullopt;
     }
     return static_cast<std::int32_t>(value);
+}
+
+void sortLinearTerms(LinearExpr& expr)
+{
+    std::sort(expr.terms.begin(), expr.terms.end(), [](const LinearTerm& lhs, const LinearTerm& rhs) {
+        return lhs.base.value.id < rhs.base.value.id;
+    });
+}
+
+std::optional<LinearExpr> normalizeLinear(LinearExpr expr)
+{
+    sortLinearTerms(expr);
+    std::vector<LinearTerm> merged;
+    merged.reserve(expr.terms.size());
+    for (const LinearTerm& term : expr.terms) {
+        if (term.base.isImmediate || term.coeff == 0) {
+            continue;
+        }
+        if (!merged.empty() && sameOperand(merged.back().base, term.base)) {
+            const auto coeff = addConst(merged.back().coeff, term.coeff);
+            if (!coeff.has_value()) {
+                return std::nullopt;
+            }
+            merged.back().coeff = *coeff;
+            if (merged.back().coeff == 0) {
+                merged.pop_back();
+            }
+        } else {
+            merged.push_back(term);
+        }
+    }
+    if (merged.size() > kMaxLinearTerms) {
+        return std::nullopt;
+    }
+    expr.terms = std::move(merged);
+    return expr;
+}
+
+std::optional<LinearExpr> linearExprOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, LinearExpr>& linearExprs)
+{
+    if (operand.isImmediate) {
+        return LinearExpr{{}, operand.immediate};
+    }
+    const auto found = linearExprs.find(operand.value.id);
+    if (found != linearExprs.end()) {
+        return found->second;
+    }
+    return LinearExpr{{LinearTerm{operand, 1}}, 0};
+}
+
+std::optional<LinearExpr> combineLinear(ir::BinaryOpcode op, const LinearExpr& lhs, const LinearExpr& rhs)
+{
+    LinearExpr result;
+    result.terms = lhs.terms;
+    result.terms.reserve(lhs.terms.size() + rhs.terms.size());
+    for (LinearTerm term : rhs.terms) {
+        if (op == ir::BinaryOpcode::Sub) {
+            const auto coeff = mulConst(term.coeff, -1);
+            if (!coeff.has_value()) {
+                return std::nullopt;
+            }
+            term.coeff = *coeff;
+        }
+        result.terms.push_back(term);
+    }
+    const auto constant = op == ir::BinaryOpcode::Add
+        ? addConst(lhs.constant, rhs.constant)
+        : subConst(lhs.constant, rhs.constant);
+    if (!constant.has_value()) {
+        return std::nullopt;
+    }
+    result.constant = *constant;
+    return normalizeLinear(std::move(result));
+}
+
+std::optional<LinearExpr> mulLinearByConst(const LinearExpr& expr, std::int32_t factor)
+{
+    LinearExpr result;
+    result.terms.reserve(expr.terms.size());
+    for (const LinearTerm& term : expr.terms) {
+        const auto coeff = mulConst(term.coeff, factor);
+        if (!coeff.has_value()) {
+            return std::nullopt;
+        }
+        result.terms.push_back(LinearTerm{term.base, *coeff});
+    }
+    const auto constant = mulConst(expr.constant, factor);
+    if (!constant.has_value()) {
+        return std::nullopt;
+    }
+    result.constant = *constant;
+    return normalizeLinear(std::move(result));
+}
+
+bool rewriteLinear(ir::Instruction& inst, const LinearExpr& expr)
+{
+    if (expr.terms.empty()) {
+        inst.kind = ir::InstructionKind::Const;
+        inst.operands = {ir::Operand::imm(expr.constant)};
+        inst.symbol.clear();
+        inst.hasSideEffect = false;
+        return true;
+    }
+    if (expr.terms.size() != 1) {
+        return false;
+    }
+
+    const LinearTerm& term = expr.terms.front();
+    if (term.coeff == 1) {
+        rewriteAddConst(inst, AddConstExpr{term.base, expr.constant});
+        return true;
+    }
+    if (expr.constant == 0) {
+        if (term.coeff == -1) {
+            inst.kind = ir::InstructionKind::Unary;
+            inst.unaryOp = ir::UnaryOpcode::Minus;
+            inst.operands = {term.base};
+            inst.symbol.clear();
+            inst.hasSideEffect = false;
+            return true;
+        }
+        inst.kind = ir::InstructionKind::Binary;
+        inst.binaryOp = ir::BinaryOpcode::Mul;
+        inst.operands = {term.base, ir::Operand::imm(term.coeff)};
+        inst.symbol.clear();
+        inst.hasSideEffect = false;
+        return true;
+    }
+    return false;
+}
+
+bool sameLinearShapeAsInstruction(const ir::Instruction& inst, const LinearExpr& expr)
+{
+    if (inst.kind == ir::InstructionKind::Const) {
+        return expr.terms.empty()
+            && inst.operands.size() == 1
+            && inst.operands[0].isImmediate
+            && inst.operands[0].immediate == expr.constant;
+    }
+    if (inst.kind == ir::InstructionKind::Copy) {
+        return expr.constant == 0
+            && expr.terms.size() == 1
+            && expr.terms.front().coeff == 1
+            && inst.operands.size() == 1
+            && sameOperand(inst.operands[0], expr.terms.front().base);
+    }
+    if (inst.kind == ir::InstructionKind::Unary && inst.unaryOp == ir::UnaryOpcode::Minus) {
+        return expr.constant == 0
+            && expr.terms.size() == 1
+            && expr.terms.front().coeff == -1
+            && inst.operands.size() == 1
+            && sameOperand(inst.operands[0], expr.terms.front().base);
+    }
+    if (inst.kind == ir::InstructionKind::Binary && inst.operands.size() == 2) {
+        if (inst.binaryOp == ir::BinaryOpcode::Add
+            && expr.terms.size() == 1
+            && expr.terms.front().coeff == 1
+            && expr.constant != 0
+            && sameOperand(inst.operands[0], expr.terms.front().base)
+            && inst.operands[1].isImmediate
+            && inst.operands[1].immediate == expr.constant) {
+            return true;
+        }
+        if (inst.binaryOp == ir::BinaryOpcode::Mul
+            && expr.constant == 0
+            && expr.terms.size() == 1
+            && sameOperand(inst.operands[0], expr.terms.front().base)
+            && inst.operands[1].isImmediate
+            && inst.operands[1].immediate == expr.terms.front().coeff) {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::optional<AffineExpr> combineAffine(ir::BinaryOpcode op, const AffineExpr& lhs, const AffineExpr& rhs)
@@ -244,6 +433,7 @@ public:
                 std::unordered_map<int, std::int32_t> constants;
                 std::unordered_map<int, AddConstExpr> addConstExprs;
                 std::unordered_map<int, AffineExpr> affineExprs;
+                std::unordered_map<int, LinearExpr> linearExprs;
                 int chainTip = -1;
                 ir::Instruction* chainStart = nullptr;
                 std::int32_t chainDelta = 0;
@@ -262,10 +452,12 @@ public:
                         constants[inst.dst.id] = inst.operands[0].immediate;
                         addConstExprs.erase(inst.dst.id);
                         affineExprs.erase(inst.dst.id);
+                        linearExprs[inst.dst.id] = LinearExpr{{}, inst.operands[0].immediate};
                     } else if (inst.dst.id >= 0) {
                         constants.erase(inst.dst.id);
                         addConstExprs.erase(inst.dst.id);
                         affineExprs.erase(inst.dst.id);
+                        linearExprs.erase(inst.dst.id);
                     }
 
                     const bool isAddSub = inst.kind == ir::InstructionKind::Binary
@@ -279,6 +471,54 @@ public:
                             || inst.binaryOp == ir::BinaryOpcode::Mul);
 
                     if (isAffineBinary && inst.dst.id >= 0) {
+                        std::optional<LinearExpr> linear;
+                        if (inst.binaryOp == ir::BinaryOpcode::Add || inst.binaryOp == ir::BinaryOpcode::Sub) {
+                            const auto lhs = linearExprOf(inst.operands[0], linearExprs);
+                            const auto rhs = linearExprOf(inst.operands[1], linearExprs);
+                            if (lhs.has_value() && rhs.has_value()) {
+                                linear = combineLinear(inst.binaryOp, *lhs, *rhs);
+                            }
+                        } else if (inst.binaryOp == ir::BinaryOpcode::Mul) {
+                            const auto rhs = operandConst(inst.operands[1], constants);
+                            if (rhs.has_value()) {
+                                const auto lhs = linearExprOf(inst.operands[0], linearExprs);
+                                if (lhs.has_value()) {
+                                    linear = mulLinearByConst(*lhs, *rhs);
+                                }
+                            } else if (const auto lhs = operandConst(inst.operands[0], constants); lhs.has_value()) {
+                                const auto rhsExpr = linearExprOf(inst.operands[1], linearExprs);
+                                if (rhsExpr.has_value()) {
+                                    linear = mulLinearByConst(*rhsExpr, *lhs);
+                                }
+                            }
+                        }
+                        if (linear.has_value()) {
+                            linearExprs[inst.dst.id] = *linear;
+                            if (!sameLinearShapeAsInstruction(inst, *linear) && rewriteLinear(inst, *linear)) {
+                                if (inst.kind == ir::InstructionKind::Const && !inst.operands.empty()) {
+                                    constants[inst.dst.id] = inst.operands[0].immediate;
+                                    addConstExprs.erase(inst.dst.id);
+                                    affineExprs.erase(inst.dst.id);
+                                } else if (inst.kind == ir::InstructionKind::Copy) {
+                                    constants.erase(inst.dst.id);
+                                    affineExprs.erase(inst.dst.id);
+                                    if (!inst.operands.empty()) {
+                                        addConstExprs[inst.dst.id] = AddConstExpr{inst.operands[0], 0};
+                                    }
+                                } else if (inst.kind == ir::InstructionKind::Binary && inst.binaryOp == ir::BinaryOpcode::Add && inst.operands.size() == 2 && inst.operands[1].isImmediate) {
+                                    constants.erase(inst.dst.id);
+                                    affineExprs.erase(inst.dst.id);
+                                    addConstExprs[inst.dst.id] = AddConstExpr{inst.operands[0], inst.operands[1].immediate};
+                                } else {
+                                    constants.erase(inst.dst.id);
+                                    addConstExprs.erase(inst.dst.id);
+                                    affineExprs.erase(inst.dst.id);
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
+
                         std::optional<AffineExpr> affine;
                         if (inst.binaryOp == ir::BinaryOpcode::Add || inst.binaryOp == ir::BinaryOpcode::Sub) {
                             const auto lhs = affineExprOf(inst.operands[0], affineExprs);
@@ -319,6 +559,7 @@ public:
                                 } else if (inst.kind == ir::InstructionKind::Binary && inst.binaryOp == ir::BinaryOpcode::Add && inst.operands.size() == 2 && inst.operands[1].isImmediate) {
                                     addConstExprs[inst.dst.id] = AddConstExpr{inst.operands[0], inst.operands[1].immediate};
                                 }
+                                linearExprs.erase(inst.dst.id);
                                 changed = true;
                                 continue;
                             }
@@ -358,6 +599,7 @@ public:
                                     constants[inst.dst.id] = *diff;
                                     addConstExprs.erase(inst.dst.id);
                                     affineExprs.erase(inst.dst.id);
+                                    linearExprs[inst.dst.id] = LinearExpr{{}, *diff};
                                     changed = true;
                                     continue;
                                 }
@@ -384,6 +626,7 @@ public:
                                 constants.erase(inst.dst.id);
                                 addConstExprs.erase(inst.dst.id);
                                 affineExprs.erase(inst.dst.id);
+                                linearExprs.erase(inst.dst.id);
                                 chainTip = inst.dst.id;
                                 changed = true;
                                 continue;
@@ -419,6 +662,7 @@ public:
                         constants.clear();
                         addConstExprs.clear();
                         affineExprs.clear();
+                        linearExprs.clear();
                         resetChain();
                     }
                 }

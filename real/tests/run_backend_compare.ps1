@@ -833,6 +833,80 @@ if ((Invoke-RiscVMain $irAffineCancelAsm) -ne 23) {
 Assert-OpcodeAtMost "backend_ir_affine_cancel" $irAffineCancelAsm "mul" 0
 Assert-OpcodeAtMost "backend_ir_affine_cancel" $irAffineCancelAsm "sub" 0
 
+$irLinearCancelAsm = Compile-Source "backend_ir_linear_multi_base_cancel" @'
+int gx = 7;
+int gy = 11;
+int main() {
+    int x = gx;
+    int y = gy;
+    int a = x + y - x;
+    int b = (x + y) * 2 - x * 2;
+    int c = x * 3 + y * 2 - x * 3;
+    return a + b + c;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irLinearCancelAsm) -ne 55) {
+    throw "backend_ir_linear_multi_base_cancel returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_linear_multi_base_cancel" $irLinearCancelAsm "sub" 0
+
+$irLinearConstantCancelAsm = Compile-Source "backend_ir_linear_constant_cancel" @'
+int gx = 5;
+int gy = 9;
+int main() {
+    int x = gx;
+    int y = gy;
+    return ((x + 3) * 4 + (y - 2) * 6) - (x * 4 + y * 6);
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irLinearConstantCancelAsm) -ne 0) {
+    throw "backend_ir_linear_constant_cancel returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_linear_constant_cancel" $irLinearConstantCancelAsm "mul" 0
+Assert-OpcodeAtMost "backend_ir_linear_constant_cancel" $irLinearConstantCancelAsm "sub" 0
+
+$globalConstExecutableEdgeAsm = Compile-Source "backend_global_const_executable_edge" @'
+int id(int x) {
+    return x;
+}
+int main() {
+    int x = 0;
+    int y = id(4);
+    int flag = 6 * 7 - 42;
+    if (flag) {
+        x = y * 1000;
+    } else {
+        x = 9;
+    }
+    return x + 1;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $globalConstExecutableEdgeAsm) -ne 10) {
+    throw "backend_global_const_executable_edge returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_global_const_executable_edge" $globalConstExecutableEdgeAsm "call" 0
+Assert-OpcodeAtMost "backend_global_const_executable_edge" $globalConstExecutableEdgeAsm "mul" 0
+
+$irCompareInvertAsm = Compile-Source "backend_ir_compare_invert" @'
+int gx = 7;
+int gy = 11;
+int main() {
+    int x = gx;
+    int y = gy;
+    int a = (x < y) == 0;
+    int b = (x >= y) != 0;
+    int c = !(x == y);
+    int d = ((x != 0) == 0);
+    int e = ((x < y) == 1);
+    int f = ((x < y) != 1);
+    return a * 100000 + b * 10000 + c * 1000 + d * 100 + e * 10 + f;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $irCompareInvertAsm) -ne 1010) {
+    throw "backend_ir_compare_invert returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_ir_compare_invert" $irCompareInvertAsm "seqz" 1
+
 $localCseCommutativeAsm = Compile-Source "backend_local_cse_commutative" @'
 int calc(int a, int b) {
     int x = a * b;

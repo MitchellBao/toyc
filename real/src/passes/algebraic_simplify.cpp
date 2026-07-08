@@ -1,5 +1,8 @@
 #include "pass_manager.h"
 
+#include <optional>
+#include <unordered_map>
+
 namespace toyc::passes {
 namespace {
 
@@ -48,6 +51,70 @@ void replaceWithNotZero(ir::Instruction& inst, ir::Operand operand)
     inst.operands = {operand, ir::Operand::imm(0)};
     inst.symbol.clear();
     inst.hasSideEffect = false;
+}
+
+bool isCompareOp(ir::BinaryOpcode op)
+{
+    switch (op) {
+    case ir::BinaryOpcode::Equal:
+    case ir::BinaryOpcode::NotEqual:
+    case ir::BinaryOpcode::Less:
+    case ir::BinaryOpcode::LessEqual:
+    case ir::BinaryOpcode::Greater:
+    case ir::BinaryOpcode::GreaterEqual:
+        return true;
+    default:
+        return false;
+    }
+}
+
+ir::BinaryOpcode invertCompareOp(ir::BinaryOpcode op)
+{
+    switch (op) {
+    case ir::BinaryOpcode::Equal:
+        return ir::BinaryOpcode::NotEqual;
+    case ir::BinaryOpcode::NotEqual:
+        return ir::BinaryOpcode::Equal;
+    case ir::BinaryOpcode::Less:
+        return ir::BinaryOpcode::GreaterEqual;
+    case ir::BinaryOpcode::LessEqual:
+        return ir::BinaryOpcode::Greater;
+    case ir::BinaryOpcode::Greater:
+        return ir::BinaryOpcode::LessEqual;
+    case ir::BinaryOpcode::GreaterEqual:
+        return ir::BinaryOpcode::Less;
+    default:
+        return op;
+    }
+}
+
+struct CompareExpr {
+    ir::BinaryOpcode op = ir::BinaryOpcode::Equal;
+    ir::Operand lhs;
+    ir::Operand rhs;
+};
+
+void replaceWithCompare(ir::Instruction& inst, const CompareExpr& expr, bool invert)
+{
+    inst.kind = ir::InstructionKind::Binary;
+    inst.binaryOp = invert ? invertCompareOp(expr.op) : expr.op;
+    inst.operands = {expr.lhs, expr.rhs};
+    inst.symbol.clear();
+    inst.hasSideEffect = false;
+}
+
+std::optional<CompareExpr> compareExprOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, CompareExpr>& compares)
+{
+    if (operand.isImmediate) {
+        return std::nullopt;
+    }
+    const auto found = compares.find(operand.value.id);
+    if (found == compares.end()) {
+        return std::nullopt;
+    }
+    return found->second;
 }
 
 bool simplifyBinary(ir::Instruction& inst)
@@ -177,6 +244,47 @@ bool simplifyBinary(ir::Instruction& inst)
     return false;
 }
 
+bool simplifyCompareUse(ir::Instruction& inst, const std::unordered_map<int, CompareExpr>& compares)
+{
+    if (inst.kind == ir::InstructionKind::Unary && inst.unaryOp == ir::UnaryOpcode::Not && inst.operands.size() == 1) {
+        if (const auto expr = compareExprOf(inst.operands[0], compares); expr.has_value()) {
+            replaceWithCompare(inst, *expr, true);
+            return true;
+        }
+        return false;
+    }
+
+    if (inst.kind != ir::InstructionKind::Binary || inst.operands.size() != 2) {
+        return false;
+    }
+    if (inst.binaryOp != ir::BinaryOpcode::Equal && inst.binaryOp != ir::BinaryOpcode::NotEqual) {
+        return false;
+    }
+
+    std::optional<CompareExpr> expr;
+    bool compareWithOne = false;
+    if (isImm(inst.operands[1], 0)) {
+        expr = compareExprOf(inst.operands[0], compares);
+    } else if (isImm(inst.operands[0], 0)) {
+        expr = compareExprOf(inst.operands[1], compares);
+    } else if (isImm(inst.operands[1], 1)) {
+        expr = compareExprOf(inst.operands[0], compares);
+        compareWithOne = true;
+    } else if (isImm(inst.operands[0], 1)) {
+        expr = compareExprOf(inst.operands[1], compares);
+        compareWithOne = true;
+    }
+    if (!expr.has_value()) {
+        return false;
+    }
+
+    const bool invert = compareWithOne
+        ? inst.binaryOp == ir::BinaryOpcode::NotEqual
+        : inst.binaryOp == ir::BinaryOpcode::Equal;
+    replaceWithCompare(inst, *expr, invert);
+    return true;
+}
+
 class AlgebraicSimplifyPass final : public Pass {
 public:
     std::string name() const override { return "algebraic-simplify"; }
@@ -185,8 +293,24 @@ public:
         bool changed = false;
         for (ir::Function& function : module.functions) {
             for (ir::BasicBlock& block : function.blocks) {
+                std::unordered_map<int, CompareExpr> compares;
                 for (ir::Instruction& inst : block.instructions) {
+                    if (inst.dst.id >= 0) {
+                        compares.erase(inst.dst.id);
+                    }
+
+                    changed = simplifyCompareUse(inst, compares) || changed;
                     changed = simplifyBinary(inst) || changed;
+
+                    if (inst.dst.id >= 0
+                        && inst.kind == ir::InstructionKind::Binary
+                        && inst.operands.size() == 2
+                        && isCompareOp(inst.binaryOp)) {
+                        compares[inst.dst.id] = CompareExpr{inst.binaryOp, inst.operands[0], inst.operands[1]};
+                    }
+                    if (inst.kind == ir::InstructionKind::Call || inst.kind == ir::InstructionKind::StoreGlobal || inst.hasSideEffect) {
+                        compares.clear();
+                    }
                 }
             }
         }

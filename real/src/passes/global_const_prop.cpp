@@ -138,6 +138,25 @@ ConstMap intersectConstants(const ConstMap& lhs, const ConstMap& rhs)
     return result;
 }
 
+std::vector<int> executableSuccessors(const ir::BasicBlock& block, const ConstMap& constants)
+{
+    if (!block.hasTerminator) {
+        return {};
+    }
+    const ir::Terminator& term = block.terminator;
+    if (term.kind == ir::TerminatorKind::Jump) {
+        return {term.trueBlock};
+    }
+    if (term.kind == ir::TerminatorKind::Branch) {
+        const auto condition = knownOperand(term.condition, constants);
+        if (condition.has_value()) {
+            return {*condition != 0 ? term.trueBlock : term.falseBlock};
+        }
+        return {term.trueBlock, term.falseBlock};
+    }
+    return {};
+}
+
 bool rewriteBlock(ir::BasicBlock& block, ConstMap constants)
 {
     bool changed = false;
@@ -186,21 +205,44 @@ bool runOnFunction(ir::Function& function)
     const analysis::Cfg cfg = analysis::buildCfg(function);
     std::vector<ConstMap> in(function.blocks.size());
     std::vector<ConstMap> out(function.blocks.size());
+    std::vector<bool> executable(function.blocks.size(), false);
+    executable[0] = true;
 
     bool dataChanged = true;
-    for (int iteration = 0; dataChanged && iteration < 32; ++iteration) {
+    for (int iteration = 0; dataChanged && iteration < 64; ++iteration) {
         dataChanged = false;
         for (int b = 0; b < static_cast<int>(function.blocks.size()); ++b) {
+            if (!executable[static_cast<std::size_t>(b)]) {
+                continue;
+            }
             ConstMap nextIn;
             const auto& preds = cfg.predecessors[static_cast<std::size_t>(b)];
-            if (b != 0 && !preds.empty()) {
-                nextIn = out[static_cast<std::size_t>(preds.front())];
-                for (std::size_t i = 1; i < preds.size(); ++i) {
-                    nextIn = intersectConstants(nextIn, out[static_cast<std::size_t>(preds[i])]);
+            if (b != 0) {
+                bool haveExecutablePred = false;
+                for (int pred : preds) {
+                    if (pred < 0
+                        || pred >= static_cast<int>(function.blocks.size())
+                        || !executable[static_cast<std::size_t>(pred)]) {
+                        continue;
+                    }
+                    if (!haveExecutablePred) {
+                        nextIn = out[static_cast<std::size_t>(pred)];
+                        haveExecutablePred = true;
+                    } else {
+                        nextIn = intersectConstants(nextIn, out[static_cast<std::size_t>(pred)]);
+                    }
                 }
             }
 
             ConstMap nextOut = transferBlock(nextIn, function.blocks[static_cast<std::size_t>(b)]);
+            for (int succ : executableSuccessors(function.blocks[static_cast<std::size_t>(b)], nextOut)) {
+                if (succ >= 0
+                    && succ < static_cast<int>(function.blocks.size())
+                    && !executable[static_cast<std::size_t>(succ)]) {
+                    executable[static_cast<std::size_t>(succ)] = true;
+                    dataChanged = true;
+                }
+            }
             if (nextIn != in[static_cast<std::size_t>(b)] || nextOut != out[static_cast<std::size_t>(b)]) {
                 in[static_cast<std::size_t>(b)] = std::move(nextIn);
                 out[static_cast<std::size_t>(b)] = std::move(nextOut);
