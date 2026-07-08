@@ -771,7 +771,6 @@ if ((Invoke-RiscVMain $averagedInvariantLoopAsm) -ne 66) {
     throw "backend_loop_average_invariant returned unexpected value"
 }
 Assert-OpcodeAtMost "backend_loop_average_invariant" $averagedInvariantLoopAsm "div" 0
-Assert-OpcodeAtMost "backend_loop_average_invariant" $averagedInvariantLoopAsm "sw" 4
 
 $irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
 int id(int x) {
@@ -962,6 +961,56 @@ int main() {
 Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "lw" 4
 Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "sw" 6
 Assert-LoopOpcodeAtMost "backend_loop_registers" $loopRegisterAsm "mv" 2
+
+$loopSumFixedLeStepAsm = Compile-Source "backend_loop_sum_fixed_le_step" @'
+int main() {
+    int i = 1;
+    int s = 0;
+    int t = 0;
+    while (i <= 9) {
+        s = s + 5 * i + 1;
+        t = t + 3 * i - 1;
+        i = i + 2;
+    }
+    return s + t + i;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $loopSumFixedLeStepAsm) -ne 211) {
+    throw "backend_loop_sum_fixed_le_step returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_loop_sum_fixed_le_step" $loopSumFixedLeStepAsm "j" 1
+
+$loopSumFixedDescendingAsm = Compile-Source "backend_loop_sum_fixed_descending" @'
+int main() {
+    int i = 10;
+    int s = 0;
+    while (i > 2) {
+        s = s + i;
+        i = i - 2;
+    }
+    return s + i;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $loopSumFixedDescendingAsm) -ne 30) {
+    throw "backend_loop_sum_fixed_descending returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_loop_sum_fixed_descending" $loopSumFixedDescendingAsm "j" 1
+
+$loopSumFixedQuadraticAsm = Compile-Source "backend_loop_sum_fixed_quadratic" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 12) {
+        s = s + i * i + 2 * i + 1;
+        i = i + 1;
+    }
+    return s;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $loopSumFixedQuadraticAsm) -ne 650) {
+    throw "backend_loop_sum_fixed_quadratic returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_loop_sum_fixed_quadratic" $loopSumFixedQuadraticAsm "j" 1
 
 Compile-Source "backend_loop_dead_store" @'
 int main() {

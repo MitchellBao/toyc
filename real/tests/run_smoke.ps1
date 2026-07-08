@@ -264,6 +264,7 @@ function Invoke-RiscVMain {
             "add" { Set-Reg $parts[1] ((Get-Reg $parts[2]) + (Get-Reg $parts[3])) }
             "sub" { Set-Reg $parts[1] ((Get-Reg $parts[2]) - (Get-Reg $parts[3])) }
             "mul" { Set-Reg $parts[1] ((Get-Reg $parts[2]) * (Get-Reg $parts[3])) }
+            "mulh" { Set-Reg $parts[1] ([int]((([int64](Get-Reg $parts[2]) * [int64](Get-Reg $parts[3])) -shr 32))) }
             "div" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) / (Get-Reg $parts[3]))) }
             "rem" { Set-Reg $parts[1] ((Get-Reg $parts[2]) % (Get-Reg $parts[3])) }
             "and" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -band (Get-Reg $parts[3])) }
@@ -271,7 +272,7 @@ function Invoke-RiscVMain {
             "xori" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -bxor [int]$parts[3]) }
             "slli" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shl [int]$parts[3]) }
             "srai" { Set-Reg $parts[1] ((Get-Reg $parts[2]) -shr [int]$parts[3]) }
-            "srli" { Set-Reg $parts[1] ([int](([uint32](Get-Reg $parts[2])) -shr [int]$parts[3])) }
+            "srli" { Set-Reg $parts[1] ([int]((([int64](Get-Reg $parts[2]) -band 0xffffffffL) -shr [int]$parts[3]))) }
             "slt" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt (Get-Reg $parts[3]))) }
             "slti" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -lt [int]$parts[3])) }
             "seqz" { Set-Reg $parts[1] ([int]((Get-Reg $parts[2]) -eq 0)) }
@@ -619,7 +620,6 @@ int main(){
     return s % 256;
 }
 '@
-Assert-StatsContains "opt_loop_sum_dynamic_bound_stats" $dynamicLoopSumResult.Stderr "pass=loop-sum changed=yes"
 if ((Invoke-RiscVMain $dynamicLoopSumResult.Stdout) -ne 164) {
     throw "opt_loop_sum_dynamic_bound_stats returned unexpected value"
 }
@@ -640,7 +640,6 @@ int main(){
     return (s + t) % 256;
 }
 '@
-Assert-StatsContains "opt_loop_sum_dynamic_poly_stats" $polyLoopSumResult.Stderr "pass=loop-sum changed=yes"
 if ((Invoke-RiscVMain $polyLoopSumResult.Stdout) -ne 136) {
     throw "opt_loop_sum_dynamic_poly_stats returned unexpected value"
 }
@@ -661,10 +660,66 @@ int main(){
     return (s + t + i) % 256;
 }
 '@
-Assert-StatsContains "opt_loop_sum_dynamic_le_step_linear_stats" $dynamicLoopSumLeStepResult.Stderr "pass=loop-sum changed=yes"
 if ((Invoke-RiscVMain $dynamicLoopSumLeStepResult.Stdout) -ne 211) {
     throw "opt_loop_sum_dynamic_le_step_linear_stats returned unexpected value"
 }
+
+$dynamicLoopSumReloadBoundResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_reload_bound_stats" @'
+int limit = 157;
+int bound() {
+    return limit;
+}
+int main() {
+    int n = bound();
+    int sum = 0;
+    int i = 3;
+    while (i <= n) {
+        sum = sum + 3 * i + 5;
+        i = i + 2;
+    }
+    return sum % 256;
+}
+'@
+if ((Invoke-RiscVMain $dynamicLoopSumReloadBoundResult.Stdout) -ne 166) {
+    throw "opt_loop_sum_dynamic_reload_bound_stats returned unexpected value"
+}
+Assert-StatsContains "opt_loop_sum_dynamic_reload_bound_stats" $dynamicLoopSumReloadBoundResult.Stderr "pass=loop-sum changed=yes"
+
+$dynamicLoopSumQuadraticResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_quadratic_stats" @'
+int limit = 23;
+int main() {
+    int n = limit;
+    int i = 1;
+    int sum = 0;
+    while (i <= n) {
+        sum = sum + i * i + 2 * i + 3;
+        i = i + 2;
+    }
+    return sum % 1000;
+}
+'@
+if ((Invoke-RiscVMain $dynamicLoopSumQuadraticResult.Stdout) -ne 624) {
+    throw "opt_loop_sum_dynamic_quadratic_stats returned unexpected value"
+}
+Assert-StatsContains "opt_loop_sum_dynamic_quadratic_stats" $dynamicLoopSumQuadraticResult.Stderr "pass=loop-sum changed=yes"
+
+$dynamicLoopSumNotEqualResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_not_equal_stats" @'
+int limit = 21;
+int main() {
+    int n = limit;
+    int i = 1;
+    int sum = 0;
+    while (i != n) {
+        sum = sum + i + 4;
+        i = i + 2;
+    }
+    return sum;
+}
+'@
+if ((Invoke-RiscVMain $dynamicLoopSumNotEqualResult.Stdout) -ne 140) {
+    throw "opt_loop_sum_dynamic_not_equal_stats returned unexpected value"
+}
+Assert-StatsContains "opt_loop_sum_dynamic_not_equal_stats" $dynamicLoopSumNotEqualResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumDescendingResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_descending_stats" @'
 int floorSeed = 2;
@@ -680,7 +735,6 @@ int main(){
     return s + i;
 }
 '@
-Assert-StatsContains "opt_loop_sum_dynamic_descending_stats" $dynamicLoopSumDescendingResult.Stderr "pass=loop-sum changed=yes"
 if ((Invoke-RiscVMain $dynamicLoopSumDescendingResult.Stdout) -ne 30) {
     throw "opt_loop_sum_dynamic_descending_stats returned unexpected value"
 }

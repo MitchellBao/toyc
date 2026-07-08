@@ -19,7 +19,7 @@ bool definesValue(const ir::Instruction& inst)
         && inst.kind != ir::InstructionKind::StoreLocal;
 }
 
-bool isHoistablePure(const ir::Instruction& inst)
+bool isHoistablePure(const ir::Instruction& inst, const std::unordered_set<std::string>& constGlobals)
 {
     if (inst.hasSideEffect) {
         return false;
@@ -36,9 +36,10 @@ bool isHoistablePure(const ir::Instruction& inst)
     case ir::InstructionKind::Copy:
     case ir::InstructionKind::Unary:
     case ir::InstructionKind::Binary:
-    case ir::InstructionKind::LoadGlobal:
     case ir::InstructionKind::LoadLocal:
         return definesValue(inst);
+    case ir::InstructionKind::LoadGlobal:
+        return definesValue(inst) && constGlobals.find(inst.symbol) != constGlobals.end();
     case ir::InstructionKind::StoreGlobal:
     case ir::InstructionKind::StoreLocal:
     case ir::InstructionKind::Call:
@@ -182,7 +183,12 @@ bool functionContainsCall(const ir::Function& function)
     return false;
 }
 
-bool runOnLoop(ir::Function& function, const analysis::Cfg& cfg, int header, int backedge)
+bool runOnLoop(
+    ir::Function& function,
+    const analysis::Cfg& cfg,
+    const std::unordered_set<std::string>& constGlobals,
+    int header,
+    int backedge)
 {
     const std::unordered_set<int> loop = collectNaturalLoop(cfg, header, backedge);
     std::vector<int> outsidePredecessors;
@@ -249,7 +255,7 @@ bool runOnLoop(ir::Function& function, const analysis::Cfg& cfg, int header, int
         const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];
         for (std::size_t instIndex = 0; instIndex < block.instructions.size(); ++instIndex) {
             const ir::Instruction& inst = block.instructions[instIndex];
-            if (!isHoistablePure(inst)) {
+            if (!isHoistablePure(inst, constGlobals)) {
                 continue;
             }
             if (defCount[inst.dst.id] != 1 || liveOut.find(inst.dst.id) != liveOut.end()) {
@@ -306,6 +312,12 @@ public:
     bool run(ir::Module& module) override
     {
         bool changed = false;
+        std::unordered_set<std::string> constGlobals;
+        for (const ir::Global& global : module.globals) {
+            if (global.isConst) {
+                constGlobals.insert(global.name);
+            }
+        }
         bool localChanged = true;
         while (localChanged) {
             localChanged = false;
@@ -319,7 +331,7 @@ public:
                         continue;
                     }
                     for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
-                        if (pred > header && runOnLoop(function, cfg, header, pred)) {
+                        if (pred > header && runOnLoop(function, cfg, constGlobals, header, pred)) {
                             localChanged = true;
                             changed = true;
                             break;
