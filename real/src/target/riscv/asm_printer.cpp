@@ -477,7 +477,11 @@ private:
 
     void allocateLocalRegs(const std::unordered_set<std::string>& locals, bool hasCall, bool hasLoop)
     {
-        if (hasCall || (!hasLoop && !function_.params.empty())) {
+        // Only skip when there is no loop and the function takes parameters (the
+        // params are cheap to keep on the stack there). Functions that contain
+        // calls are fine: locals go into callee-saved registers, which are saved
+        // in the prologue / restored in the epilogue and therefore survive calls.
+        if (!hasLoop && !function_.params.empty()) {
             return;
         }
 
@@ -509,8 +513,14 @@ private:
             return lhs.first < rhs.first;
         });
 
-        static constexpr const char* regs[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
-        const std::size_t count = std::min<std::size_t>(ordered.size(), std::size(regs));
+        // With no calls, values live in caller-saved temps and never need
+        // callee-saved registers, so hot locals may use the whole callee-saved
+        // bank. With calls, leave s7-s11 for values that must survive a call.
+        static constexpr const char* regsNoCall[] = {"s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11"};
+        static constexpr const char* regsWithCall[] = {"s1", "s2", "s3", "s4", "s5", "s6"};
+        const char* const* regs = hasCall ? regsWithCall : regsNoCall;
+        const std::size_t regCount = hasCall ? std::size(regsWithCall) : std::size(regsNoCall);
+        const std::size_t count = std::min<std::size_t>(ordered.size(), regCount);
         for (std::size_t i = 0; i < count; ++i) {
             allocatedLocalRegs_[ordered[i].first] = regs[i];
         }
