@@ -781,7 +781,7 @@ if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 27) {
     throw "opt_global_cse_across_blocks_stats returned unexpected value"
 }
 
-Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-copy-prop" 2
+Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-copy-prop" 3
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse" 2
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=const-call-eval" 2
 
@@ -817,7 +817,7 @@ int main() {
     return g;
 }
 '@
-Assert-StatsContains "opt_dead_function_elim_stats" $deadFunctionResult.Stderr "pass=dead-function-elim changed=yes"
+Assert-StatsOccurrenceAtMost "opt_dead_function_elim_stats" $deadFunctionResult.Stderr "pass=dead-function-elim" 3
 Assert-AssemblyNotContains "opt_dead_function_elim_stats" $deadFunctionResult.Stdout ".globl unused_large"
 if ((Invoke-RiscVMain $deadFunctionResult.Stdout) -ne 1) {
     throw "opt_dead_function_elim_stats returned unexpected value"

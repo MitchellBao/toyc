@@ -14,6 +14,7 @@ namespace toyc::passes {
 namespace {
 
 constexpr std::size_t kMaxInlineInstructions = 400;
+constexpr std::size_t kMaxVoidInlineInstructions = 12;
 constexpr int kMaxInlineRounds = 6;
 constexpr int kMaxInlineSitesPerRound = 1024;
 
@@ -159,6 +160,40 @@ bool isInlineCandidate(const ir::Function& function, const std::unordered_set<st
     }
 
     return true;
+}
+
+bool isNarrowVoidInlineCandidate(const ir::Function& function)
+{
+    if (function.returnType != ir::Type::Void || function.blocks.size() > 2) {
+        return false;
+    }
+
+    std::size_t instructions = 0;
+    bool sawStoreGlobal = false;
+    for (const ir::BasicBlock& block : function.blocks) {
+        instructions += block.instructions.size();
+        if (block.terminator.kind == ir::TerminatorKind::Return && block.terminator.hasReturnValue) {
+            return false;
+        }
+        for (const ir::Instruction& inst : block.instructions) {
+            switch (inst.kind) {
+            case ir::InstructionKind::Const:
+            case ir::InstructionKind::Copy:
+            case ir::InstructionKind::LoadLocal:
+            case ir::InstructionKind::StoreLocal:
+            case ir::InstructionKind::Unary:
+            case ir::InstructionKind::Binary:
+                break;
+            case ir::InstructionKind::StoreGlobal:
+                sawStoreGlobal = true;
+                break;
+            case ir::InstructionKind::LoadGlobal:
+            case ir::InstructionKind::Call:
+                return false;
+            }
+        }
+    }
+    return sawStoreGlobal && instructions <= kMaxVoidInlineInstructions;
 }
 
 ir::Operand remapOperand(const ir::Operand& operand, const std::unordered_map<int, ir::Value>& values)
@@ -331,7 +366,8 @@ std::unordered_map<std::string, const ir::Function*> collectCandidates(const ir:
     const std::unordered_set<std::string> recursive = recursiveFunctions(module);
     std::unordered_map<std::string, const ir::Function*> candidates;
     for (const ir::Function& function : module.functions) {
-        if (isInlineCandidate(function, recursive)) {
+        if (isInlineCandidate(function, recursive)
+            && (function.returnType != ir::Type::Void || isNarrowVoidInlineCandidate(function))) {
             candidates.emplace(function.name, &function);
         }
     }

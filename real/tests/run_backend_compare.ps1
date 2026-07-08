@@ -743,6 +743,36 @@ if ((Invoke-RiscVMain $globalStoreForwardAsm) -ne 9) {
 }
 Assert-OpcodeAtMost "backend_global_store_load_forward" $globalStoreForwardAsm "lw" 0
 
+$averagedInvariantLoopAsm = Compile-Source "backend_loop_average_invariant" @'
+int g = 0;
+void setg(int x) {
+    g = x;
+    return;
+}
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 12) {
+        int tmp = 0;
+        int j = 0;
+        while (j < 60) {
+            setg(i);
+            tmp = tmp + g;
+            j = j + 1;
+        }
+        tmp = tmp / 60;
+        sum = sum + tmp;
+        i = i + 1;
+    }
+    return sum;
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $averagedInvariantLoopAsm) -ne 66) {
+    throw "backend_loop_average_invariant returned unexpected value"
+}
+Assert-OpcodeAtMost "backend_loop_average_invariant" $averagedInvariantLoopAsm "div" 0
+Assert-OpcodeAtMost "backend_loop_average_invariant" $averagedInvariantLoopAsm "sw" 4
+
 $irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
 int id(int x) {
     return x;

@@ -334,7 +334,7 @@ bool isWhileCond(const ir::BasicBlock& block)
     return block.label.find(".while.cond") == 0;
 }
 
-bool isSafeBodyInstruction(const ir::Instruction& inst)
+bool isSafeBodyInstruction(const ir::Instruction& inst, const std::unordered_set<std::string>& deadStoreGlobals)
 {
     switch (inst.kind) {
     case ir::InstructionKind::Const:
@@ -344,8 +344,9 @@ bool isSafeBodyInstruction(const ir::Instruction& inst)
     case ir::InstructionKind::Unary:
     case ir::InstructionKind::Binary:
         return true;
-    case ir::InstructionKind::LoadGlobal:
     case ir::InstructionKind::StoreGlobal:
+        return !inst.symbol.empty() && deadStoreGlobals.find(inst.symbol) != deadStoreGlobals.end();
+    case ir::InstructionKind::LoadGlobal:
     case ir::InstructionKind::Call:
         return false;
     }
@@ -605,6 +606,11 @@ struct BinaryDef {
     ir::Operand rhs;
 };
 
+struct InvariantOperand {
+    ir::Operand operand;
+    std::string reloadLocal;
+};
+
 bool isLoadOfLocal(
     ir::Operand operand,
     const std::string& symbol,
@@ -638,22 +644,106 @@ std::optional<std::int32_t> constOperandValue(
     return found->second;
 }
 
-std::optional<ir::Operand> invariantOperand(
+std::optional<InvariantOperand> invariantOperand(
     ir::Operand operand,
     const std::unordered_map<int, ir::Operand>& copies,
-    const std::unordered_set<int>& definedInBody)
+    const std::unordered_set<int>& definedInBody,
+    const std::unordered_map<int, std::string>& loadedLocal,
+    const std::unordered_set<std::string>& storedLocals)
 {
     const auto resolved = resolveCopy(operand, copies);
     if (!resolved.has_value()) {
         return std::nullopt;
     }
     if (resolved->isImmediate || resolved->value.id < 0) {
-        return resolved;
+        return InvariantOperand{*resolved, ""};
     }
     if (definedInBody.find(resolved->value.id) != definedInBody.end()) {
+        const auto loaded = loadedLocal.find(resolved->value.id);
+        if (loaded != loadedLocal.end() && storedLocals.find(loaded->second) == storedLocals.end()) {
+            return InvariantOperand{ir::Operand{}, loaded->second};
+        }
         return std::nullopt;
     }
-    return resolved;
+    return InvariantOperand{*resolved, ""};
+}
+
+std::optional<std::int32_t> inductionStepInBody(const ir::BasicBlock& body, const std::string& induction)
+{
+    std::unordered_map<int, std::int32_t> constants;
+    std::unordered_map<int, ir::Operand> copies;
+    std::unordered_map<int, std::string> loadedLocal;
+    std::unordered_map<int, BinaryDef> binaryDefs;
+    std::optional<std::int32_t> step;
+
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal) {
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::Const
+            && inst.dst.id >= 0
+            && !inst.operands.empty()
+            && inst.operands[0].isImmediate) {
+            constants[inst.dst.id] = inst.operands[0].immediate;
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+            loadedLocal[inst.dst.id] = inst.symbol;
+            constants.erase(inst.dst.id);
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
+            copies[inst.dst.id] = resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]);
+            constants.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+            binaryDefs[inst.dst.id] = BinaryDef{
+                inst.binaryOp,
+                resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]),
+                resolveCopy(inst.operands[1], copies).value_or(inst.operands[1]),
+            };
+            constants.erase(inst.dst.id);
+            copies.erase(inst.dst.id);
+            continue;
+        }
+        if (inst.kind != ir::InstructionKind::StoreLocal || inst.symbol != induction || inst.operands.empty()) {
+            continue;
+        }
+
+        const ir::Operand stored = resolveCopy(inst.operands[0], copies).value_or(inst.operands[0]);
+        if (stored.isImmediate || stored.value.id < 0) {
+            return std::nullopt;
+        }
+        const auto def = binaryDefs.find(stored.value.id);
+        if (def == binaryDefs.end()) {
+            return std::nullopt;
+        }
+
+        const bool lhsSelf = isLoadOfLocal(def->second.lhs, induction, copies, loadedLocal);
+        const bool rhsSelf = isLoadOfLocal(def->second.rhs, induction, copies, loadedLocal);
+        std::optional<std::int32_t> candidate;
+        if (def->second.op == ir::BinaryOpcode::Add && lhsSelf) {
+            candidate = constOperandValue(def->second.rhs, copies, constants);
+        } else if (def->second.op == ir::BinaryOpcode::Add && rhsSelf) {
+            candidate = constOperandValue(def->second.lhs, copies, constants);
+        } else if (def->second.op == ir::BinaryOpcode::Sub && lhsSelf) {
+            if (const auto value = constOperandValue(def->second.rhs, copies, constants); value.has_value()) {
+                candidate = -*value;
+            }
+        }
+        if (!candidate.has_value()) {
+            return std::nullopt;
+        }
+        if (step.has_value() && *step != *candidate) {
+            return std::nullopt;
+        }
+        step = *candidate;
+    }
+
+    return step;
 }
 
 bool tryInvariantAccumulationLoop(
@@ -667,9 +757,13 @@ bool tryInvariantAccumulationLoop(
     int trips)
 {
     std::unordered_set<int> definedInBody;
+    std::unordered_set<std::string> storedLocals;
     for (const ir::Instruction& inst : body.instructions) {
         if (inst.dst.id >= 0) {
             definedInBody.insert(inst.dst.id);
+        }
+        if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+            storedLocals.insert(inst.symbol);
         }
     }
 
@@ -678,10 +772,13 @@ bool tryInvariantAccumulationLoop(
     std::unordered_map<int, std::string> loadedLocal;
     std::unordered_map<int, BinaryDef> binaryDefs;
     std::optional<std::string> accumulator;
-    std::optional<ir::Operand> increment;
+    std::optional<InvariantOperand> increment;
     bool sawInductionStore = false;
 
     for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal) {
+            continue;
+        }
         if (inst.kind == ir::InstructionKind::Const
             && inst.dst.id >= 0
             && !inst.operands.empty()
@@ -755,7 +852,12 @@ bool tryInvariantAccumulationLoop(
         if (lhsAcc == rhsAcc) {
             return false;
         }
-        const auto candidate = invariantOperand(lhsAcc ? def->second.rhs : def->second.lhs, copies, definedInBody);
+        const auto candidate = invariantOperand(
+            lhsAcc ? def->second.rhs : def->second.lhs,
+            copies,
+            definedInBody,
+            loadedLocal,
+            storedLocals);
         if (!candidate.has_value()) {
             return false;
         }
@@ -787,13 +889,21 @@ bool tryInvariantAccumulationLoop(
     load.dst = ir::Value{function.nextValue++};
     replacement.push_back(load);
 
-    ir::Operand scaled = *increment;
+    ir::Operand scaled = increment->operand;
+    if (!increment->reloadLocal.empty()) {
+        ir::Instruction incrementLoad;
+        incrementLoad.kind = ir::InstructionKind::LoadLocal;
+        incrementLoad.symbol = increment->reloadLocal;
+        incrementLoad.dst = ir::Value{function.nextValue++};
+        replacement.push_back(incrementLoad);
+        scaled = ir::Operand::ref(incrementLoad.dst);
+    }
     if (trips != 1) {
         ir::Instruction mul;
         mul.kind = ir::InstructionKind::Binary;
         mul.binaryOp = ir::BinaryOpcode::Mul;
         mul.dst = ir::Value{function.nextValue++};
-        mul.operands = {*increment, ir::Operand::imm(trips)};
+        mul.operands = {scaled, ir::Operand::imm(trips)};
         replacement.push_back(mul);
         scaled = ir::Operand::ref(mul.dst);
     }
@@ -975,8 +1085,28 @@ bool runOnLoop(ir::Function& function, int header)
     if (body.terminator.kind != ir::TerminatorKind::Jump || body.terminator.trueBlock != header) {
         return false;
     }
+    std::unordered_set<std::string> loadedGlobalsAfterLoop;
+    for (int b = exitIndex; b < static_cast<int>(function.blocks.size()); ++b) {
+        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(b)];
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
+                loadedGlobalsAfterLoop.insert(inst.symbol);
+            }
+            if (inst.kind == ir::InstructionKind::Call) {
+                return false;
+            }
+        }
+    }
+    std::unordered_set<std::string> deadStoreGlobals;
     for (const ir::Instruction& inst : body.instructions) {
-        if (!isSafeBodyInstruction(inst)) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal
+            && !inst.symbol.empty()
+            && loadedGlobalsAfterLoop.find(inst.symbol) == loadedGlobalsAfterLoop.end()) {
+            deadStoreGlobals.insert(inst.symbol);
+        }
+    }
+    for (const ir::Instruction& inst : body.instructions) {
+        if (!isSafeBodyInstruction(inst, deadStoreGlobals)) {
             return false;
         }
     }
@@ -1099,6 +1229,24 @@ bool runOnLoop(ir::Function& function, int header)
     if (!start.has_value()) {
         return false;
     }
+    if (bound.has_value()) {
+        const auto bodyStep = inductionStepInBody(body, *induction);
+        if (bodyStep.has_value()) {
+            if (const auto fixedTrips = tripCount(*cmpOp, *start, *bound, *bodyStep); fixedTrips.has_value()) {
+                if (tryInvariantAccumulationLoop(
+                        function,
+                        header,
+                        exitIndex,
+                        body,
+                        *induction,
+                        *start,
+                        *bodyStep,
+                        *fixedTrips)) {
+                    return true;
+                }
+            }
+        }
+    }
 
     constants = valueConstantsBeforeLoop(function, header, localConstants);
     std::unordered_map<int, PolyValue> polyValues;
@@ -1108,6 +1256,11 @@ bool runOnLoop(ir::Function& function, int header)
     std::unordered_map<std::string, PolyValue> currentLocal;
     std::unordered_map<std::string, PolyValue> finalLocal;
     for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal
+            && !inst.symbol.empty()
+            && deadStoreGlobals.find(inst.symbol) != deadStoreGlobals.end()) {
+            continue;
+        }
         switch (inst.kind) {
         case ir::InstructionKind::Const:
             if (inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
