@@ -53,6 +53,21 @@ std::unordered_set<std::string> computeLiveIn(const ir::BasicBlock& block, std::
     return live;
 }
 
+std::unordered_set<std::string> computeGlobalsEverLoaded(const ir::Module& module)
+{
+    std::unordered_set<std::string> loaded;
+    for (const ir::Function& function : module.functions) {
+        for (const ir::BasicBlock& block : function.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
+                    loaded.insert(inst.symbol);
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
 std::vector<std::unordered_set<std::string>> computeLiveOut(const ir::Function& function)
 {
     const std::size_t blockCount = function.blocks.size();
@@ -88,12 +103,24 @@ public:
     bool run(ir::Module& module) override
     {
         bool changed = false;
+        // A store to a global is dead when the global's written value can never
+        // be observed. The program's only observable output is main's return
+        // value (globals are not externally visible in ToyC and there is no
+        // aliasing), so:
+        //   * a global that is never loaded anywhere in the module is dead, and
+        //   * within a block, a store is dead if a later store to the same global
+        //     overwrites it before any load of it or any call (a call may read
+        //     any global). Block-out liveness is the set of globals loaded
+        //     somewhere in the module (conservative: any of them may be read
+        //     after this block).
+        const std::unordered_set<std::string> globalsEverLoaded = computeGlobalsEverLoaded(module);
         for (ir::Function& function : module.functions) {
             const std::vector<std::unordered_set<std::string>> liveOut = computeLiveOut(function);
             for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
                 ir::BasicBlock& block = function.blocks[blockIndex];
                 std::vector<bool> remove(block.instructions.size(), false);
                 std::unordered_set<std::string> live = liveOut[blockIndex];
+                std::unordered_set<std::string> liveGlobals = globalsEverLoaded;
                 for (std::size_t reverse = 0; reverse < block.instructions.size(); ++reverse) {
                     const std::size_t i = block.instructions.size() - reverse - 1;
                     const ir::Instruction& inst = block.instructions[i];
@@ -104,6 +131,18 @@ public:
                             remove[i] = true;
                         } else {
                             live.erase(inst.symbol);
+                        }
+                    } else if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
+                        liveGlobals.insert(inst.symbol);
+                    } else if (inst.kind == ir::InstructionKind::Call) {
+                        for (const std::string& sym : globalsEverLoaded) {
+                            liveGlobals.insert(sym);
+                        }
+                    } else if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
+                        if (liveGlobals.find(inst.symbol) == liveGlobals.end()) {
+                            remove[i] = true;
+                        } else {
+                            liveGlobals.erase(inst.symbol);
                         }
                     }
                 }

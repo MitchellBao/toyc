@@ -56,6 +56,11 @@ public:
             for (ir::BasicBlock& block : function.blocks) {
                 std::unordered_map<int, ir::Operand> copies;
                 std::unordered_map<std::string, ir::Operand> localValues;
+                // Last stored value of each global within this block. Valid until
+                // a call or unknown side effect (which may read/rewrite globals);
+                // a store to a *different* global does not invalidate others (no
+                // aliasing in ToyC). Enables store->load forwarding of globals.
+                std::unordered_map<std::string, ir::Operand> globalValues;
                 for (ir::Instruction& inst : block.instructions) {
                     for (ir::Operand& operand : inst.operands) {
                         changed = replaceOperand(operand, copies) || changed;
@@ -63,6 +68,9 @@ public:
 
                     if (mayClobberLocals(inst)) {
                         localValues.clear();
+                    }
+                    if (inst.kind == ir::InstructionKind::Call || inst.hasSideEffect) {
+                        globalValues.clear();
                     }
 
                     if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
@@ -75,6 +83,16 @@ public:
                         }
                     } else if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty() && !inst.operands.empty()) {
                         localValues[inst.symbol] = inst.operands[0];
+                    } else if (inst.kind == ir::InstructionKind::LoadGlobal && inst.dst.id >= 0) {
+                        const auto found = globalValues.find(inst.symbol);
+                        if (found != globalValues.end()) {
+                            inst.kind = ir::InstructionKind::Copy;
+                            inst.operands = {found->second};
+                            inst.symbol.clear();
+                            changed = true;
+                        }
+                    } else if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty() && !inst.operands.empty()) {
+                        globalValues[inst.symbol] = inst.operands[0];
                     }
 
                     if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
