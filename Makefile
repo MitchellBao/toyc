@@ -25,6 +25,7 @@ SOURCES := \
 	real/src/passes/global_cse.cpp \
 	real/src/passes/algebraic_simplify.cpp \
 	real/src/passes/copy_prop.cpp \
+	real/src/passes/local_coalesce.cpp \
 	real/src/passes/cse.cpp \
 	real/src/passes/inst_combine.cpp \
 	real/src/passes/dce.cpp \

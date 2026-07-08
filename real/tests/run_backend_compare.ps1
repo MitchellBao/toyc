@@ -626,6 +626,38 @@ int main() {
 '@ -Optimize
 Assert-NoAdjacentStoreLoadSameSlot "backend_stack_roundtrip_peephole" $stackRoundTripAsm
 
+$copyCoalesceAsm = Compile-Source "backend_copy_coalesce_chain" @'
+int g = 5;
+int id(int x) {
+    return x;
+}
+int get(int x) {
+    int z = id(x);
+    int y = z;
+    while (y > 0) {
+        y = y - 1;
+    }
+    return g + y;
+}
+int main() {
+    return get(3);
+}
+'@ -Optimize
+if ((Invoke-RiscVMain $copyCoalesceAsm) -ne 5) {
+    throw "backend_copy_coalesce_chain returned unexpected value"
+}
+
+Assert-BackendsAgree "backend_local_coalesce_source_live" @'
+int keep(int x) {
+    int y = x;
+    y = y + 1;
+    return x * 10 + y;
+}
+int main() {
+    return keep(4);
+}
+'@ 45
+
 $irAlgebraAsm = Compile-Source "backend_ir_algebra_simplify" @'
 int id(int x) {
     return x;

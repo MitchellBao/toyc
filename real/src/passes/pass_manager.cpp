@@ -79,6 +79,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
+            manager.add(createLocalCoalescePass());
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
             manager.add(createSimplifyCfgPass());
@@ -88,6 +89,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createConstPropPass());
         manager.add(createAlgebraicSimplifyPass());
         manager.add(createCopyPropPass());
+        manager.add(createLocalCoalescePass());
         manager.add(createCsePass());
         manager.add(createInstCombinePass());
         manager.add(createSimplifyCfgPass());
@@ -104,6 +106,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
+            manager.add(createLocalCoalescePass());
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
             manager.add(createDcePass());
@@ -116,6 +119,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         manager.add(createConstPropPass());
         manager.add(createAlgebraicSimplifyPass());
         manager.add(createCopyPropPass());
+        manager.add(createLocalCoalescePass());
         manager.add(createCsePass());
         manager.add(createInstCombinePass());
         manager.add(createDcePass());
@@ -130,6 +134,7 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
             manager.add(createConstPropPass());
             manager.add(createAlgebraicSimplifyPass());
             manager.add(createCopyPropPass());
+            manager.add(createLocalCoalescePass());
             manager.add(createCsePass());
             manager.add(createInstCombinePass());
             manager.add(createDcePass());

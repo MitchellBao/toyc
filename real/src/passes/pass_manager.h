@@ -40,6 +40,7 @@ std::unique_ptr<Pass> createGlobalCsePass();
 std::unique_ptr<Pass> createConstCallEvalPass();
 std::unique_ptr<Pass> createAlgebraicSimplifyPass();
 std::unique_ptr<Pass> createCopyPropPass();
+std::unique_ptr<Pass> createLocalCoalescePass();
 std::unique_ptr<Pass> createCsePass();
 std::unique_ptr<Pass> createInstCombinePass();
 std::unique_ptr<Pass> createDcePass();
