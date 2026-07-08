@@ -923,6 +923,26 @@ if ((Invoke-RiscVMain $inlineStoreGlobalResult.Stdout) -ne 45) {
     throw "opt_inline_store_global_side_effect_stats returned unexpected value"
 }
 
+$storeGlobalOverwriteResult = Compile-OptSnippetWithStats "opt_store_global_overwrite_dse_stats" @'
+int g = 0;
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < 40) {
+        g = i + 1;
+        g = i + 2;
+        g = i + 3;
+        sum = sum + g;
+        i = i + 1;
+    }
+    return sum % 256;
+}
+'@
+Assert-StatsContains "opt_store_global_overwrite_dse_stats" $storeGlobalOverwriteResult.Stderr "pass=dse changed=yes"
+if ((Invoke-RiscVMain $storeGlobalOverwriteResult.Stdout) -ne 132) {
+    throw "opt_store_global_overwrite_dse_stats returned unexpected value"
+}
+
 $cfgBranchFoldResult = Compile-OptSnippetWithStats "opt_cfg_fold_next_jump_stats" @'
 int g = 0;
 int bump(int x) {

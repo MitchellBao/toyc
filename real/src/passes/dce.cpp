@@ -1,8 +1,9 @@
 #include "pass_manager.h"
 
 #include <algorithm>
-#include <vector>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace toyc::passes {
 namespace {
@@ -35,6 +36,15 @@ public:
     {
         bool changed = false;
         for (ir::Function& function : module.functions) {
+            std::unordered_map<int, const ir::Instruction*> definitions;
+            for (const ir::BasicBlock& block : function.blocks) {
+                for (const ir::Instruction& inst : block.instructions) {
+                    if (inst.dst.id >= 0) {
+                        definitions[inst.dst.id] = &inst;
+                    }
+                }
+            }
+
             std::unordered_set<int> liveValues;
             std::vector<int> worklist;
             auto markLive = [&](const ir::Operand& operand) {
@@ -58,15 +68,12 @@ public:
             while (!worklist.empty()) {
                 const int value = worklist.back();
                 worklist.pop_back();
-                for (const ir::BasicBlock& block : function.blocks) {
-                    for (const ir::Instruction& inst : block.instructions) {
-                        if (inst.dst.id != value) {
-                            continue;
-                        }
-                        for (const ir::Operand& operand : inst.operands) {
-                            markLive(operand);
-                        }
-                    }
+                const auto definition = definitions.find(value);
+                if (definition == definitions.end()) {
+                    continue;
+                }
+                for (const ir::Operand& operand : definition->second->operands) {
+                    markLive(operand);
                 }
             }
 

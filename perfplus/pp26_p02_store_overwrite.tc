@@ -1,0 +1,15 @@
+int g = 0;
+int limit = 240;
+
+int main() {
+    int i = 0;
+    int sum = 0;
+    while (i < limit) {
+        g = i + 1;
+        g = i + 2;
+        g = i + 3;
+        sum = (sum + g) % 65521;
+        i = i + 1;
+    }
+    return sum % 256;
+}

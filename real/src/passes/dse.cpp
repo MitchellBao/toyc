@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -94,6 +95,7 @@ public:
                 ir::BasicBlock& block = function.blocks[blockIndex];
                 std::vector<bool> remove(block.instructions.size(), false);
                 std::unordered_set<std::string> live = liveOut[blockIndex];
+                std::unordered_map<std::string, std::size_t> pendingGlobalStore;
                 for (std::size_t reverse = 0; reverse < block.instructions.size(); ++reverse) {
                     const std::size_t i = block.instructions.size() - reverse - 1;
                     const ir::Instruction& inst = block.instructions[i];
@@ -105,6 +107,16 @@ public:
                         } else {
                             live.erase(inst.symbol);
                         }
+                    } else if (inst.kind == ir::InstructionKind::LoadGlobal && !inst.symbol.empty()) {
+                        pendingGlobalStore.erase(inst.symbol);
+                    } else if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
+                        const auto pending = pendingGlobalStore.find(inst.symbol);
+                        if (pending != pendingGlobalStore.end()) {
+                            remove[i] = true;
+                        }
+                        pendingGlobalStore[inst.symbol] = i;
+                    } else if (inst.kind == ir::InstructionKind::Call || inst.hasSideEffect) {
+                        pendingGlobalStore.clear();
                     }
                 }
 

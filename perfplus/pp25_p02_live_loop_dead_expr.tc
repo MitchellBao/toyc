@@ -1,0 +1,17 @@
+int seed = 97;
+
+int main() {
+    int n = seed + 203;
+    int i = 0;
+    int live = 0;
+    while (i < n) {
+        int x = i + 1;
+        int dead1 = x * x;
+        int dead2 = dead1 * (x + 7);
+        int dead3 = dead2 + dead1 + x;
+        int dead4 = dead3 / 3;
+        live = (live + i) % 65521;
+        i = i + 1;
+    }
+    return live % 256;
+}
