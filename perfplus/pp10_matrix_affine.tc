@@ -1,0 +1,22 @@
+int bias = 5;
+
+int cell(int r, int c) {
+    return (r * 13 + c * 7 + bias) % 101;
+}
+
+int main() {
+    int sum = 0;
+    int r = 0;
+    while (r < 35) {
+        int c = 0;
+        while (c < 35) {
+            int a = cell(r, c);
+            int b = (a + 4) - 4;
+            int d = b * 2 - a;
+            sum = (sum + d + (a - b)) % 1000003;
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return sum % 256;
+}

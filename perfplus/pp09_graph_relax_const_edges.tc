@@ -1,0 +1,25 @@
+int salt = 7;
+
+int weight(int u, int v) {
+    return (u * 17 + v * 31 + salt) % 97;
+}
+
+int main() {
+    int dist = 0;
+    int u = 0;
+    while (u < 28) {
+        int v = 0;
+        while (v < 28) {
+            int w1 = weight(u, v);
+            int w2 = weight(u, v);
+            if (((u + v) % 4) == 0) {
+                dist = (dist + w1 + w2) % 1000003;
+            } else {
+                dist = (dist + w1 - w2 + 3) % 1000003;
+            }
+            v = v + 1;
+        }
+        u = u + 1;
+    }
+    return dist % 256;
+}

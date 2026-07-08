@@ -1,0 +1,16 @@
+int modpow(int a, int e, int m) {
+    int r = 1;
+    while (e > 0) {
+        if ((e % 2) != 0) {
+            r = (r * a) % m;
+        }
+        a = (a * a) % m;
+        e = e / 2;
+    }
+    return r;
+}
+
+int main() {
+    int a = (7 + 13) - 13;
+    return modpow(a, 1234, 251) % 256;
+}

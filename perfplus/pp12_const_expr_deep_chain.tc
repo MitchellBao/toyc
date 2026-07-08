@@ -1,0 +1,17 @@
+const int A0 = 1;
+const int A1 = A0 + 2;
+const int A2 = A1 * 3;
+const int A3 = A2 - 4;
+const int A4 = A3 * A3;
+const int A5 = A4 / 5 + A2;
+const int A6 = A5 % 257;
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 1024) {
+        sum = sum + A6;
+        i = i + 1;
+    }
+    return sum % 256;
+}

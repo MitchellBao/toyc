@@ -1,0 +1,15 @@
+int seed = 7;
+
+int main() {
+    int s1 = 0;
+    int s2 = 0;
+    int s3 = 0;
+    int i = 0;
+    while (i < 320) {
+        s1 = s1 + i;
+        s2 = s2 + i * i;
+        s3 = s3 + 3 * i + seed;
+        i = i + 1;
+    }
+    return (s1 + s2 + s3) % 256;
+}

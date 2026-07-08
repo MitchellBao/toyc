@@ -1,0 +1,26 @@
+int adjust = 1009;
+
+int val(int r, int c) {
+    int base = r * 17 + c * 23;
+    return (base + adjust) % 127;
+}
+
+int main() {
+    int sum = 0;
+    int r = 0;
+    while (r < 26) {
+        int c = 0;
+        while (c < 26) {
+            int a = val(r, c);
+            int b = val(r, c);
+            if (((r - r) + (c - c)) == 0) {
+                sum = (sum + a + b) % 1000003;
+            } else {
+                sum = sum + 999;
+            }
+            c = c + 1;
+        }
+        r = r + 1;
+    }
+    return sum % 256;
+}

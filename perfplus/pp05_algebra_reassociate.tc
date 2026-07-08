@@ -1,0 +1,19 @@
+int load() {
+    return 23;
+}
+
+int main() {
+    int x = load();
+    int sum = 0;
+    int i = 0;
+    while (i < 700) {
+        int a = (x + 13) - 13;
+        int b = (a - 8) + 8;
+        int c = (b + 5) + 9;
+        int d = c - b;
+        int e = x - x;
+        sum = sum + d + e + (x && 1) + (x || 0);
+        i = i + 1;
+    }
+    return sum % 256;
+}

@@ -1,0 +1,16 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 600) {
+        if (((17 * 3 + 1) > 50) && ((i - i) == 0)) {
+            sum = sum + i;
+        } else {
+            sum = sum + 1000;
+        }
+        if (((i + 5) - 5) != i) {
+            sum = sum + 77;
+        }
+        i = i + 1;
+    }
+    return sum % 256;
+}

@@ -1,0 +1,24 @@
+int id(int x) {
+    return x;
+}
+
+int main() {
+    int seed = id(37);
+    int sum = 0;
+    int i = 0;
+    while (i < 500) {
+        int a = seed;
+        int b = a;
+        int c = b;
+        if ((i % 3) == 0) {
+            c = c + 5;
+            c = c - 5;
+        } else {
+            c = c + 9;
+            c = c - 9;
+        }
+        sum = sum + c;
+        i = i + 1;
+    }
+    return sum % 256;
+}

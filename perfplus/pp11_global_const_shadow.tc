@@ -1,0 +1,15 @@
+const int G0 = 41;
+const int G1 = G0 * 2 + 9;
+int g = 0;
+
+int main() {
+    int G0 = 3;
+    int sum = 0;
+    int i = 0;
+    while (i < 240) {
+        g = G1;
+        sum = sum + g + G0;
+        i = i + 1;
+    }
+    return sum % 256;
+}

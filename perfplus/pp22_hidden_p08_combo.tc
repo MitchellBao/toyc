@@ -1,0 +1,31 @@
+int glob = 0;
+
+void touch(int x) {
+    int d1 = x + 1;
+    int d2 = d1 * d1;
+    glob = x;
+    return;
+}
+
+int calc(int a, int b) {
+    int x = (a + b) * (a + b);
+    int y = (b + a) * (b + a);
+    return x - y + a;
+}
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 120) {
+        int j = 0;
+        int tmp = 0;
+        while (j < 25) {
+            touch(i);
+            tmp = tmp + glob + calc(i, j) - i;
+            j = j + 1;
+        }
+        sum = (sum + tmp / 25) % 65521;
+        i = i + 1;
+    }
+    return sum % 256;
+}

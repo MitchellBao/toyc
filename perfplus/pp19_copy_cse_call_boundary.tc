@@ -1,0 +1,20 @@
+int g = 5;
+
+int id(int x) {
+    return x;
+}
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 300) {
+        int a = id(i);
+        int b = a;
+        int c = b;
+        int x = (c + g) * (c + g);
+        int y = (g + c) * (g + c);
+        sum = (sum + x - y + c) % 1000003;
+        i = i + 1;
+    }
+    return sum % 256;
+}

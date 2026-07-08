@@ -1,0 +1,14 @@
+int main() {
+    int x = 0;
+    int i = 0;
+    while (i < 1000) {
+        int a = 42;
+        if ((i % 2) == 0) {
+            x = a + 7;
+        } else {
+            x = 49;
+        }
+        i = i + 1;
+    }
+    return x;
+}

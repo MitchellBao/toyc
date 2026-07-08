@@ -1,0 +1,12 @@
+int g = 3;
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 360) {
+        int invariant = (g + 7) * (g + 7);
+        sum = sum + invariant - invariant + i;
+        i = i + 1;
+    }
+    return sum % 256;
+}

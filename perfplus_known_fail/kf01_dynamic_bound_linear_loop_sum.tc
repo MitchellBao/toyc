@@ -1,0 +1,16 @@
+int limit = 157;
+
+int bound() {
+    return limit;
+}
+
+int main() {
+    int n = bound();
+    int sum = 0;
+    int i = 3;
+    while (i <= n) {
+        sum = sum + 3 * i + 5;
+        i = i + 2;
+    }
+    return sum % 256;
+}

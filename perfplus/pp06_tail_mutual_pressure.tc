@@ -1,0 +1,10 @@
+int acc(int n, int a, int b) {
+    if (n <= 0) {
+        return a + b;
+    }
+    return acc(n - 1, b, (a + b) % 1009);
+}
+
+int main() {
+    return acc(800, 1, 1) % 256;
+}

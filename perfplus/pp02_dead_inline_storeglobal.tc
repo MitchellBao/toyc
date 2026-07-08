@@ -1,0 +1,28 @@
+int g = 0;
+
+void setg(int x) {
+    int a1 = x + 1;
+    int a2 = a1 * 2;
+    int a3 = a2 - a1;
+    int a4 = a3 * 0;
+    int a5 = a4 + 99;
+    g = x;
+    return;
+}
+
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 147) {
+        int tmp = 0;
+        int j = 0;
+        while (j < 48) {
+            setg(i);
+            tmp = tmp + g;
+            j = j + 1;
+        }
+        sum = (sum + tmp / 48) % 1000003;
+        i = i + 1;
+    }
+    return sum % 256;
+}
