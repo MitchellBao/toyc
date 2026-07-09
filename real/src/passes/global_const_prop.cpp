@@ -4,7 +4,9 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace toyc::passes {
@@ -258,13 +260,63 @@ bool runOnFunction(ir::Function& function)
     return changed;
 }
 
+std::unordered_map<std::string, std::int32_t> readOnlyGlobalInitials(const ir::Module& module)
+{
+    std::unordered_set<std::string> storedGlobals;
+    for (const ir::Function& function : module.functions) {
+        for (const ir::BasicBlock& block : function.blocks) {
+            for (const ir::Instruction& inst : block.instructions) {
+                if (inst.kind == ir::InstructionKind::StoreGlobal && !inst.symbol.empty()) {
+                    storedGlobals.insert(inst.symbol);
+                }
+            }
+        }
+    }
+
+    std::unordered_map<std::string, std::int32_t> values;
+    for (const ir::Global& global : module.globals) {
+        if (storedGlobals.find(global.name) == storedGlobals.end()) {
+            values.emplace(global.name, global.init);
+        }
+    }
+    return values;
+}
+
+bool replaceReadOnlyGlobalLoads(ir::Module& module)
+{
+    const std::unordered_map<std::string, std::int32_t> globals = readOnlyGlobalInitials(module);
+    if (globals.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (ir::Function& function : module.functions) {
+        for (ir::BasicBlock& block : function.blocks) {
+            for (ir::Instruction& inst : block.instructions) {
+                if (inst.kind != ir::InstructionKind::LoadGlobal || inst.dst.id < 0 || inst.symbol.empty()) {
+                    continue;
+                }
+                const auto found = globals.find(inst.symbol);
+                if (found == globals.end()) {
+                    continue;
+                }
+                inst.kind = ir::InstructionKind::Const;
+                inst.operands = {ir::Operand::imm(found->second)};
+                inst.symbol.clear();
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 class GlobalConstPropPass final : public Pass {
 public:
     std::string name() const override { return "global-const-prop"; }
 
     bool run(ir::Module& module) override
     {
-        bool changed = false;
+        bool changed = replaceReadOnlyGlobalLoads(module);
         for (ir::Function& function : module.functions) {
             changed = runOnFunction(function) || changed;
         }

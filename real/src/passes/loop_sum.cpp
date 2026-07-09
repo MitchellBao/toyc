@@ -97,6 +97,11 @@ std::int32_t wrapInt32(std::int64_t value)
     return static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
 }
 
+std::int32_t wrapInt32Wide(__int128 value)
+{
+    return static_cast<std::int32_t>(static_cast<std::uint32_t>(value));
+}
+
 std::optional<std::int64_t> checkedInt64(__int128 value)
 {
     if (value < LLONG_MIN || value > LLONG_MAX) {
@@ -451,6 +456,28 @@ std::optional<std::int32_t> closedFormSum(
         return std::nullopt;
     }
     return wrapInt32(static_cast<std::int64_t>(total));
+}
+
+std::optional<std::int32_t> closedFormSumNoWrap(
+    const Poly& increment,
+    std::int32_t start,
+    std::int32_t step,
+    int trips)
+{
+    const auto sumI = sumInduction(start, step, trips);
+    const auto sumI2 = sumInductionSquared(start, step, trips);
+    if (!sumI.has_value() || !sumI2.has_value()) {
+        return std::nullopt;
+    }
+
+    const __int128 total =
+        static_cast<__int128>(increment.quadratic) * *sumI2
+        + static_cast<__int128>(increment.linear) * *sumI
+        + static_cast<__int128>(increment.constant) * trips;
+    if (total < INT32_MIN || total > INT32_MAX) {
+        return std::nullopt;
+    }
+    return static_cast<std::int32_t>(total);
 }
 
 std::optional<ir::Operand> resolveCopy(
@@ -1605,6 +1632,723 @@ bool tryConditionalAccumulationLoop(ir::Function& function, int header)
     return true;
 }
 
+struct ModuloTerm {
+    Poly poly;
+    std::int32_t modulus = 1;
+};
+
+struct ModuloAccumulation {
+    std::string accumulator;
+    ModuloTerm term;
+};
+
+struct ModuloReducedAccumulation {
+    std::string accumulator;
+    Poly increment;
+    std::int32_t modulus = 1;
+};
+
+std::optional<ModuloTerm> moduloOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, ModuloTerm>& moduloValues)
+{
+    if (operand.isImmediate || operand.value.id < 0) {
+        return std::nullopt;
+    }
+    const auto found = moduloValues.find(operand.value.id);
+    if (found == moduloValues.end()) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+std::optional<std::string> pureLocalBaseOf(
+    const ir::Operand& operand,
+    const std::unordered_map<int, std::int32_t>& constants,
+    const std::unordered_map<int, PolyValue>& polyValues)
+{
+    const auto value = polyOf(operand, constants, polyValues);
+    if (!value.has_value() || value->base.empty() || !isZero(value->poly)) {
+        return std::nullopt;
+    }
+    return value->base;
+}
+
+std::int32_t evalPolyInt32(const Poly& poly, std::int64_t x)
+{
+    const __int128 value =
+        static_cast<__int128>(poly.quadratic) * x * x
+        + static_cast<__int128>(poly.linear) * x
+        + static_cast<__int128>(poly.constant);
+    return wrapInt32Wide(value);
+}
+
+std::optional<std::int32_t> closedFormModuloSum(
+    const ModuloTerm& term,
+    std::int32_t start,
+    std::int32_t step,
+    int trips)
+{
+    if (term.modulus <= 0 || term.modulus > 256 || trips < 0) {
+        return std::nullopt;
+    }
+
+    const int period = term.modulus;
+    std::vector<std::int32_t> prefix(static_cast<std::size_t>(period) + 1, 0);
+    std::int64_t cycleSum = 0;
+    for (int t = 0; t < period; ++t) {
+        const std::int64_t x = static_cast<std::int64_t>(start) + static_cast<std::int64_t>(step) * t;
+        const std::int32_t value = evalPolyInt32(term.poly, x);
+        const std::int32_t delta = value % term.modulus;
+        cycleSum += delta;
+        prefix[static_cast<std::size_t>(t + 1)] = wrapInt32(static_cast<std::int64_t>(prefix[static_cast<std::size_t>(t)]) + delta);
+    }
+
+    const std::int64_t fullCycles = trips / period;
+    const int remainder = trips % period;
+    const __int128 total =
+        static_cast<__int128>(fullCycles) * cycleSum
+        + prefix[static_cast<std::size_t>(remainder)];
+    return wrapInt32Wide(total);
+}
+
+bool tryModuloAccumulationLoop(ir::Function& function, int header)
+{
+    if (header < 0 || header >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+    const ir::BasicBlock& headerBlock = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(headerBlock) || headerBlock.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const int bodyIndex = headerBlock.terminator.trueBlock;
+    const int exitIndex = headerBlock.terminator.falseBlock;
+    if (bodyIndex < 0 || bodyIndex >= static_cast<int>(function.blocks.size()) || exitIndex < 0) {
+        return false;
+    }
+    ir::BasicBlock& body = function.blocks[static_cast<std::size_t>(bodyIndex)];
+    if (body.terminator.kind != ir::TerminatorKind::Jump || body.terminator.trueBlock != header) {
+        return false;
+    }
+    for (const ir::Instruction& inst : body.instructions) {
+        if (!isSafeBodyInstruction(inst)) {
+            return false;
+        }
+    }
+
+    const auto compare = analyzeCompare(headerBlock, headerBlock.terminator.condition);
+    if (!compare.has_value()) {
+        return false;
+    }
+    const std::string induction = compare->local;
+    const auto start = initialLocalConst(function, header, induction);
+    const auto step = inductionStepInBody(body, induction);
+    if (!start.has_value() || !step.has_value() || *step <= 0) {
+        return false;
+    }
+    const auto trips = tripCount(compare->op, *start, compare->bound, *step);
+    if (!trips.has_value()) {
+        return false;
+    }
+
+    std::unordered_set<std::string> bodyStoredLocals;
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+            bodyStoredLocals.insert(inst.symbol);
+        }
+    }
+    const std::unordered_map<std::string, std::int32_t> localConstants = initialLocalConstants(function, header);
+    std::unordered_map<int, std::int32_t> constants = valueConstantsBeforeLoop(function, header, localConstants);
+    std::unordered_map<int, PolyValue> polyValues;
+    for (const auto& [valueId, value] : constants) {
+        polyValues[valueId] = PolyValue{"", Poly{0, 0, value}};
+    }
+    std::unordered_map<int, ModuloTerm> moduloValues;
+    std::unordered_map<int, ModuloAccumulation> accumulationValues;
+    std::unordered_map<int, ModuloReducedAccumulation> reducedAccumulationValues;
+    std::unordered_map<std::string, ModuloTerm> accumulations;
+    std::unordered_map<std::string, ModuloReducedAccumulation> reducedAccumulations;
+    bool sawInductionStore = false;
+
+    auto rememberConstant = [&](int valueId, const PolyValue& value) {
+        if (value.base.empty() && isConstant(value.poly)) {
+            if (const auto constant = int32Value(value.poly.constant); constant.has_value()) {
+                constants[valueId] = *constant;
+            }
+        }
+    };
+
+    for (const ir::Instruction& inst : body.instructions) {
+        switch (inst.kind) {
+        case ir::InstructionKind::Const:
+            if (inst.dst.id < 0 || inst.operands.empty() || !inst.operands[0].isImmediate) {
+                return false;
+            }
+            constants[inst.dst.id] = inst.operands[0].immediate;
+            polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, inst.operands[0].immediate}};
+            moduloValues.erase(inst.dst.id);
+            accumulationValues.erase(inst.dst.id);
+            reducedAccumulationValues.erase(inst.dst.id);
+            break;
+        case ir::InstructionKind::LoadLocal:
+            if (inst.dst.id < 0) {
+                return false;
+            }
+            moduloValues.erase(inst.dst.id);
+            accumulationValues.erase(inst.dst.id);
+            reducedAccumulationValues.erase(inst.dst.id);
+            if (bodyStoredLocals.find(inst.symbol) == bodyStoredLocals.end()) {
+                if (const auto value = localConstants.find(inst.symbol); value != localConstants.end()) {
+                    constants[inst.dst.id] = value->second;
+                    polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, value->second}};
+                    break;
+                }
+            }
+            constants.erase(inst.dst.id);
+            if (inst.symbol == induction) {
+                polyValues[inst.dst.id] = PolyValue{"", Poly{0, 1, 0}};
+            } else {
+                polyValues[inst.dst.id] = PolyValue{inst.symbol, Poly{0, 0, 0}};
+            }
+            break;
+        case ir::InstructionKind::Copy:
+            if (inst.dst.id < 0 || inst.operands.empty()) {
+                return false;
+            }
+            constants.erase(inst.dst.id);
+            polyValues.erase(inst.dst.id);
+            moduloValues.erase(inst.dst.id);
+            accumulationValues.erase(inst.dst.id);
+            reducedAccumulationValues.erase(inst.dst.id);
+            if (const auto value = polyOf(inst.operands[0], constants, polyValues); value.has_value()) {
+                polyValues[inst.dst.id] = *value;
+                rememberConstant(inst.dst.id, *value);
+            } else if (const auto value = moduloOf(inst.operands[0], moduloValues); value.has_value()) {
+                moduloValues[inst.dst.id] = *value;
+            } else if (!inst.operands[0].isImmediate) {
+                const auto found = accumulationValues.find(inst.operands[0].value.id);
+                if (found != accumulationValues.end()) {
+                    accumulationValues[inst.dst.id] = found->second;
+                } else {
+                    const auto reducedFound = reducedAccumulationValues.find(inst.operands[0].value.id);
+                    if (reducedFound != reducedAccumulationValues.end()) {
+                        reducedAccumulationValues[inst.dst.id] = reducedFound->second;
+                    } else {
+                        return false;
+                    }
+                }
+            } else {
+                return false;
+            }
+            break;
+        case ir::InstructionKind::Binary:
+            if (inst.dst.id < 0 || inst.operands.size() != 2) {
+                return false;
+            }
+            constants.erase(inst.dst.id);
+            polyValues.erase(inst.dst.id);
+            moduloValues.erase(inst.dst.id);
+            accumulationValues.erase(inst.dst.id);
+            reducedAccumulationValues.erase(inst.dst.id);
+            if (inst.binaryOp == ir::BinaryOpcode::Mod) {
+                const auto lhs = polyOf(inst.operands[0], constants, polyValues);
+                const auto rhs = constOf(inst.operands[1], constants);
+                if (!lhs.has_value() || !rhs.has_value() || *rhs <= 0) {
+                    return false;
+                }
+                if (lhs->base.empty()) {
+                    if (*rhs > 256) {
+                        return false;
+                    }
+                    moduloValues[inst.dst.id] = ModuloTerm{lhs->poly, *rhs};
+                } else {
+                    if (lhs->base == induction || isZero(lhs->poly)) {
+                        return false;
+                    }
+                    reducedAccumulationValues[inst.dst.id] = ModuloReducedAccumulation{lhs->base, lhs->poly, *rhs};
+                }
+                break;
+            }
+            if (inst.binaryOp == ir::BinaryOpcode::Add) {
+                const auto lhsMod = moduloOf(inst.operands[0], moduloValues);
+                const auto rhsMod = moduloOf(inst.operands[1], moduloValues);
+                const auto lhsAcc = pureLocalBaseOf(inst.operands[0], constants, polyValues);
+                const auto rhsAcc = pureLocalBaseOf(inst.operands[1], constants, polyValues);
+                if (lhsAcc.has_value() && rhsMod.has_value() && *lhsAcc != induction) {
+                    accumulationValues[inst.dst.id] = ModuloAccumulation{*lhsAcc, *rhsMod};
+                    break;
+                }
+                if (rhsAcc.has_value() && lhsMod.has_value() && *rhsAcc != induction) {
+                    accumulationValues[inst.dst.id] = ModuloAccumulation{*rhsAcc, *lhsMod};
+                    break;
+                }
+            }
+            if (const auto lhs = polyOf(inst.operands[0], constants, polyValues), rhs = polyOf(inst.operands[1], constants, polyValues);
+                lhs.has_value() && rhs.has_value()) {
+                if (const auto folded = evalPoly(inst.binaryOp, *lhs, *rhs); folded.has_value()) {
+                    polyValues[inst.dst.id] = *folded;
+                    rememberConstant(inst.dst.id, *folded);
+                    break;
+                }
+            }
+            return false;
+        case ir::InstructionKind::StoreLocal:
+            if (inst.operands.empty()) {
+                return false;
+            }
+            if (inst.symbol == induction) {
+                sawInductionStore = true;
+                break;
+            }
+            if (inst.operands[0].isImmediate || inst.operands[0].value.id < 0) {
+                return false;
+            }
+            if (const auto found = accumulationValues.find(inst.operands[0].value.id);
+                found != accumulationValues.end() && found->second.accumulator == inst.symbol) {
+                if (accumulations.find(inst.symbol) != accumulations.end()) {
+                    return false;
+                }
+                if (reducedAccumulations.find(inst.symbol) != reducedAccumulations.end()) {
+                    return false;
+                }
+                accumulations.emplace(inst.symbol, found->second.term);
+                break;
+            }
+            if (const auto found = reducedAccumulationValues.find(inst.operands[0].value.id);
+                found != reducedAccumulationValues.end() && found->second.accumulator == inst.symbol) {
+                if (accumulations.find(inst.symbol) != accumulations.end()
+                    || reducedAccumulations.find(inst.symbol) != reducedAccumulations.end()) {
+                    return false;
+                }
+                reducedAccumulations.emplace(inst.symbol, found->second);
+                break;
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+
+    if (!sawInductionStore || (accumulations.empty() && reducedAccumulations.empty())) {
+        return false;
+    }
+    const std::unordered_set<std::string> liveAfterLoop = computeLiveAfterLoop(function, header, bodyIndex);
+    for (const auto& [symbol, term] : accumulations) {
+        (void)term;
+        if (liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
+            return false;
+        }
+    }
+    for (const auto& [symbol, accumulation] : reducedAccumulations) {
+        (void)accumulation;
+        if (liveAfterLoop.find(symbol) == liveAfterLoop.end()) {
+            return false;
+        }
+    }
+
+    std::vector<ir::Instruction> replacement;
+    for (const auto& [symbol, term] : accumulations) {
+        const auto total = closedFormModuloSum(term, *start, *step, *trips);
+        if (!total.has_value()) {
+            return false;
+        }
+
+        ir::Instruction load;
+        load.kind = ir::InstructionKind::LoadLocal;
+        load.symbol = symbol;
+        load.dst = ir::Value{function.nextValue++};
+        replacement.push_back(load);
+
+        ir::Instruction add;
+        add.kind = ir::InstructionKind::Binary;
+        add.binaryOp = ir::BinaryOpcode::Add;
+        add.dst = ir::Value{function.nextValue++};
+        add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(*total)};
+        replacement.push_back(add);
+
+        ir::Instruction store;
+        store.kind = ir::InstructionKind::StoreLocal;
+        store.symbol = symbol;
+        store.operands = {ir::Operand::ref(add.dst)};
+        replacement.push_back(store);
+    }
+    for (const auto& [symbol, accumulation] : reducedAccumulations) {
+        const auto total = closedFormSumNoWrap(accumulation.increment, *start, *step, *trips);
+        if (!total.has_value()) {
+            return false;
+        }
+
+        ir::Instruction load;
+        load.kind = ir::InstructionKind::LoadLocal;
+        load.symbol = symbol;
+        load.dst = ir::Value{function.nextValue++};
+        replacement.push_back(load);
+
+        ir::Instruction add;
+        add.kind = ir::InstructionKind::Binary;
+        add.binaryOp = ir::BinaryOpcode::Add;
+        add.dst = ir::Value{function.nextValue++};
+        add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(*total)};
+        replacement.push_back(add);
+
+        ir::Instruction mod;
+        mod.kind = ir::InstructionKind::Binary;
+        mod.binaryOp = ir::BinaryOpcode::Mod;
+        mod.dst = ir::Value{function.nextValue++};
+        mod.operands = {ir::Operand::ref(add.dst), ir::Operand::imm(accumulation.modulus)};
+        replacement.push_back(mod);
+
+        ir::Instruction store;
+        store.kind = ir::InstructionKind::StoreLocal;
+        store.symbol = symbol;
+        store.operands = {ir::Operand::ref(mod.dst)};
+        replacement.push_back(store);
+    }
+
+    ir::Instruction inductionStore;
+    inductionStore.kind = ir::InstructionKind::StoreLocal;
+    inductionStore.symbol = induction;
+    inductionStore.operands = {ir::Operand::imm(static_cast<std::int32_t>(*start + static_cast<std::int64_t>(*step) * *trips))};
+    replacement.push_back(inductionStore);
+
+    ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+    mutableHeader.instructions = std::move(replacement);
+    mutableHeader.terminator = {};
+    mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
+    mutableHeader.terminator.trueBlock = exitIndex;
+    mutableHeader.hasTerminator = true;
+    return true;
+}
+
+struct PeriodicCondition {
+    ModuloTerm term;
+    ir::BinaryOpcode op = ir::BinaryOpcode::Equal;
+    std::int32_t rhs = 0;
+};
+
+std::optional<ir::BinaryOpcode> reverseComparison(ir::BinaryOpcode op)
+{
+    switch (op) {
+    case ir::BinaryOpcode::Equal:
+        return ir::BinaryOpcode::Equal;
+    case ir::BinaryOpcode::NotEqual:
+        return ir::BinaryOpcode::NotEqual;
+    case ir::BinaryOpcode::Less:
+        return ir::BinaryOpcode::Greater;
+    case ir::BinaryOpcode::LessEqual:
+        return ir::BinaryOpcode::GreaterEqual;
+    case ir::BinaryOpcode::Greater:
+        return ir::BinaryOpcode::Less;
+    case ir::BinaryOpcode::GreaterEqual:
+        return ir::BinaryOpcode::LessEqual;
+    default:
+        return std::nullopt;
+    }
+}
+
+bool evalComparison(ir::BinaryOpcode op, std::int32_t lhs, std::int32_t rhs)
+{
+    switch (op) {
+    case ir::BinaryOpcode::Equal:
+        return lhs == rhs;
+    case ir::BinaryOpcode::NotEqual:
+        return lhs != rhs;
+    case ir::BinaryOpcode::Less:
+        return lhs < rhs;
+    case ir::BinaryOpcode::LessEqual:
+        return lhs <= rhs;
+    case ir::BinaryOpcode::Greater:
+        return lhs > rhs;
+    case ir::BinaryOpcode::GreaterEqual:
+        return lhs >= rhs;
+    default:
+        return false;
+    }
+}
+
+std::optional<PeriodicCondition> analyzePeriodicCondition(
+    const ir::BasicBlock& block,
+    const ir::Operand& cond,
+    const std::string& induction)
+{
+    if (cond.isImmediate || cond.value.id < 0) {
+        return std::nullopt;
+    }
+
+    std::unordered_map<int, std::int32_t> constants;
+    std::unordered_map<int, PolyValue> polyValues;
+    std::unordered_map<int, ModuloTerm> moduloValues;
+    struct CompareDef { ir::BinaryOpcode op; ir::Operand lhs; ir::Operand rhs; };
+    std::unordered_map<int, CompareDef> compares;
+
+    for (const ir::Instruction& inst : block.instructions) {
+        switch (inst.kind) {
+        case ir::InstructionKind::Const:
+            if (inst.dst.id >= 0 && !inst.operands.empty() && inst.operands[0].isImmediate) {
+                constants[inst.dst.id] = inst.operands[0].immediate;
+                polyValues[inst.dst.id] = PolyValue{"", Poly{0, 0, inst.operands[0].immediate}};
+            }
+            break;
+        case ir::InstructionKind::LoadLocal:
+            if (inst.dst.id < 0) {
+                return std::nullopt;
+            }
+            if (inst.symbol != induction) {
+                return std::nullopt;
+            }
+            constants.erase(inst.dst.id);
+            polyValues[inst.dst.id] = PolyValue{"", Poly{0, 1, 0}};
+            break;
+        case ir::InstructionKind::Copy:
+            if (inst.dst.id < 0 || inst.operands.empty()) {
+                return std::nullopt;
+            }
+            constants.erase(inst.dst.id);
+            polyValues.erase(inst.dst.id);
+            moduloValues.erase(inst.dst.id);
+            if (const auto value = polyOf(inst.operands[0], constants, polyValues); value.has_value()) {
+                polyValues[inst.dst.id] = *value;
+                if (value->base.empty() && isConstant(value->poly)) {
+                    if (const auto constant = int32Value(value->poly.constant); constant.has_value()) {
+                        constants[inst.dst.id] = *constant;
+                    }
+                }
+            } else if (const auto value = moduloOf(inst.operands[0], moduloValues); value.has_value()) {
+                moduloValues[inst.dst.id] = *value;
+            } else {
+                return std::nullopt;
+            }
+            break;
+        case ir::InstructionKind::Binary:
+            if (inst.dst.id < 0 || inst.operands.size() != 2) {
+                return std::nullopt;
+            }
+            constants.erase(inst.dst.id);
+            polyValues.erase(inst.dst.id);
+            moduloValues.erase(inst.dst.id);
+            if (inst.binaryOp == ir::BinaryOpcode::Mod) {
+                const auto lhs = polyOf(inst.operands[0], constants, polyValues);
+                const auto rhs = constOf(inst.operands[1], constants);
+                if (!lhs.has_value() || !lhs->base.empty() || !rhs.has_value() || *rhs <= 0 || *rhs > 256) {
+                    return std::nullopt;
+                }
+                moduloValues[inst.dst.id] = ModuloTerm{lhs->poly, *rhs};
+                break;
+            }
+            if (inst.binaryOp == ir::BinaryOpcode::Equal
+                || inst.binaryOp == ir::BinaryOpcode::NotEqual
+                || inst.binaryOp == ir::BinaryOpcode::Less
+                || inst.binaryOp == ir::BinaryOpcode::LessEqual
+                || inst.binaryOp == ir::BinaryOpcode::Greater
+                || inst.binaryOp == ir::BinaryOpcode::GreaterEqual) {
+                compares[inst.dst.id] = CompareDef{inst.binaryOp, inst.operands[0], inst.operands[1]};
+                break;
+            }
+            if (const auto lhs = polyOf(inst.operands[0], constants, polyValues), rhs = polyOf(inst.operands[1], constants, polyValues);
+                lhs.has_value() && rhs.has_value()) {
+                if (const auto folded = evalPoly(inst.binaryOp, *lhs, *rhs); folded.has_value()) {
+                    polyValues[inst.dst.id] = *folded;
+                    if (folded->base.empty() && isConstant(folded->poly)) {
+                        if (const auto constant = int32Value(folded->poly.constant); constant.has_value()) {
+                            constants[inst.dst.id] = *constant;
+                        }
+                    }
+                    break;
+                }
+            }
+            return std::nullopt;
+        default:
+            return std::nullopt;
+        }
+    }
+
+    const auto found = compares.find(cond.value.id);
+    if (found == compares.end()) {
+        return std::nullopt;
+    }
+    const auto lhsMod = moduloOf(found->second.lhs, moduloValues);
+    const auto rhsConst = constOf(found->second.rhs, constants);
+    if (lhsMod.has_value() && rhsConst.has_value()) {
+        return PeriodicCondition{*lhsMod, found->second.op, *rhsConst};
+    }
+    const auto lhsConst = constOf(found->second.lhs, constants);
+    const auto rhsMod = moduloOf(found->second.rhs, moduloValues);
+    if (lhsConst.has_value() && rhsMod.has_value()) {
+        const auto reversed = reverseComparison(found->second.op);
+        if (!reversed.has_value()) {
+            return std::nullopt;
+        }
+        return PeriodicCondition{*rhsMod, *reversed, *lhsConst};
+    }
+    return std::nullopt;
+}
+
+std::optional<std::int32_t> closedFormPeriodicConditionSum(
+    const PeriodicCondition& condition,
+    const Poly& thenIncrement,
+    const Poly& elseIncrement,
+    std::int32_t start,
+    std::int32_t step,
+    int trips)
+{
+    if (condition.term.modulus <= 0 || condition.term.modulus > 256 || step <= 0 || trips < 0) {
+        return std::nullopt;
+    }
+
+    __int128 total = 0;
+    const int period = condition.term.modulus;
+    for (int residue = 0; residue < period; ++residue) {
+        if (residue >= trips) {
+            break;
+        }
+        const int count = ((trips - 1 - residue) / period) + 1;
+        const std::int32_t first = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(start) + static_cast<std::int64_t>(step) * residue);
+        const std::int32_t condValue = evalPolyInt32(condition.term.poly, first) % condition.term.modulus;
+        const Poly& selected = evalComparison(condition.op, condValue, condition.rhs) ? thenIncrement : elseIncrement;
+        const auto partial = closedFormSum(selected, first, step * period, count);
+        if (!partial.has_value()) {
+            return std::nullopt;
+        }
+        total += *partial;
+    }
+    return wrapInt32Wide(total);
+}
+
+bool tryPeriodicConditionalAccumulationLoop(ir::Function& function, int header)
+{
+    const int n = static_cast<int>(function.blocks.size());
+    if (header < 0 || header >= n) {
+        return false;
+    }
+    const ir::BasicBlock& H = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(H) || H.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const int ifIdx = H.terminator.trueBlock;
+    const int exitIdx = H.terminator.falseBlock;
+    if (ifIdx < 0 || ifIdx >= n || exitIdx < 0) {
+        return false;
+    }
+    const ir::BasicBlock& IF = function.blocks[static_cast<std::size_t>(ifIdx)];
+    if (IF.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    for (const ir::Instruction& inst : IF.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreLocal || inst.kind == ir::InstructionKind::StoreGlobal
+            || inst.kind == ir::InstructionKind::LoadGlobal || inst.kind == ir::InstructionKind::Call) {
+            return false;
+        }
+    }
+
+    const int thenIdx = IF.terminator.trueBlock;
+    const int elseIdx = IF.terminator.falseBlock;
+    if (thenIdx < 0 || elseIdx < 0 || thenIdx >= n || elseIdx >= n || thenIdx == elseIdx) {
+        return false;
+    }
+    const ir::BasicBlock& THEN = function.blocks[static_cast<std::size_t>(thenIdx)];
+    const ir::BasicBlock& ELSE = function.blocks[static_cast<std::size_t>(elseIdx)];
+    if (THEN.terminator.kind != ir::TerminatorKind::Jump || ELSE.terminator.kind != ir::TerminatorKind::Jump) {
+        return false;
+    }
+    const int latchIdx = THEN.terminator.trueBlock;
+    if (ELSE.terminator.trueBlock != latchIdx || latchIdx < 0 || latchIdx >= n) {
+        return false;
+    }
+    const ir::BasicBlock& LATCH = function.blocks[static_cast<std::size_t>(latchIdx)];
+    if (LATCH.terminator.kind != ir::TerminatorKind::Jump || LATCH.terminator.trueBlock != header) {
+        return false;
+    }
+
+    const auto hdr = analyzeCompare(H, H.terminator.condition);
+    if (!hdr.has_value()) {
+        return false;
+    }
+    const std::string induction = hdr->local;
+    const auto step = inductionStepInBody(LATCH, induction);
+    if (!step.has_value() || *step <= 0) {
+        return false;
+    }
+    for (const ir::Instruction& inst : LATCH.instructions) {
+        if (inst.kind == ir::InstructionKind::StoreGlobal || inst.kind == ir::InstructionKind::LoadGlobal || inst.kind == ir::InstructionKind::Call) {
+            return false;
+        }
+        if (inst.kind == ir::InstructionKind::StoreLocal && inst.symbol != induction) {
+            return false;
+        }
+    }
+    const auto start = initialLocalConst(function, header, induction);
+    if (!start.has_value()) {
+        return false;
+    }
+    const auto totalTrips = tripCount(hdr->op, *start, hdr->bound, *step);
+    if (!totalTrips.has_value()) {
+        return false;
+    }
+    const auto periodic = analyzePeriodicCondition(IF, IF.terminator.condition, induction);
+    if (!periodic.has_value()) {
+        return false;
+    }
+
+    std::string acc;
+    for (const ir::BasicBlock* b : {&THEN, &ELSE}) {
+        for (const ir::Instruction& inst : b->instructions) {
+            if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+                if (!acc.empty() && acc != inst.symbol) {
+                    return false;
+                }
+                acc = inst.symbol;
+            }
+        }
+    }
+    if (acc.empty() || acc == induction) {
+        return false;
+    }
+    const auto thenInc = branchAccIncrement(THEN, induction, acc);
+    const auto elseInc = branchAccIncrement(ELSE, induction, acc);
+    if (!thenInc.has_value() || !elseInc.has_value()) {
+        return false;
+    }
+    const auto incTotal = closedFormPeriodicConditionSum(*periodic, *thenInc, *elseInc, *start, *step, *totalTrips);
+    if (!incTotal.has_value()) {
+        return false;
+    }
+
+    std::vector<ir::Instruction> replacement;
+    ir::Instruction load;
+    load.kind = ir::InstructionKind::LoadLocal;
+    load.symbol = acc;
+    load.dst = ir::Value{function.nextValue++};
+    replacement.push_back(load);
+
+    ir::Instruction add;
+    add.kind = ir::InstructionKind::Binary;
+    add.binaryOp = ir::BinaryOpcode::Add;
+    add.dst = ir::Value{function.nextValue++};
+    add.operands = {ir::Operand::ref(load.dst), ir::Operand::imm(*incTotal)};
+    replacement.push_back(add);
+
+    ir::Instruction store;
+    store.kind = ir::InstructionKind::StoreLocal;
+    store.symbol = acc;
+    store.operands = {ir::Operand::ref(add.dst)};
+    replacement.push_back(store);
+
+    ir::Instruction indStore;
+    indStore.kind = ir::InstructionKind::StoreLocal;
+    indStore.symbol = induction;
+    indStore.operands = {ir::Operand::imm(static_cast<std::int32_t>(*start + static_cast<std::int64_t>(*step) * *totalTrips))};
+    replacement.push_back(indStore);
+
+    ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+    mutableHeader.instructions = std::move(replacement);
+    mutableHeader.terminator = {};
+    mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
+    mutableHeader.terminator.trueBlock = exitIdx;
+    mutableHeader.hasTerminator = true;
+    return true;
+}
+
 class LoopSumPass final : public Pass {
 public:
     std::string name() const override { return "loop-sum"; }
@@ -1613,7 +2357,10 @@ public:
         bool changed = false;
         for (ir::Function& function : module.functions) {
             for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
-                if (runOnLoop(function, i) || tryConditionalAccumulationLoop(function, i)) {
+                if (runOnLoop(function, i)
+                    || tryModuloAccumulationLoop(function, i)
+                    || tryPeriodicConditionalAccumulationLoop(function, i)
+                    || tryConditionalAccumulationLoop(function, i)) {
                     changed = true;
                 }
             }

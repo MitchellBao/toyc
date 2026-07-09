@@ -1003,6 +1003,58 @@ if ((Invoke-RiscVMain $p07QuadraticResult.Stdout 1000) -ne 64) {
     throw "opt_p07_quadratic_accumulator_stats returned unexpected value"
 }
 
+$p07ModuloQuadraticResult = Compile-OptSnippetWithStats "opt_p07_modulo_quadratic_accumulator_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        s = s + (i * i + 3 * i + 5) % 97;
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_modulo_quadratic_accumulator_stats" $p07ModuloQuadraticResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07ModuloQuadraticResult.Stdout 1000) -ne 227) {
+    throw "opt_p07_modulo_quadratic_accumulator_stats returned unexpected value"
+}
+
+$p07PeriodicConditionResult = Compile-OptSnippetWithStats "opt_p07_periodic_condition_accumulator_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        if (i % 7 == 3) {
+            s = s + i * i + 1;
+        } else {
+            s = s + 2 * i + 5;
+        }
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_periodic_condition_accumulator_stats" $p07PeriodicConditionResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07PeriodicConditionResult.Stdout 1000) -ne 212) {
+    throw "opt_p07_periodic_condition_accumulator_stats returned unexpected value"
+}
+
+$p07ModuloReducedAccumulatorResult = Compile-OptSnippetWithStats "opt_p07_modulo_reduced_accumulator_stats" @'
+int main() {
+    int i = 0;
+    int s = 0;
+    while (i < 1000) {
+        s = (s + i) % 65521;
+        i = i + 1;
+    }
+    return s % 256;
+}
+'@
+Assert-StatsContains "opt_p07_modulo_reduced_accumulator_stats" $p07ModuloReducedAccumulatorResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $p07ModuloReducedAccumulatorResult.Stdout 1000) -ne 149) {
+    throw "opt_p07_modulo_reduced_accumulator_stats returned unexpected value"
+}
+
 $p07CallInsideResult = Compile-OptSnippetWithStats "opt_p07_call_inside_loop_not_optimized_stats" @'
 int f(int x) {
     return x + 1;
@@ -1143,7 +1195,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumReloadBoundResult.Stdout) -ne 166) {
     throw "opt_loop_sum_dynamic_reload_bound_stats returned unexpected value"
 }
-Assert-StatsNotContains "opt_loop_sum_dynamic_reload_bound_stats" $dynamicLoopSumReloadBoundResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsContains "opt_loop_sum_dynamic_reload_bound_stats" $dynamicLoopSumReloadBoundResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumQuadraticResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_quadratic_stats" @'
 int limit = 23;
@@ -1161,7 +1213,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumQuadraticResult.Stdout) -ne 624) {
     throw "opt_loop_sum_dynamic_quadratic_stats returned unexpected value"
 }
-Assert-StatsNotContains "opt_loop_sum_dynamic_quadratic_stats" $dynamicLoopSumQuadraticResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsContains "opt_loop_sum_dynamic_quadratic_stats" $dynamicLoopSumQuadraticResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumNotEqualResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_not_equal_stats" @'
 int limit = 21;
@@ -1179,7 +1231,7 @@ int main() {
 if ((Invoke-RiscVMain $dynamicLoopSumNotEqualResult.Stdout) -ne 140) {
     throw "opt_loop_sum_dynamic_not_equal_stats returned unexpected value"
 }
-Assert-StatsNotContains "opt_loop_sum_dynamic_not_equal_stats" $dynamicLoopSumNotEqualResult.Stderr "pass=loop-sum changed=yes"
+Assert-StatsContains "opt_loop_sum_dynamic_not_equal_stats" $dynamicLoopSumNotEqualResult.Stderr "pass=loop-sum changed=yes"
 
 $dynamicLoopSumDescendingResult = Compile-OptSnippetWithStats "opt_loop_sum_dynamic_descending_stats" @'
 int floorSeed = 2;
