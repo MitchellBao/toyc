@@ -470,6 +470,47 @@ function Assert-StatsOccurrenceAtMost {
     }
 }
 
+function Invoke-GccExit {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [string]$OptLevel
+    )
+
+    $inputPath = Join-Path $Root "$Name.$OptLevel.gcc.c"
+    $exePath = Join-Path $Root "$Name.$OptLevel.gcc.exe"
+    Set-Content -LiteralPath $inputPath -Value $Source -Encoding ascii
+    & gcc "-$OptLevel" -x c $inputPath -o $exePath
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $inputPath
+        if (Test-Path -LiteralPath $exePath) {
+            Remove-Item -LiteralPath $exePath
+        }
+        throw "$Name gcc $OptLevel compilation failed"
+    }
+    & $exePath
+    $exitCode = $LASTEXITCODE -band 255
+    Remove-Item -LiteralPath $inputPath
+    Remove-Item -LiteralPath $exePath
+    return $exitCode
+}
+
+function Assert-P02FuzzerCase {
+    param(
+        [string]$Name,
+        [string]$Source,
+        [int]$MaxSteps = 2000
+    )
+
+    $result = Compile-OptSnippetWithStatsNoConstCallEval $Name $Source
+    $toy = Invoke-RiscVMain $result.Stdout $MaxSteps
+    $gccO0 = Invoke-GccExit $Name $Source "O0"
+    $gccO2 = Invoke-GccExit $Name $Source "O2"
+    if ($toy -ne $gccO0 -or $toy -ne $gccO2) {
+        throw "$Name mismatch: ToyC=$toy gcc-O0=$gccO0 gcc-O2=$gccO2"
+    }
+}
+
 function First-StatsLine {
     param(
         [string]$Stats,
@@ -916,6 +957,164 @@ int main() {
 if ((Invoke-RiscVMain $p02ReachableStoreGlobalResult.Stdout 100) -ne 1) {
     throw "opt_p02_reachable_store_global_kept_stats returned unexpected value"
 }
+
+$p02DeadHotLoopLocalResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_local_mod_stats" @'
+int main() {
+    int i = 0;
+    int acc = 0;
+    while (i < 1000000) {
+        acc = acc + (i * i) % 97;
+        i = i + 1;
+    }
+    return 7;
+}
+'@
+Assert-StatsContains "opt_p02_dead_hot_loop_local_mod_stats" $p02DeadHotLoopLocalResult.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $p02DeadHotLoopLocalResult.Stdout 200) -ne 7) {
+    throw "opt_p02_dead_hot_loop_local_mod_stats returned unexpected value"
+}
+
+$p02DeadHotLoopGlobalResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_global_store_stats" @'
+int g = 0;
+int main() {
+    int i = 0;
+    while (i < 1000000) {
+        g = (i * i) % 97;
+        i = i + 1;
+    }
+    return 7;
+}
+'@
+Assert-StatsContains "opt_p02_dead_hot_loop_global_store_stats" $p02DeadHotLoopGlobalResult.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $p02DeadHotLoopGlobalResult.Stdout 200) -ne 7) {
+    throw "opt_p02_dead_hot_loop_global_store_stats returned unexpected value"
+}
+
+$p02DeadHotLoopIfElseResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_if_else_stats" @'
+int main() {
+    int i = 0;
+    int dead = 0;
+    while (i < 1000000) {
+        if (i % 2) {
+            dead = dead + i * 3;
+        } else {
+            dead = dead + i * 5;
+        }
+        i = i + 1;
+    }
+    return 7;
+}
+'@
+Assert-StatsContains "opt_p02_dead_hot_loop_if_else_stats" $p02DeadHotLoopIfElseResult.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $p02DeadHotLoopIfElseResult.Stdout 200) -ne 7) {
+    throw "opt_p02_dead_hot_loop_if_else_stats returned unexpected value"
+}
+
+$p02DeadHotLoopMultiChainResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_multi_chain_stats" @'
+int main() {
+    int live = 9;
+    int i = 0;
+    int a = 0;
+    int b = 1;
+    while (i < 1000000) {
+        a = a + (i * i) % 97;
+        b = b * 3 + a;
+        i = i + 1;
+    }
+    return live;
+}
+'@
+Assert-StatsContains "opt_p02_dead_hot_loop_multi_chain_stats" $p02DeadHotLoopMultiChainResult.Stderr "pass=dce changed=yes"
+if ((Invoke-RiscVMain $p02DeadHotLoopMultiChainResult.Stdout 200) -ne 9) {
+    throw "opt_p02_dead_hot_loop_multi_chain_stats returned unexpected value"
+}
+
+$p02DeadHotLoopCleanupResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_cleanup_stats" @'
+int main() {
+    int bound = 1000000;
+    int i = 0;
+    int dead = bound - 1;
+    while (i < bound) {
+        dead = dead + i;
+        i = i + 1;
+    }
+    return 3;
+}
+'@
+Assert-StatsContains "opt_p02_dead_hot_loop_cleanup_stats" $p02DeadHotLoopCleanupResult.Stderr "pass=dce changed=yes"
+Assert-AssemblyNotContains "opt_p02_dead_hot_loop_cleanup_stats" $p02DeadHotLoopCleanupResult.Stdout "1000000"
+if ((Invoke-RiscVMain $p02DeadHotLoopCleanupResult.Stdout 200) -ne 3) {
+    throw "opt_p02_dead_hot_loop_cleanup_stats returned unexpected value"
+}
+
+Assert-P02FuzzerCase "p02_fuzzer_dead_local_mod" @'
+int main() {
+    int i = 0;
+    int acc = 0;
+    while (i < 1000000) {
+        acc = acc + (i * i) % 97;
+        i = i + 1;
+    }
+    return 7;
+}
+'@ 200
+
+Assert-P02FuzzerCase "p02_fuzzer_dead_global_store" @'
+int g = 0;
+int main() {
+    int i = 0;
+    while (i < 1000000) {
+        g = (i * 13 + 5) % 97;
+        i = i + 1;
+    }
+    return 11;
+}
+'@ 200
+
+Assert-P02FuzzerCase "p02_fuzzer_dead_if_else" @'
+int main() {
+    int i = 0;
+    int dead = 0;
+    while (i < 1000000) {
+        if (i % 3) {
+            dead = dead + i * 2;
+        } else {
+            dead = dead + i * 7;
+        }
+        i = i + 1;
+    }
+    return 13;
+}
+'@ 200
+
+Assert-P02FuzzerCase "p02_fuzzer_dead_multi_chain" @'
+int main() {
+    int live = 17;
+    int i = 0;
+    int a = 1;
+    int b = 2;
+    while (i < 1000000) {
+        a = a + (i * i) % 97;
+        b = b * 5 + a;
+        i = i + 1;
+    }
+    return live;
+}
+'@ 200
+
+Assert-P02FuzzerCase "p02_fuzzer_live_loop_kept" @'
+int main() {
+    int i = 0;
+    int live = 0;
+    while (i < 37) {
+        int dead1 = i * i;
+        int dead2 = dead1 % 97;
+        live = (live + i) % 256;
+        i = i + 1;
+    }
+    return live;
+}
+'@ 4000
 
 Assert-OptReturn "opt_loop_sum_closed_form" @'
 int main(){int i=0; int s=0; while(i<10){i=i+1; s=s+i;} return s;}
