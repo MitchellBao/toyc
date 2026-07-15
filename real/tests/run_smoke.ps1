@@ -1907,4 +1907,88 @@ if ((Invoke-RiscVMain $nestedModuloStrengthResult.Stdout) -ne 256) {
     throw "opt_nested_modulo_strength_stats returned unexpected value"
 }
 
+$invariantEmptyLoopBypassResult = Compile-OptSnippetWithStats "opt_invariant_empty_loop_bypass_stats" @'
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 10) {
+        int j = 0;
+        while (j < 20) {
+            if (i == 0) {
+                sum = sum + j;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+'@
+Assert-StatsContains "opt_invariant_empty_loop_bypass_stats" $invariantEmptyLoopBypassResult.Stderr "pass=loop-sum changed=yes"
+if ((Count-AssemblyOpcode $invariantEmptyLoopBypassResult.Stdout "blt") -gt 1) {
+    throw "opt_invariant_empty_loop_bypass_stats retained the bypassed inner loop"
+}
+if ((Invoke-RiscVMain $invariantEmptyLoopBypassResult.Stdout) -ne 190) {
+    throw "opt_invariant_empty_loop_bypass_stats returned unexpected value"
+}
+
+$guardedRuntimeModuloSumResult = Compile-OptSnippetWithStats "opt_guarded_runtime_modulo_sum_stats" @'
+int main() {
+    int i = 0;
+    int total = 0;
+    int diagonal = 0;
+    int origin = 0;
+    while (i < 4) {
+        int j = 0;
+        while (j < 4) {
+            int z = 0;
+            while (z < 7) {
+                int value = (i * j + z) % 7;
+                total = total + value;
+                if (i == j) {
+                    diagonal = diagonal + value;
+                }
+                if (i + j == 0) {
+                    origin = origin + value;
+                }
+                z = z + 1;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return total + diagonal + origin;
+}
+'@
+Assert-StatsContains "opt_guarded_runtime_modulo_sum_stats" $guardedRuntimeModuloSumResult.Stderr "pass=loop-sum changed=yes"
+if ((Count-AssemblyOpcode $guardedRuntimeModuloSumResult.Stdout "blt") -gt 2) {
+    throw "opt_guarded_runtime_modulo_sum_stats retained the summarized inner loop"
+}
+if ((Invoke-RiscVMain $guardedRuntimeModuloSumResult.Stdout) -ne 441) {
+    throw "opt_guarded_runtime_modulo_sum_stats returned unexpected value"
+}
+
+$signedRuntimeModuloSumResult = Compile-OptSnippetWithStats "opt_signed_runtime_modulo_sum_stats" @'
+int main() {
+    int total = 0;
+    int row = -2;
+    while (row < 1) {
+        int z = 0;
+        while (z < 7) {
+            total = total + ((row * 3 + z) % 7);
+            z = z + 1;
+        }
+        row = row + 1;
+    }
+    return total;
+}
+'@
+Assert-StatsContains "opt_signed_runtime_modulo_sum_stats" $signedRuntimeModuloSumResult.Stderr "pass=loop-sum changed=yes"
+if ((Count-AssemblyOpcode $signedRuntimeModuloSumResult.Stdout "blt") -gt 1) {
+    throw "opt_signed_runtime_modulo_sum_stats retained the summarized inner loop"
+}
+if ((Invoke-RiscVMain $signedRuntimeModuloSumResult.Stdout) -ne 0) {
+    throw "opt_signed_runtime_modulo_sum_stats returned unexpected value"
+}
+
 Write-Host "ToyC smoke tests passed"

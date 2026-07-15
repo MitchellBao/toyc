@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -1466,6 +1467,160 @@ std::unordered_set<int> collectLoopBlocks(const analysis::Cfg& cfg, int header, 
     return loop;
 }
 
+bool localMayBeReadBeforeWrite(
+    const ir::Function& function,
+    const analysis::Cfg& cfg,
+    int startBlock,
+    const std::string& symbol)
+{
+    if (startBlock < 0 || startBlock >= static_cast<int>(function.blocks.size())) {
+        return true;
+    }
+    std::vector<int> worklist{startBlock};
+    std::unordered_set<int> visited;
+    while (!worklist.empty()) {
+        const int blockIndex = worklist.back();
+        worklist.pop_back();
+        if (!visited.insert(blockIndex).second) {
+            continue;
+        }
+        bool overwritten = false;
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+            if (inst.kind == ir::InstructionKind::LoadLocal && inst.symbol == symbol) {
+                return true;
+            }
+            if (inst.kind == ir::InstructionKind::StoreLocal && inst.symbol == symbol) {
+                overwritten = true;
+                break;
+            }
+        }
+        if (overwritten) {
+            continue;
+        }
+        for (int succ : cfg.successors[static_cast<std::size_t>(blockIndex)]) {
+            if (succ >= 0 && succ < static_cast<int>(function.blocks.size())) {
+                worklist.push_back(succ);
+            }
+        }
+    }
+    return false;
+}
+
+bool isPureInductionLatch(const ir::BasicBlock& block, const std::string& induction)
+{
+    if (!inductionStepInBody(block, induction).has_value()) {
+        return false;
+    }
+    for (const ir::Instruction& inst : block.instructions) {
+        switch (inst.kind) {
+        case ir::InstructionKind::Const:
+        case ir::InstructionKind::Copy:
+        case ir::InstructionKind::LoadLocal:
+        case ir::InstructionKind::Unary:
+        case ir::InstructionKind::Binary:
+            break;
+        case ir::InstructionKind::StoreLocal:
+            if (inst.symbol != induction) {
+                return false;
+            }
+            break;
+        case ir::InstructionKind::LoadGlobal:
+        case ir::InstructionKind::StoreGlobal:
+        case ir::InstructionKind::Call:
+            return false;
+        }
+    }
+    return true;
+}
+
+bool tryInvariantEmptyLoopBypass(ir::Function& function, int header)
+{
+    if (header < 0 || header >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+    const ir::BasicBlock& headerBlock = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(headerBlock) || headerBlock.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const auto compare = analyzeCompare(headerBlock, headerBlock.terminator.condition);
+    if (!compare.has_value()) {
+        return false;
+    }
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<int> outsidePreds;
+    std::vector<int> backedges;
+    for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
+        if (pred < 0 || pred >= static_cast<int>(function.blocks.size())) {
+            return false;
+        }
+        if (inductionStepInBody(function.blocks[static_cast<std::size_t>(pred)], compare->local).has_value()) {
+            backedges.push_back(pred);
+        } else {
+            outsidePreds.push_back(pred);
+        }
+    }
+    if (outsidePreds.size() != 1 || backedges.size() != 1) {
+        return false;
+    }
+    const int preheader = outsidePreds.front();
+    const int backedge = backedges.front();
+    const int guardIndex = headerBlock.terminator.trueBlock;
+    const int exitIndex = headerBlock.terminator.falseBlock;
+    if (guardIndex < 0 || guardIndex >= static_cast<int>(function.blocks.size()) || exitIndex < 0
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.trueBlock != header
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.trueBlock != header
+        || !isPureInductionLatch(function.blocks[static_cast<std::size_t>(backedge)], compare->local)
+        || localMayBeReadBeforeWrite(function, cfg, exitIndex, compare->local)) {
+        return false;
+    }
+
+    const std::unordered_set<int> loop = collectLoopBlocks(cfg, header, backedge);
+    const ir::BasicBlock& guard = function.blocks[static_cast<std::size_t>(guardIndex)];
+    if (guard.terminator.kind != ir::TerminatorKind::Branch
+        || guard.terminator.condition.isImmediate
+        || guard.terminator.condition.value.id < 0) {
+        return false;
+    }
+    std::unordered_set<int> loopValues;
+    for (int blockIndex : loop) {
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+            if (inst.dst.id >= 0) {
+                loopValues.insert(inst.dst.id);
+            }
+        }
+    }
+    if (loopValues.find(guard.terminator.condition.value.id) != loopValues.end()) {
+        return false;
+    }
+
+    const bool falseIsEmpty = guard.terminator.falseBlock == backedge;
+    const bool trueIsEmpty = guard.terminator.trueBlock == backedge;
+    if (falseIsEmpty == trueIsEmpty) {
+        return false;
+    }
+    const int activeBlock = falseIsEmpty ? guard.terminator.trueBlock : guard.terminator.falseBlock;
+    if (activeBlock < 0 || activeBlock >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+
+    ir::Terminator& preheaderTerm = function.blocks[static_cast<std::size_t>(preheader)].terminator;
+    preheaderTerm = {};
+    preheaderTerm.kind = ir::TerminatorKind::Branch;
+    preheaderTerm.condition = guard.terminator.condition;
+    preheaderTerm.trueBlock = falseIsEmpty ? header : exitIndex;
+    preheaderTerm.falseBlock = falseIsEmpty ? exitIndex : header;
+
+    ir::Terminator& guardTerm = function.blocks[static_cast<std::size_t>(guardIndex)].terminator;
+    guardTerm = {};
+    guardTerm.kind = ir::TerminatorKind::Jump;
+    guardTerm.trueBlock = activeBlock;
+    function.blocks[static_cast<std::size_t>(guardIndex)].hasTerminator = true;
+    return true;
+}
+
 std::optional<RuntimeLinearExpr> runtimeLinearOf(
     const ir::Operand& operand,
     const std::string& induction,
@@ -1727,6 +1882,655 @@ bool tryModuloStrengthReduction(ir::Function& function, int header)
     stateStore.symbol = state;
     stateStore.operands = {wrapped};
     backedgeBlock.instructions.push_back(stateStore);
+    return true;
+}
+
+struct AccumulationStore {
+    int block = -1;
+    std::string symbol;
+    ir::Operand increment;
+};
+
+struct GuardedAccumulation {
+    int guardBlock = -1;
+    int updateBlock = -1;
+    int joinBlock = -1;
+    bool activeOnTrue = true;
+    std::string symbol;
+    ir::Operand condition;
+};
+
+ir::Operand resolvedOperand(
+    ir::Operand operand,
+    const std::unordered_map<int, ir::Operand>& copies)
+{
+    return resolveCopy(operand, copies).value_or(operand);
+}
+
+std::optional<AccumulationStore> accumulationStoreOfInstruction(
+    const ir::Instruction& inst,
+    int blockIndex,
+    const std::unordered_map<int, ir::Operand>& copies,
+    const std::unordered_map<int, std::string>& loadedLocals,
+    const std::unordered_map<int, BinaryDef>& binaryDefs)
+{
+    if (inst.kind != ir::InstructionKind::StoreLocal || inst.symbol.empty() || inst.operands.empty()) {
+        return std::nullopt;
+    }
+    const ir::Operand stored = resolvedOperand(inst.operands[0], copies);
+    if (stored.isImmediate || stored.value.id < 0) {
+        return std::nullopt;
+    }
+    const auto binary = binaryDefs.find(stored.value.id);
+    if (binary == binaryDefs.end() || binary->second.op != ir::BinaryOpcode::Add) {
+        return std::nullopt;
+    }
+    const ir::Operand lhs = resolvedOperand(binary->second.lhs, copies);
+    const ir::Operand rhs = resolvedOperand(binary->second.rhs, copies);
+    auto isSelfLoad = [&](const ir::Operand& operand) {
+        if (operand.isImmediate || operand.value.id < 0) {
+            return false;
+        }
+        const auto found = loadedLocals.find(operand.value.id);
+        return found != loadedLocals.end() && found->second == inst.symbol;
+    };
+    if (isSelfLoad(lhs) == isSelfLoad(rhs)) {
+        return std::nullopt;
+    }
+    return AccumulationStore{blockIndex, inst.symbol, isSelfLoad(lhs) ? rhs : lhs};
+}
+
+std::optional<AccumulationStore> accumulationStoreInBlock(
+    const ir::BasicBlock& block,
+    int blockIndex,
+    const std::unordered_map<int, ir::Operand>& copies,
+    const std::unordered_map<int, std::string>& loadedLocals,
+    const std::unordered_map<int, BinaryDef>& binaryDefs)
+{
+    std::optional<AccumulationStore> result;
+    for (const ir::Instruction& inst : block.instructions) {
+        if (inst.kind != ir::InstructionKind::StoreLocal) {
+            continue;
+        }
+        if (result.has_value()) {
+            return std::nullopt;
+        }
+        result = accumulationStoreOfInstruction(inst, blockIndex, copies, loadedLocals, binaryDefs);
+        if (!result.has_value()) {
+            return std::nullopt;
+        }
+    }
+    return result;
+}
+
+bool blockHasOnlyPureLocalAccumulation(
+    const ir::BasicBlock& block,
+    const std::string& symbol)
+{
+    int stores = 0;
+    for (const ir::Instruction& inst : block.instructions) {
+        switch (inst.kind) {
+        case ir::InstructionKind::Const:
+        case ir::InstructionKind::Copy:
+        case ir::InstructionKind::LoadLocal:
+        case ir::InstructionKind::Unary:
+        case ir::InstructionKind::Binary:
+            break;
+        case ir::InstructionKind::StoreLocal:
+            if (inst.symbol != symbol || ++stores != 1) {
+                return false;
+            }
+            break;
+        case ir::InstructionKind::LoadGlobal:
+        case ir::InstructionKind::StoreGlobal:
+        case ir::InstructionKind::Call:
+            return false;
+        }
+    }
+    return stores == 1;
+}
+
+bool trySinkInvariantGuardedAccumulations(ir::Function& function, int header)
+{
+    if (header < 0 || header >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+    const ir::BasicBlock& headerBlock = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(headerBlock) || headerBlock.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const auto compare = analyzeCompare(headerBlock, headerBlock.terminator.condition);
+    if (!compare.has_value()) {
+        return false;
+    }
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<int> outsidePreds;
+    std::vector<int> backedges;
+    for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
+        if (pred < 0 || pred >= static_cast<int>(function.blocks.size())) {
+            return false;
+        }
+        if (inductionStepInBody(function.blocks[static_cast<std::size_t>(pred)], compare->local).has_value()) {
+            backedges.push_back(pred);
+        } else {
+            outsidePreds.push_back(pred);
+        }
+    }
+    if (outsidePreds.size() != 1 || backedges.size() != 1) {
+        return false;
+    }
+    const int preheader = outsidePreds.front();
+    const int backedge = backedges.front();
+    const int bodyEntry = headerBlock.terminator.trueBlock;
+    const int exitIndex = headerBlock.terminator.falseBlock;
+    if (bodyEntry < 0 || bodyEntry >= static_cast<int>(function.blocks.size()) || exitIndex < 0
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.trueBlock != header
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.trueBlock != header
+        || !isPureInductionLatch(function.blocks[static_cast<std::size_t>(backedge)], compare->local)) {
+        return false;
+    }
+
+    const std::unordered_set<int> loop = collectLoopBlocks(cfg, header, backedge);
+    std::unordered_set<int> loopValues;
+    std::unordered_map<int, ir::Operand> copies;
+    std::unordered_map<int, std::string> loadedLocals;
+    std::unordered_map<int, BinaryDef> binaryDefs;
+    for (int blockIndex : loop) {
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+            if (inst.dst.id >= 0) {
+                loopValues.insert(inst.dst.id);
+            }
+            if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
+                copies[inst.dst.id] = inst.operands[0];
+            } else if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+                loadedLocals[inst.dst.id] = inst.symbol;
+            } else if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+                binaryDefs[inst.dst.id] = BinaryDef{inst.binaryOp, inst.operands[0], inst.operands[1]};
+            }
+        }
+    }
+
+    const auto primary = accumulationStoreInBlock(
+        function.blocks[static_cast<std::size_t>(bodyEntry)],
+        bodyEntry,
+        copies,
+        loadedLocals,
+        binaryDefs);
+    if (!primary.has_value() || primary->symbol == compare->local) {
+        return false;
+    }
+
+    std::vector<GuardedAccumulation> guards;
+    std::unordered_set<std::string> secondarySymbols;
+    int current = bodyEntry;
+    std::unordered_set<int> visitedChain;
+    while (current != backedge && visitedChain.insert(current).second) {
+        const ir::BasicBlock& guard = function.blocks[static_cast<std::size_t>(current)];
+        if (guard.terminator.kind == ir::TerminatorKind::Jump) {
+            current = guard.terminator.trueBlock;
+            continue;
+        }
+        if (guard.terminator.kind != ir::TerminatorKind::Branch
+            || guard.terminator.condition.isImmediate
+            || guard.terminator.condition.value.id < 0
+            || loopValues.find(guard.terminator.condition.value.id) != loopValues.end()) {
+            return false;
+        }
+
+        std::optional<GuardedAccumulation> matched;
+        for (bool activeOnTrue : {true, false}) {
+            const int updateIndex = activeOnTrue ? guard.terminator.trueBlock : guard.terminator.falseBlock;
+            const int joinIndex = activeOnTrue ? guard.terminator.falseBlock : guard.terminator.trueBlock;
+            if (updateIndex < 0 || updateIndex >= static_cast<int>(function.blocks.size())
+                || joinIndex < 0 || joinIndex >= static_cast<int>(function.blocks.size())) {
+                continue;
+            }
+            const ir::BasicBlock& update = function.blocks[static_cast<std::size_t>(updateIndex)];
+            if (update.terminator.kind != ir::TerminatorKind::Jump || update.terminator.trueBlock != joinIndex) {
+                continue;
+            }
+            const auto accumulation = accumulationStoreInBlock(update, updateIndex, copies, loadedLocals, binaryDefs);
+            if (!accumulation.has_value()
+                || accumulation->symbol == primary->symbol
+                || !sameOperand(accumulation->increment, primary->increment)
+                || !blockHasOnlyPureLocalAccumulation(update, accumulation->symbol)
+                || !secondarySymbols.insert(accumulation->symbol).second) {
+                continue;
+            }
+            matched = GuardedAccumulation{
+                current,
+                updateIndex,
+                joinIndex,
+                activeOnTrue,
+                accumulation->symbol,
+                guard.terminator.condition};
+            break;
+        }
+        if (!matched.has_value()) {
+            return false;
+        }
+        guards.push_back(*matched);
+        current = matched->joinBlock;
+    }
+    if (guards.empty() || current != backedge) {
+        return false;
+    }
+    for (const GuardedAccumulation& guarded : guards) {
+        for (int blockIndex : loop) {
+            if (blockIndex == guarded.updateBlock) {
+                continue;
+            }
+            for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+                if ((inst.kind == ir::InstructionKind::LoadLocal || inst.kind == ir::InstructionKind::StoreLocal)
+                    && inst.symbol == guarded.symbol) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    const std::string snapshot = ".guard.sum.start." + std::to_string(function.nextValue);
+    const std::string deltaLocal = ".guard.sum.delta." + std::to_string(function.nextValue);
+    ir::Instruction beforeLoad;
+    beforeLoad.kind = ir::InstructionKind::LoadLocal;
+    beforeLoad.symbol = primary->symbol;
+    beforeLoad.dst = ir::Value{function.nextValue++};
+    function.blocks[static_cast<std::size_t>(preheader)].instructions.push_back(beforeLoad);
+    ir::Instruction beforeStore;
+    beforeStore.kind = ir::InstructionKind::StoreLocal;
+    beforeStore.symbol = snapshot;
+    beforeStore.operands = {ir::Operand::ref(beforeLoad.dst)};
+    function.blocks[static_cast<std::size_t>(preheader)].instructions.push_back(beforeStore);
+
+    const int deltaBlockIndex = static_cast<int>(function.blocks.size());
+    std::vector<ir::BasicBlock> appended;
+    ir::BasicBlock deltaBlock;
+    deltaBlock.label = ".guard.sum.delta." + std::to_string(function.nextValue);
+    ir::Instruction afterLoad;
+    afterLoad.kind = ir::InstructionKind::LoadLocal;
+    afterLoad.symbol = primary->symbol;
+    afterLoad.dst = ir::Value{function.nextValue++};
+    deltaBlock.instructions.push_back(afterLoad);
+    ir::Instruction snapshotLoad;
+    snapshotLoad.kind = ir::InstructionKind::LoadLocal;
+    snapshotLoad.symbol = snapshot;
+    snapshotLoad.dst = ir::Value{function.nextValue++};
+    deltaBlock.instructions.push_back(snapshotLoad);
+    ir::Instruction delta;
+    delta.kind = ir::InstructionKind::Binary;
+    delta.binaryOp = ir::BinaryOpcode::Sub;
+    delta.dst = ir::Value{function.nextValue++};
+    delta.operands = {ir::Operand::ref(afterLoad.dst), ir::Operand::ref(snapshotLoad.dst)};
+    deltaBlock.instructions.push_back(delta);
+    ir::Instruction deltaStore;
+    deltaStore.kind = ir::InstructionKind::StoreLocal;
+    deltaStore.symbol = deltaLocal;
+    deltaStore.operands = {ir::Operand::ref(delta.dst)};
+    deltaBlock.instructions.push_back(deltaStore);
+    deltaBlock.terminator.kind = ir::TerminatorKind::Jump;
+    deltaBlock.terminator.trueBlock = deltaBlockIndex + 1;
+    deltaBlock.hasTerminator = true;
+    appended.push_back(std::move(deltaBlock));
+
+    for (std::size_t i = 0; i < guards.size(); ++i) {
+        const int checkIndex = deltaBlockIndex + 1 + static_cast<int>(i) * 2;
+        const int updateIndex = checkIndex + 1;
+        const int nextIndex = i + 1 == guards.size() ? exitIndex : checkIndex + 2;
+
+        ir::BasicBlock check;
+        check.label = ".guard.sum.check." + std::to_string(function.nextValue) + "." + std::to_string(i);
+        check.terminator.kind = ir::TerminatorKind::Branch;
+        check.terminator.condition = guards[i].condition;
+        check.terminator.trueBlock = guards[i].activeOnTrue ? updateIndex : nextIndex;
+        check.terminator.falseBlock = guards[i].activeOnTrue ? nextIndex : updateIndex;
+        check.hasTerminator = true;
+        appended.push_back(std::move(check));
+
+        ir::BasicBlock update;
+        update.label = ".guard.sum.update." + std::to_string(function.nextValue) + "." + std::to_string(i);
+        ir::Instruction accumulatorLoad;
+        accumulatorLoad.kind = ir::InstructionKind::LoadLocal;
+        accumulatorLoad.symbol = guards[i].symbol;
+        accumulatorLoad.dst = ir::Value{function.nextValue++};
+        update.instructions.push_back(accumulatorLoad);
+        ir::Instruction movedDeltaLoad;
+        movedDeltaLoad.kind = ir::InstructionKind::LoadLocal;
+        movedDeltaLoad.symbol = deltaLocal;
+        movedDeltaLoad.dst = ir::Value{function.nextValue++};
+        update.instructions.push_back(movedDeltaLoad);
+        ir::Instruction add;
+        add.kind = ir::InstructionKind::Binary;
+        add.binaryOp = ir::BinaryOpcode::Add;
+        add.dst = ir::Value{function.nextValue++};
+        add.operands = {ir::Operand::ref(accumulatorLoad.dst), ir::Operand::ref(movedDeltaLoad.dst)};
+        update.instructions.push_back(add);
+        ir::Instruction store;
+        store.kind = ir::InstructionKind::StoreLocal;
+        store.symbol = guards[i].symbol;
+        store.operands = {ir::Operand::ref(add.dst)};
+        update.instructions.push_back(store);
+        update.terminator.kind = ir::TerminatorKind::Jump;
+        update.terminator.trueBlock = nextIndex;
+        update.hasTerminator = true;
+        appended.push_back(std::move(update));
+    }
+
+    function.blocks.insert(
+        function.blocks.end(),
+        std::make_move_iterator(appended.begin()),
+        std::make_move_iterator(appended.end()));
+    function.blocks[static_cast<std::size_t>(header)].terminator.falseBlock = deltaBlockIndex;
+    for (const GuardedAccumulation& guard : guards) {
+        ir::Terminator& term = function.blocks[static_cast<std::size_t>(guard.guardBlock)].terminator;
+        term = {};
+        term.kind = ir::TerminatorKind::Jump;
+        term.trueBlock = guard.joinBlock;
+        function.blocks[static_cast<std::size_t>(guard.guardBlock)].hasTerminator = true;
+    }
+    return true;
+}
+
+std::int32_t closedRuntimeResidueSum(
+    std::int32_t initial,
+    std::int32_t delta,
+    std::int32_t modulus,
+    int trips)
+{
+    std::unordered_map<std::int32_t, int> seen;
+    std::vector<std::int32_t> states;
+    std::vector<std::int64_t> prefix{0};
+    std::int32_t current = initial;
+    while (static_cast<int>(states.size()) < trips && seen.find(current) == seen.end()) {
+        seen[current] = static_cast<int>(states.size());
+        states.push_back(current);
+        prefix.push_back(prefix.back() + current);
+        current = static_cast<std::int32_t>(current + delta);
+        if (current >= modulus) {
+            current = static_cast<std::int32_t>(current - modulus);
+        }
+    }
+    if (trips <= static_cast<int>(states.size())) {
+        return wrapInt32(prefix[static_cast<std::size_t>(trips)]);
+    }
+
+    const int cycleStart = seen[current];
+    const int cycleLength = static_cast<int>(states.size()) - cycleStart;
+    const std::int64_t cycleSum = prefix.back() - prefix[static_cast<std::size_t>(cycleStart)];
+    const int remaining = trips - cycleStart;
+    const int fullCycles = remaining / cycleLength;
+    const int tail = remaining % cycleLength;
+    const __int128 total =
+        static_cast<__int128>(prefix[static_cast<std::size_t>(cycleStart)])
+        + static_cast<__int128>(fullCycles) * cycleSum
+        + prefix[static_cast<std::size_t>(cycleStart + tail)]
+        - prefix[static_cast<std::size_t>(cycleStart)];
+    return wrapInt32Wide(total);
+}
+
+bool tryRuntimeModuloSumLoop(ir::Function& function, int header)
+{
+    if (header < 0 || header >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+    const ir::BasicBlock& headerBlock = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(headerBlock) || headerBlock.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const int bodyIndex = headerBlock.terminator.trueBlock;
+    const int exitIndex = headerBlock.terminator.falseBlock;
+    if (bodyIndex < 0 || bodyIndex >= static_cast<int>(function.blocks.size()) || exitIndex < 0) {
+        return false;
+    }
+    const ir::BasicBlock& body = function.blocks[static_cast<std::size_t>(bodyIndex)];
+    if (body.terminator.kind != ir::TerminatorKind::Jump || body.terminator.trueBlock != header) {
+        return false;
+    }
+    for (const ir::Instruction& inst : body.instructions) {
+        if (!isSafeBodyInstruction(inst)) {
+            return false;
+        }
+    }
+
+    const auto compare = analyzeCompare(headerBlock, headerBlock.terminator.condition);
+    if (!compare.has_value()) {
+        return false;
+    }
+    const auto start = initialLocalConst(function, header, compare->local);
+    const auto step = inductionStepInBody(body, compare->local);
+    if (!start.has_value() || !step.has_value() || *step <= 0) {
+        return false;
+    }
+    const auto trips = tripCount(compare->op, *start, compare->bound, *step);
+    if (!trips.has_value() || *trips <= 0) {
+        return false;
+    }
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<int> outsidePreds;
+    for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
+        if (pred != bodyIndex) {
+            outsidePreds.push_back(pred);
+        }
+    }
+    if (outsidePreds.size() != 1) {
+        return false;
+    }
+    const int preheader = outsidePreds.front();
+    if (preheader < 0 || preheader >= static_cast<int>(function.blocks.size())
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.trueBlock != header) {
+        return false;
+    }
+
+    std::unordered_set<int> loopValues;
+    std::unordered_map<int, const ir::Instruction*> definitions;
+    std::unordered_map<int, ir::Operand> copies;
+    std::unordered_map<int, std::string> loadedLocals;
+    std::unordered_map<int, BinaryDef> binaryDefs;
+    for (int blockIndex : {header, bodyIndex}) {
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+            if (inst.dst.id >= 0) {
+                loopValues.insert(inst.dst.id);
+                definitions[inst.dst.id] = &inst;
+            }
+            if (inst.kind == ir::InstructionKind::Copy && inst.dst.id >= 0 && !inst.operands.empty()) {
+                copies[inst.dst.id] = inst.operands[0];
+            } else if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0) {
+                loadedLocals[inst.dst.id] = inst.symbol;
+            } else if (inst.kind == ir::InstructionKind::Binary && inst.dst.id >= 0 && inst.operands.size() == 2) {
+                binaryDefs[inst.dst.id] = BinaryDef{inst.binaryOp, inst.operands[0], inst.operands[1]};
+            }
+        }
+    }
+
+    const ir::Instruction* moduloInstruction = nullptr;
+    RuntimeLinearExpr expression;
+    std::int32_t modulus = 0;
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind != ir::InstructionKind::Binary
+            || inst.binaryOp != ir::BinaryOpcode::Mod
+            || inst.dst.id < 0
+            || inst.operands.size() != 2
+            || !inst.operands[1].isImmediate
+            || inst.operands[1].immediate <= 1
+            || inst.operands[1].immediate > 16) {
+            continue;
+        }
+        const auto linear = runtimeLinearOf(inst.operands[0], compare->local, loopValues, definitions);
+        if (!linear.has_value() || !linear->invariantBase.has_value() || linear->inductionCoeff <= 0) {
+            continue;
+        }
+        const __int128 runtimeDelta = static_cast<__int128>(linear->inductionCoeff) * *step;
+        if (runtimeDelta <= 0 || runtimeDelta >= inst.operands[1].immediate
+            || linear->inductionCoeff > INT32_MAX
+            || linear->constant < INT32_MIN || linear->constant > INT32_MAX) {
+            continue;
+        }
+        if (moduloInstruction != nullptr) {
+            return false;
+        }
+        moduloInstruction = &inst;
+        expression = *linear;
+        modulus = inst.operands[1].immediate;
+    }
+    if (moduloInstruction == nullptr) {
+        return false;
+    }
+
+    std::optional<AccumulationStore> accumulation;
+    for (const ir::Instruction& inst : body.instructions) {
+        if (inst.kind != ir::InstructionKind::StoreLocal) {
+            continue;
+        }
+        if (inst.symbol == compare->local) {
+            continue;
+        }
+        const auto parsed = accumulationStoreOfInstruction(inst, bodyIndex, copies, loadedLocals, binaryDefs);
+        if (!parsed.has_value()
+            || !sameOperand(parsed->increment, ir::Operand::ref(moduloInstruction->dst))
+            || accumulation.has_value()) {
+            return false;
+        }
+        accumulation = parsed;
+    }
+    if (!accumulation.has_value()) {
+        return false;
+    }
+
+    auto& preheaderInstructions = function.blocks[static_cast<std::size_t>(preheader)].instructions;
+    ir::Instruction inductionLoad;
+    inductionLoad.kind = ir::InstructionKind::LoadLocal;
+    inductionLoad.symbol = compare->local;
+    inductionLoad.dst = ir::Value{function.nextValue++};
+    preheaderInstructions.push_back(inductionLoad);
+    ir::Operand initial = *expression.invariantBase;
+    ir::Operand inductionValue = ir::Operand::ref(inductionLoad.dst);
+    if (expression.inductionCoeff != 1) {
+        inductionValue = appendBinary(
+            function,
+            preheaderInstructions,
+            ir::BinaryOpcode::Mul,
+            inductionValue,
+            ir::Operand::imm(static_cast<std::int32_t>(expression.inductionCoeff)));
+    }
+    initial = appendBinary(function, preheaderInstructions, ir::BinaryOpcode::Add, initial, inductionValue);
+    if (expression.constant != 0) {
+        initial = appendBinary(
+            function,
+            preheaderInstructions,
+            ir::BinaryOpcode::Add,
+            initial,
+            ir::Operand::imm(static_cast<std::int32_t>(expression.constant)));
+    }
+    initial = appendBinary(function, preheaderInstructions, ir::BinaryOpcode::Mod, initial, ir::Operand::imm(modulus));
+
+    std::vector<std::int32_t> residues;
+    for (std::int32_t residue = 0; residue < modulus; ++residue) {
+        residues.push_back(residue);
+    }
+    for (std::int32_t residue = -1; residue > -modulus; --residue) {
+        residues.push_back(residue);
+    }
+    const std::int32_t runtimeDelta = static_cast<std::int32_t>(expression.inductionCoeff * *step);
+    std::vector<std::int32_t> totals;
+    totals.reserve(residues.size());
+    for (std::int32_t residue : residues) {
+        totals.push_back(closedRuntimeResidueSum(residue, runtimeDelta, modulus, *trips));
+    }
+
+    const std::string totalLocal = ".runtime.mod.sum." + std::to_string(function.nextValue);
+    const int firstCaseBlock = static_cast<int>(function.blocks.size());
+    const int lastCase = static_cast<int>(residues.size()) - 1;
+    std::vector<ir::BasicBlock> appended;
+    appended.reserve(static_cast<std::size_t>(lastCase * 2 + 1));
+    for (int i = 0; i < lastCase; ++i) {
+        const int checkIndex = firstCaseBlock + i * 2;
+        const int storeIndex = checkIndex + 1;
+        const int nextIndex = firstCaseBlock + (i + 1) * 2;
+
+        ir::BasicBlock check;
+        check.label = ".runtime.mod.check." + std::to_string(function.nextValue) + "." + std::to_string(i);
+        const ir::Operand equal = appendBinary(
+            function,
+            check.instructions,
+            ir::BinaryOpcode::Equal,
+            initial,
+            ir::Operand::imm(residues[static_cast<std::size_t>(i)]));
+        check.terminator.kind = ir::TerminatorKind::Branch;
+        check.terminator.condition = equal;
+        check.terminator.trueBlock = storeIndex;
+        check.terminator.falseBlock = nextIndex;
+        check.hasTerminator = true;
+        appended.push_back(std::move(check));
+
+        ir::BasicBlock store;
+        store.label = ".runtime.mod.store." + std::to_string(function.nextValue) + "." + std::to_string(i);
+        ir::Instruction valueStore;
+        valueStore.kind = ir::InstructionKind::StoreLocal;
+        valueStore.symbol = totalLocal;
+        valueStore.operands = {ir::Operand::imm(totals[static_cast<std::size_t>(i)])};
+        store.instructions.push_back(valueStore);
+        store.terminator.kind = ir::TerminatorKind::Jump;
+        store.terminator.trueBlock = header;
+        store.hasTerminator = true;
+        appended.push_back(std::move(store));
+    }
+    ir::BasicBlock defaultStore;
+    defaultStore.label = ".runtime.mod.default." + std::to_string(function.nextValue);
+    ir::Instruction defaultValueStore;
+    defaultValueStore.kind = ir::InstructionKind::StoreLocal;
+    defaultValueStore.symbol = totalLocal;
+    defaultValueStore.operands = {ir::Operand::imm(totals.back())};
+    defaultStore.instructions.push_back(defaultValueStore);
+    defaultStore.terminator.kind = ir::TerminatorKind::Jump;
+    defaultStore.terminator.trueBlock = header;
+    defaultStore.hasTerminator = true;
+    appended.push_back(std::move(defaultStore));
+
+    function.blocks.insert(
+        function.blocks.end(),
+        std::make_move_iterator(appended.begin()),
+        std::make_move_iterator(appended.end()));
+    function.blocks[static_cast<std::size_t>(preheader)].terminator.trueBlock = firstCaseBlock;
+
+    std::vector<ir::Instruction> replacement;
+    ir::Instruction accumulatorLoad;
+    accumulatorLoad.kind = ir::InstructionKind::LoadLocal;
+    accumulatorLoad.symbol = accumulation->symbol;
+    accumulatorLoad.dst = ir::Value{function.nextValue++};
+    replacement.push_back(accumulatorLoad);
+    ir::Instruction totalLoad;
+    totalLoad.kind = ir::InstructionKind::LoadLocal;
+    totalLoad.symbol = totalLocal;
+    totalLoad.dst = ir::Value{function.nextValue++};
+    replacement.push_back(totalLoad);
+    ir::Instruction add;
+    add.kind = ir::InstructionKind::Binary;
+    add.binaryOp = ir::BinaryOpcode::Add;
+    add.dst = ir::Value{function.nextValue++};
+    add.operands = {ir::Operand::ref(accumulatorLoad.dst), ir::Operand::ref(totalLoad.dst)};
+    replacement.push_back(add);
+    ir::Instruction store;
+    store.kind = ir::InstructionKind::StoreLocal;
+    store.symbol = accumulation->symbol;
+    store.operands = {ir::Operand::ref(add.dst)};
+    replacement.push_back(store);
+    ir::Instruction inductionStore;
+    inductionStore.kind = ir::InstructionKind::StoreLocal;
+    inductionStore.symbol = compare->local;
+    inductionStore.operands = {ir::Operand::imm(static_cast<std::int32_t>(
+        static_cast<std::int64_t>(*start) + static_cast<std::int64_t>(*step) * *trips))};
+    replacement.push_back(inductionStore);
+
+    ir::BasicBlock& mutableHeader = function.blocks[static_cast<std::size_t>(header)];
+    mutableHeader.instructions = std::move(replacement);
+    mutableHeader.terminator = {};
+    mutableHeader.terminator.kind = ir::TerminatorKind::Jump;
+    mutableHeader.terminator.trueBlock = exitIndex;
+    mutableHeader.hasTerminator = true;
     return true;
 }
 
@@ -2707,7 +3511,10 @@ public:
         bool changed = false;
         for (ir::Function& function : module.functions) {
             for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
-                if (tryModuloStrengthReduction(function, i)
+                if (trySinkInvariantGuardedAccumulations(function, i)
+                    || tryInvariantEmptyLoopBypass(function, i)
+                    || tryRuntimeModuloSumLoop(function, i)
+                    || tryModuloStrengthReduction(function, i)
                     || runOnLoop(function, i)
                     || tryModuloAccumulationLoop(function, i)
                     || tryPeriodicConditionalAccumulationLoop(function, i)
