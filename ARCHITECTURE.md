@@ -166,6 +166,10 @@ the bottom of the caller frame.
    optimization.
 4. The verifier runs before and after the pass pipeline.
 5. Backend peephole optimizations must be mechanical and local.
+6. Optimization passes must not interpret or JIT the program, execute `main`,
+   or replace it with a precomputed result obtained by stepping through its
+   control flow. Constant results must come from static IR analysis and
+   semantics-preserving transformations.
 
 ## Current Performance Baseline
 

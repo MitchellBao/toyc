@@ -1,7 +1,6 @@
 #include "pass_manager.h"
 
 #include <cstddef>
-#include <cstdlib>
 #include <memory>
 #include <ostream>
 #include <utility>
@@ -41,12 +40,6 @@ void printStatsLine(std::ostream& out, const std::string& passName, const IrStat
         << " ir_inst=" << before.instructions << "->" << after.instructions
         << " terminators=" << before.terminators << "->" << after.terminators
         << '\n';
-}
-
-bool constCallEvalDisabled()
-{
-    const char* value = std::getenv("TOYC_DISABLE_CONST_CALL_EVAL");
-    return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
 // Runs a group of sub-passes repeatedly until a full round makes no change, up
@@ -127,7 +120,6 @@ bool PassManager::run(ir::Module& module)
 PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsOut)
 {
     PassManager manager(collectStats, statsOut);
-    const bool disableConstCallEval = constCallEvalDisabled();
     manager.add(createCanonicalizePass());
     manager.add(createSimplifyCfgPass());
     if (optimize) {
@@ -164,12 +156,6 @@ PassManager buildPipeline(bool optimize, bool collectStats, std::ostream* statsO
         };
 
         manager.add(makeCoreGroup("opt-converge"));
-        // const-call-eval can collapse a now-pure function/loop to a constant;
-        // run it once, then converge again so the constant propagates and the
-        // remaining dead code / CFG is cleaned up.
-        if (!disableConstCallEval) {
-            manager.add(createConstCallEvalPass());
-        }
         manager.add(makeCoreGroup("opt-converge-post"));
         manager.add(createDeadFunctionElimPass());
         manager.add(createSimplifyCfgPass());

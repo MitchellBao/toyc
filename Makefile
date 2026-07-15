@@ -19,7 +19,6 @@ SOURCES := \
 	real/src/passes/canonicalize.cpp \
 	real/src/passes/simplify_cfg.cpp \
 	real/src/passes/const_prop.cpp \
-	real/src/passes/const_call_eval.cpp \
 	real/src/passes/global_const_prop.cpp \
 	real/src/passes/global_copy_prop.cpp \
 	real/src/passes/global_cse.cpp \

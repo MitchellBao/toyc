@@ -11,8 +11,7 @@ function Invoke-Compiler {
         [string]$Name,
         [string]$Source,
         [switch]$Optimize,
-        [switch]$Stats,
-        [switch]$DisableConstCallEval
+        [switch]$Stats
     )
 
     $mode = if ($Optimize) { "opt" } else { "plain" }
@@ -33,9 +32,6 @@ function Invoke-Compiler {
     $psi.FileName = $env:ComSpec
     $psi.Arguments = "/d /s /c `"$cmdLine`""
     $psi.UseShellExecute = $false
-    if ($DisableConstCallEval) {
-        $psi.Environment["TOYC_DISABLE_CONST_CALL_EVAL"] = "1"
-    }
     $process = [System.Diagnostics.Process]::Start($psi)
     $process.WaitForExit()
 
@@ -375,19 +371,6 @@ function Compile-OptSnippetWithStats {
     return $result
 }
 
-function Compile-OptSnippetWithStatsNoConstCallEval {
-    param(
-        [string]$Name,
-        [string]$Source
-    )
-
-    $result = Invoke-Compiler $Name $Source -Optimize -Stats -DisableConstCallEval
-    if ($result.ExitCode -ne 0) {
-        throw "$Name compilation failed: $($result.Stderr)"
-    }
-    return $result
-}
-
 function Assert-StatsContains {
     param(
         [string]$Name,
@@ -502,7 +485,7 @@ function Assert-P02FuzzerCase {
         [int]$MaxSteps = 2000
     )
 
-    $result = Compile-OptSnippetWithStatsNoConstCallEval $Name $Source
+    $result = Compile-OptSnippetWithStats $Name $Source
     $toy = Invoke-RiscVMain $result.Stdout $MaxSteps
     $gccO0 = Invoke-GccExit $Name $Source "O0"
     $gccO2 = Invoke-GccExit $Name $Source "O2"
@@ -672,7 +655,26 @@ int choose(){ return 1; }
 int main(){int x=0; if(choose()){x=5;} else {x=5;} return x+1;}
 '@ 6
 
-$targetAlgebraChain = Compile-OptSnippetWithStatsNoConstCallEval "target_algebra_chain_stats" @'
+$noWholeProgramEval = Compile-OptSnippetWithStats "opt_no_whole_program_eval" @'
+int main() {
+    int i = 0;
+    int x = 2;
+    while (i < 1000) {
+        x = (x * x + 3) % 10007;
+        i = i + 1;
+    }
+    return x;
+}
+'@
+Assert-StatsNotContains "opt_no_whole_program_eval" $noWholeProgramEval.Stderr "const-call-eval"
+if (-not $noWholeProgramEval.Stdout.Contains("mul ") -or -not $noWholeProgramEval.Stdout.Contains("j .L_main_")) {
+    throw "opt_no_whole_program_eval collapsed main instead of preserving runtime computation"
+}
+if ((Invoke-RiscVMain $noWholeProgramEval.Stdout) -ne 4896) {
+    throw "opt_no_whole_program_eval returned unexpected value"
+}
+
+$targetAlgebraChain = Compile-OptSnippetWithStats "target_algebra_chain_stats" @'
 int main() {
     int x = 9;
     int a = x + 0;
@@ -693,7 +695,7 @@ if ((Invoke-RiscVMain $targetAlgebraChain.Stdout 100) -ne 9) {
     throw "target_algebra_chain_stats returned unexpected value"
 }
 
-$targetCopyChain = Compile-OptSnippetWithStatsNoConstCallEval "target_copy_chain_stats" @'
+$targetCopyChain = Compile-OptSnippetWithStats "target_copy_chain_stats" @'
 int id(int x) {
     return x;
 }
@@ -711,7 +713,7 @@ if ((Invoke-RiscVMain $targetCopyChain.Stdout 1000) -ne 42) {
     throw "target_copy_chain_stats returned unexpected value"
 }
 
-$targetCopyCoalesceExpr = Compile-OptSnippetWithStatsNoConstCallEval "target_copy_coalesce_expr_stats" @'
+$targetCopyCoalesceExpr = Compile-OptSnippetWithStats "target_copy_coalesce_expr_stats" @'
 int id(int x) {
     return x;
 }
@@ -729,7 +731,7 @@ if ((Invoke-RiscVMain $targetCopyCoalesceExpr.Stdout 1000) -ne 16) {
     throw "target_copy_coalesce_expr_stats returned unexpected value"
 }
 
-$targetLocalCse = Compile-OptSnippetWithStatsNoConstCallEval "target_local_cse_basic_stats" @'
+$targetLocalCse = Compile-OptSnippetWithStats "target_local_cse_basic_stats" @'
 int id(int x) {
     return x;
 }
@@ -751,7 +753,7 @@ if ((Invoke-RiscVMain $targetLocalCse.Stdout 1000) -ne 141) {
     throw "target_local_cse_basic_stats returned unexpected value"
 }
 
-$targetCseKill = Compile-OptSnippetWithStatsNoConstCallEval "target_cse_kill_case_stats" @'
+$targetCseKill = Compile-OptSnippetWithStats "target_cse_kill_case_stats" @'
 int id(int x) {
     return x;
 }
@@ -768,7 +770,7 @@ if ((Invoke-RiscVMain $targetCseKill.Stdout 1000) -ne 18) {
     throw "target_cse_kill_case_stats returned unexpected value"
 }
 
-$targetCseCallBarrier = Compile-OptSnippetWithStatsNoConstCallEval "target_cse_call_barrier_stats" @'
+$targetCseCallBarrier = Compile-OptSnippetWithStats "target_cse_call_barrier_stats" @'
 int g = 0;
 int bump(int x) {
     if (x < 0) {
@@ -789,7 +791,7 @@ if ((Invoke-RiscVMain $targetCseCallBarrier.Stdout 2000) -ne 30) {
     throw "target_cse_call_barrier_stats returned unexpected value"
 }
 
-$targetTailRecursion = Compile-OptSnippetWithStatsNoConstCallEval "target_tail_recursion_simple_stats" @'
+$targetTailRecursion = Compile-OptSnippetWithStats "target_tail_recursion_simple_stats" @'
 int sum(int n, int acc) {
     if (n == 0) {
         return acc;
@@ -958,7 +960,7 @@ if ((Invoke-RiscVMain $p02ReachableStoreGlobalResult.Stdout 100) -ne 1) {
     throw "opt_p02_reachable_store_global_kept_stats returned unexpected value"
 }
 
-$p02DeadHotLoopLocalResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_local_mod_stats" @'
+$p02DeadHotLoopLocalResult = Compile-OptSnippetWithStats "opt_p02_dead_hot_loop_local_mod_stats" @'
 int main() {
     int i = 0;
     int acc = 0;
@@ -974,7 +976,7 @@ if ((Invoke-RiscVMain $p02DeadHotLoopLocalResult.Stdout 200) -ne 7) {
     throw "opt_p02_dead_hot_loop_local_mod_stats returned unexpected value"
 }
 
-$p02DeadHotLoopGlobalResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_global_store_stats" @'
+$p02DeadHotLoopGlobalResult = Compile-OptSnippetWithStats "opt_p02_dead_hot_loop_global_store_stats" @'
 int g = 0;
 int main() {
     int i = 0;
@@ -990,7 +992,7 @@ if ((Invoke-RiscVMain $p02DeadHotLoopGlobalResult.Stdout 200) -ne 7) {
     throw "opt_p02_dead_hot_loop_global_store_stats returned unexpected value"
 }
 
-$p02DeadHotLoopIfElseResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_if_else_stats" @'
+$p02DeadHotLoopIfElseResult = Compile-OptSnippetWithStats "opt_p02_dead_hot_loop_if_else_stats" @'
 int main() {
     int i = 0;
     int dead = 0;
@@ -1010,7 +1012,7 @@ if ((Invoke-RiscVMain $p02DeadHotLoopIfElseResult.Stdout 200) -ne 7) {
     throw "opt_p02_dead_hot_loop_if_else_stats returned unexpected value"
 }
 
-$p02DeadHotLoopMultiChainResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_multi_chain_stats" @'
+$p02DeadHotLoopMultiChainResult = Compile-OptSnippetWithStats "opt_p02_dead_hot_loop_multi_chain_stats" @'
 int main() {
     int live = 9;
     int i = 0;
@@ -1029,7 +1031,7 @@ if ((Invoke-RiscVMain $p02DeadHotLoopMultiChainResult.Stdout 200) -ne 9) {
     throw "opt_p02_dead_hot_loop_multi_chain_stats returned unexpected value"
 }
 
-$p02DeadHotLoopCleanupResult = Compile-OptSnippetWithStatsNoConstCallEval "opt_p02_dead_hot_loop_cleanup_stats" @'
+$p02DeadHotLoopCleanupResult = Compile-OptSnippetWithStats "opt_p02_dead_hot_loop_cleanup_stats" @'
 int main() {
     int bound = 1000000;
     int i = 0;
@@ -1549,8 +1551,6 @@ if ((Invoke-RiscVMain $globalCseResult.Stdout) -ne 27) {
 
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-copy-prop" 3
 Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=global-cse" 2
-Assert-StatsOccurrenceAtMost "opt_global_cse_across_blocks_stats" $globalCseResult.Stderr "pass=const-call-eval" 2
-
 $inlineResult = Compile-OptSnippetWithStats "opt_iterative_inline_chain_stats" @'
 int seed = 5;
 int one(int x) { return x + 1; }
