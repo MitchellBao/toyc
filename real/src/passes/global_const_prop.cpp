@@ -2,6 +2,7 @@
 
 #include "analysis/cfg.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -260,6 +261,153 @@ bool runOnFunction(ir::Function& function)
     return changed;
 }
 
+struct ImmutableLocalConstant {
+    std::int32_t value = 0;
+    std::size_t storeIndex = 0;
+};
+
+bool replaceImmutableLocalLoads(ir::Function& function)
+{
+    if (function.blocks.empty()) {
+        return false;
+    }
+
+    std::unordered_map<std::string, int> storeCounts;
+    for (const ir::BasicBlock& block : function.blocks) {
+        for (const ir::Instruction& inst : block.instructions) {
+            if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+                ++storeCounts[inst.symbol];
+            }
+        }
+    }
+
+    ConstMap entryConstants;
+    std::unordered_map<std::string, ImmutableLocalConstant> immutable;
+    const ir::BasicBlock& entry = function.blocks.front();
+    for (std::size_t i = 0; i < entry.instructions.size(); ++i) {
+        const ir::Instruction& inst = entry.instructions[i];
+        if (inst.kind == ir::InstructionKind::StoreLocal
+            && !inst.symbol.empty()
+            && !inst.operands.empty()
+            && storeCounts[inst.symbol] == 1) {
+            if (const auto value = knownOperand(inst.operands[0], entryConstants); value.has_value()) {
+                immutable[inst.symbol] = ImmutableLocalConstant{*value, i};
+            }
+        }
+        transferInstruction(entryConstants, inst);
+    }
+    if (immutable.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (std::size_t blockIndex = 0; blockIndex < function.blocks.size(); ++blockIndex) {
+        ir::BasicBlock& block = function.blocks[blockIndex];
+        for (std::size_t instIndex = 0; instIndex < block.instructions.size(); ++instIndex) {
+            ir::Instruction& inst = block.instructions[instIndex];
+            if (inst.kind != ir::InstructionKind::LoadLocal || inst.dst.id < 0 || inst.symbol.empty()) {
+                continue;
+            }
+            const auto found = immutable.find(inst.symbol);
+            if (found == immutable.end()
+                || (blockIndex == 0 && instIndex <= found->second.storeIndex)) {
+                continue;
+            }
+            inst.kind = ir::InstructionKind::Const;
+            inst.operands = {ir::Operand::imm(found->second.value)};
+            inst.symbol.clear();
+            inst.hasSideEffect = false;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+using LocalConstMap = std::unordered_map<std::string, std::int32_t>;
+
+LocalConstMap intersectLocalConstants(const LocalConstMap& lhs, const LocalConstMap& rhs)
+{
+    LocalConstMap result = lhs;
+    for (auto iter = result.begin(); iter != result.end();) {
+        const auto found = rhs.find(iter->first);
+        if (found == rhs.end() || found->second != iter->second) {
+            iter = result.erase(iter);
+        } else {
+            ++iter;
+        }
+    }
+    return result;
+}
+
+void transferLocalConstants(LocalConstMap& locals, const ir::BasicBlock& block)
+{
+    for (const ir::Instruction& inst : block.instructions) {
+        if (inst.kind != ir::InstructionKind::StoreLocal || inst.symbol.empty()) {
+            continue;
+        }
+        if (!inst.operands.empty() && inst.operands[0].isImmediate) {
+            locals[inst.symbol] = inst.operands[0].immediate;
+        } else {
+            locals.erase(inst.symbol);
+        }
+    }
+}
+
+bool replaceConstantLocalLoads(ir::Function& function)
+{
+    if (function.blocks.empty()) {
+        return false;
+    }
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<LocalConstMap> in(function.blocks.size());
+    std::vector<LocalConstMap> out(function.blocks.size());
+    bool dataChanged = true;
+    for (int iteration = 0; dataChanged && iteration < 64; ++iteration) {
+        dataChanged = false;
+        for (int b = 0; b < static_cast<int>(function.blocks.size()); ++b) {
+            LocalConstMap nextIn;
+            const auto& preds = cfg.predecessors[static_cast<std::size_t>(b)];
+            if (b != 0 && !preds.empty()) {
+                nextIn = out[static_cast<std::size_t>(preds.front())];
+                for (std::size_t i = 1; i < preds.size(); ++i) {
+                    nextIn = intersectLocalConstants(nextIn, out[static_cast<std::size_t>(preds[i])]);
+                }
+            }
+            LocalConstMap nextOut = nextIn;
+            transferLocalConstants(nextOut, function.blocks[static_cast<std::size_t>(b)]);
+            if (nextIn != in[static_cast<std::size_t>(b)] || nextOut != out[static_cast<std::size_t>(b)]) {
+                in[static_cast<std::size_t>(b)] = std::move(nextIn);
+                out[static_cast<std::size_t>(b)] = std::move(nextOut);
+                dataChanged = true;
+            }
+        }
+    }
+
+    bool changed = false;
+    for (std::size_t b = 0; b < function.blocks.size(); ++b) {
+        LocalConstMap locals = in[b];
+        for (ir::Instruction& inst : function.blocks[b].instructions) {
+            if (inst.kind == ir::InstructionKind::LoadLocal && inst.dst.id >= 0 && !inst.symbol.empty()) {
+                if (const auto found = locals.find(inst.symbol); found != locals.end()) {
+                    inst.kind = ir::InstructionKind::Const;
+                    inst.operands = {ir::Operand::imm(found->second)};
+                    inst.symbol.clear();
+                    inst.hasSideEffect = false;
+                    changed = true;
+                }
+            } else if (inst.kind == ir::InstructionKind::StoreLocal && !inst.symbol.empty()) {
+                if (!inst.operands.empty() && inst.operands[0].isImmediate) {
+                    locals[inst.symbol] = inst.operands[0].immediate;
+                } else {
+                    locals.erase(inst.symbol);
+                }
+            }
+        }
+    }
+    return changed;
+}
+
 std::unordered_map<std::string, std::int32_t> readOnlyGlobalInitials(const ir::Module& module)
 {
     std::unordered_set<std::string> storedGlobals;
@@ -318,7 +466,9 @@ public:
     {
         bool changed = replaceReadOnlyGlobalLoads(module);
         for (ir::Function& function : module.functions) {
+            changed = replaceImmutableLocalLoads(function) || changed;
             changed = runOnFunction(function) || changed;
+            changed = replaceConstantLocalLoads(function) || changed;
         }
         return changed;
     }

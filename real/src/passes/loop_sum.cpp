@@ -1,5 +1,7 @@
 #include "pass_manager.h"
 
+#include "analysis/cfg.h"
+
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -1380,6 +1382,354 @@ std::optional<CompareInfo> analyzeCompare(const ir::BasicBlock& block, const ir:
     return std::nullopt;
 }
 
+struct RuntimeLinearExpr {
+    std::optional<ir::Operand> invariantBase;
+    std::int64_t inductionCoeff = 0;
+    std::int64_t constant = 0;
+};
+
+bool sameOperand(const ir::Operand& lhs, const ir::Operand& rhs)
+{
+    if (lhs.isImmediate != rhs.isImmediate) {
+        return false;
+    }
+    return lhs.isImmediate ? lhs.immediate == rhs.immediate : lhs.value.id == rhs.value.id;
+}
+
+std::optional<RuntimeLinearExpr> combineRuntimeLinear(
+    const RuntimeLinearExpr& lhs,
+    const RuntimeLinearExpr& rhs,
+    bool subtract)
+{
+    RuntimeLinearExpr result;
+    if (lhs.invariantBase.has_value() && rhs.invariantBase.has_value()) {
+        if (!sameOperand(*lhs.invariantBase, *rhs.invariantBase)) {
+            return std::nullopt;
+        }
+        if (!subtract) {
+            return std::nullopt;
+        }
+    } else if (lhs.invariantBase.has_value()) {
+        result.invariantBase = lhs.invariantBase;
+    } else if (rhs.invariantBase.has_value()) {
+        if (subtract) {
+            return std::nullopt;
+        }
+        result.invariantBase = rhs.invariantBase;
+    }
+
+    const __int128 coeff = static_cast<__int128>(lhs.inductionCoeff)
+        + (subtract ? -static_cast<__int128>(rhs.inductionCoeff) : static_cast<__int128>(rhs.inductionCoeff));
+    const __int128 constant = static_cast<__int128>(lhs.constant)
+        + (subtract ? -static_cast<__int128>(rhs.constant) : static_cast<__int128>(rhs.constant));
+    if (coeff < INT64_MIN || coeff > INT64_MAX || constant < INT64_MIN || constant > INT64_MAX) {
+        return std::nullopt;
+    }
+    result.inductionCoeff = static_cast<std::int64_t>(coeff);
+    result.constant = static_cast<std::int64_t>(constant);
+    return result;
+}
+
+std::optional<RuntimeLinearExpr> scaleRuntimeLinear(const RuntimeLinearExpr& value, std::int64_t factor)
+{
+    if (value.invariantBase.has_value() && factor != 1) {
+        return std::nullopt;
+    }
+    const __int128 coeff = static_cast<__int128>(value.inductionCoeff) * factor;
+    const __int128 constant = static_cast<__int128>(value.constant) * factor;
+    if (coeff < INT64_MIN || coeff > INT64_MAX || constant < INT64_MIN || constant > INT64_MAX) {
+        return std::nullopt;
+    }
+    return RuntimeLinearExpr{
+        value.invariantBase,
+        static_cast<std::int64_t>(coeff),
+        static_cast<std::int64_t>(constant)};
+}
+
+std::unordered_set<int> collectLoopBlocks(const analysis::Cfg& cfg, int header, int backedge)
+{
+    std::unordered_set<int> loop{header, backedge};
+    std::vector<int> worklist{backedge};
+    while (!worklist.empty()) {
+        const int block = worklist.back();
+        worklist.pop_back();
+        for (int pred : cfg.predecessors[static_cast<std::size_t>(block)]) {
+            if (pred < 0 || loop.find(pred) != loop.end()) {
+                continue;
+            }
+            loop.insert(pred);
+            if (pred != header) {
+                worklist.push_back(pred);
+            }
+        }
+    }
+    return loop;
+}
+
+std::optional<RuntimeLinearExpr> runtimeLinearOf(
+    const ir::Operand& operand,
+    const std::string& induction,
+    const std::unordered_set<int>& loopValues,
+    const std::unordered_map<int, const ir::Instruction*>& definitions,
+    int depth = 0)
+{
+    if (depth > 16) {
+        return std::nullopt;
+    }
+    if (operand.isImmediate) {
+        return RuntimeLinearExpr{std::nullopt, 0, operand.immediate};
+    }
+    if (operand.value.id < 0) {
+        return std::nullopt;
+    }
+    if (loopValues.find(operand.value.id) == loopValues.end()) {
+        return RuntimeLinearExpr{operand, 0, 0};
+    }
+    const auto found = definitions.find(operand.value.id);
+    if (found == definitions.end()) {
+        return std::nullopt;
+    }
+    const ir::Instruction& inst = *found->second;
+    if (inst.kind == ir::InstructionKind::Const && inst.operands.size() == 1 && inst.operands[0].isImmediate) {
+        return RuntimeLinearExpr{std::nullopt, 0, inst.operands[0].immediate};
+    }
+    if (inst.kind == ir::InstructionKind::LoadLocal && inst.symbol == induction) {
+        return RuntimeLinearExpr{std::nullopt, 1, 0};
+    }
+    if (inst.kind == ir::InstructionKind::Copy && inst.operands.size() == 1) {
+        return runtimeLinearOf(inst.operands[0], induction, loopValues, definitions, depth + 1);
+    }
+    if (inst.kind != ir::InstructionKind::Binary || inst.operands.size() != 2) {
+        return std::nullopt;
+    }
+    const auto lhs = runtimeLinearOf(inst.operands[0], induction, loopValues, definitions, depth + 1);
+    const auto rhs = runtimeLinearOf(inst.operands[1], induction, loopValues, definitions, depth + 1);
+    if (!lhs.has_value() || !rhs.has_value()) {
+        return std::nullopt;
+    }
+    if (inst.binaryOp == ir::BinaryOpcode::Add || inst.binaryOp == ir::BinaryOpcode::Sub) {
+        return combineRuntimeLinear(*lhs, *rhs, inst.binaryOp == ir::BinaryOpcode::Sub);
+    }
+    if (inst.binaryOp == ir::BinaryOpcode::Mul) {
+        const bool lhsConstant = !lhs->invariantBase.has_value() && lhs->inductionCoeff == 0;
+        const bool rhsConstant = !rhs->invariantBase.has_value() && rhs->inductionCoeff == 0;
+        if (lhsConstant) {
+            return scaleRuntimeLinear(*rhs, lhs->constant);
+        }
+        if (rhsConstant) {
+            return scaleRuntimeLinear(*lhs, rhs->constant);
+        }
+    }
+    return std::nullopt;
+}
+
+ir::Operand appendBinary(
+    ir::Function& function,
+    std::vector<ir::Instruction>& instructions,
+    ir::BinaryOpcode op,
+    ir::Operand lhs,
+    ir::Operand rhs)
+{
+    ir::Instruction inst;
+    inst.kind = ir::InstructionKind::Binary;
+    inst.binaryOp = op;
+    inst.dst = ir::Value{function.nextValue++};
+    inst.operands = {lhs, rhs};
+    instructions.push_back(inst);
+    return ir::Operand::ref(inst.dst);
+}
+
+bool tryModuloStrengthReduction(ir::Function& function, int header)
+{
+    if (header < 0 || header >= static_cast<int>(function.blocks.size())) {
+        return false;
+    }
+    const ir::BasicBlock& headerBlock = function.blocks[static_cast<std::size_t>(header)];
+    if (!isWhileCond(headerBlock) || headerBlock.terminator.kind != ir::TerminatorKind::Branch) {
+        return false;
+    }
+    const auto compare = analyzeCompare(headerBlock, headerBlock.terminator.condition);
+    if (!compare.has_value()) {
+        return false;
+    }
+
+    const analysis::Cfg cfg = analysis::buildCfg(function);
+    std::vector<int> outsidePreds;
+    std::vector<int> backedges;
+    std::optional<std::int32_t> inductionStep;
+    for (int pred : cfg.predecessors[static_cast<std::size_t>(header)]) {
+        if (pred < 0 || pred >= static_cast<int>(function.blocks.size())) {
+            return false;
+        }
+        const auto predStep = inductionStepInBody(
+            function.blocks[static_cast<std::size_t>(pred)],
+            compare->local);
+        if (predStep.has_value()) {
+            backedges.push_back(pred);
+            inductionStep = predStep;
+        } else {
+            outsidePreds.push_back(pred);
+        }
+    }
+    if (outsidePreds.size() != 1 || backedges.size() != 1
+        || !inductionStep.has_value() || *inductionStep <= 0) {
+        return false;
+    }
+    const int preheader = outsidePreds.front();
+    const int backedge = backedges.front();
+    if (function.blocks[static_cast<std::size_t>(preheader)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(preheader)].terminator.trueBlock != header
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.kind != ir::TerminatorKind::Jump
+        || function.blocks[static_cast<std::size_t>(backedge)].terminator.trueBlock != header) {
+        return false;
+    }
+    const std::unordered_set<int> loop = collectLoopBlocks(cfg, header, backedge);
+    std::unordered_set<int> loopValues;
+    std::unordered_map<int, const ir::Instruction*> definitions;
+    for (int blockIndex : loop) {
+        for (const ir::Instruction& inst : function.blocks[static_cast<std::size_t>(blockIndex)].instructions) {
+            if (inst.dst.id >= 0) {
+                loopValues.insert(inst.dst.id);
+                definitions[inst.dst.id] = &inst;
+            }
+        }
+    }
+
+    int candidateBlock = -1;
+    int candidateIndex = -1;
+    std::int32_t modulus = 0;
+    RuntimeLinearExpr expression;
+    for (int blockIndex : loop) {
+        const ir::BasicBlock& block = function.blocks[static_cast<std::size_t>(blockIndex)];
+        for (int i = 0; i < static_cast<int>(block.instructions.size()); ++i) {
+            const ir::Instruction& inst = block.instructions[static_cast<std::size_t>(i)];
+            if (inst.kind != ir::InstructionKind::Binary
+                || inst.binaryOp != ir::BinaryOpcode::Mod
+                || inst.dst.id < 0
+                || inst.operands.size() != 2
+                || !inst.operands[1].isImmediate
+                || inst.operands[1].immediate <= 1
+                || inst.operands[1].immediate > 256) {
+                continue;
+            }
+            const auto linear = runtimeLinearOf(inst.operands[0], compare->local, loopValues, definitions);
+            if (!linear.has_value() || !linear->invariantBase.has_value() || linear->inductionCoeff <= 0) {
+                continue;
+            }
+            if (blockIndex == backedge) {
+                bool inductionAlreadyAdvanced = false;
+                for (int prior = 0; prior < i; ++prior) {
+                    const ir::Instruction& priorInst = block.instructions[static_cast<std::size_t>(prior)];
+                    if (priorInst.kind == ir::InstructionKind::StoreLocal
+                        && priorInst.symbol == compare->local) {
+                        inductionAlreadyAdvanced = true;
+                        break;
+                    }
+                }
+                if (inductionAlreadyAdvanced) {
+                    continue;
+                }
+            }
+            const __int128 delta = static_cast<__int128>(linear->inductionCoeff) * *inductionStep;
+            if (delta <= 0 || delta >= inst.operands[1].immediate
+                || linear->inductionCoeff > INT32_MAX
+                || linear->constant < INT32_MIN || linear->constant > INT32_MAX) {
+                continue;
+            }
+            candidateBlock = blockIndex;
+            candidateIndex = i;
+            modulus = inst.operands[1].immediate;
+            expression = *linear;
+            break;
+        }
+        if (candidateBlock >= 0) {
+            break;
+        }
+    }
+    if (candidateBlock < 0) {
+        return false;
+    }
+
+    const std::string state = ".mod.strength." + std::to_string(function.nextValue);
+    auto& preheaderInstructions = function.blocks[static_cast<std::size_t>(preheader)].instructions;
+    ir::Instruction inductionLoad;
+    inductionLoad.kind = ir::InstructionKind::LoadLocal;
+    inductionLoad.symbol = compare->local;
+    inductionLoad.dst = ir::Value{function.nextValue++};
+    preheaderInstructions.push_back(inductionLoad);
+
+    ir::Operand initial = *expression.invariantBase;
+    ir::Operand inductionValue = ir::Operand::ref(inductionLoad.dst);
+    if (expression.inductionCoeff != 1) {
+        inductionValue = appendBinary(
+            function,
+            preheaderInstructions,
+            ir::BinaryOpcode::Mul,
+            inductionValue,
+            ir::Operand::imm(static_cast<std::int32_t>(expression.inductionCoeff)));
+    }
+    initial = appendBinary(function, preheaderInstructions, ir::BinaryOpcode::Add, initial, inductionValue);
+    if (expression.constant != 0) {
+        initial = appendBinary(
+            function,
+            preheaderInstructions,
+            ir::BinaryOpcode::Add,
+            initial,
+            ir::Operand::imm(static_cast<std::int32_t>(expression.constant)));
+    }
+    initial = appendBinary(function, preheaderInstructions, ir::BinaryOpcode::Mod, initial, ir::Operand::imm(modulus));
+    ir::Instruction initialStore;
+    initialStore.kind = ir::InstructionKind::StoreLocal;
+    initialStore.symbol = state;
+    initialStore.operands = {initial};
+    preheaderInstructions.push_back(initialStore);
+
+    ir::Instruction& modulo = function.blocks[static_cast<std::size_t>(candidateBlock)].instructions[static_cast<std::size_t>(candidateIndex)];
+    modulo.kind = ir::InstructionKind::LoadLocal;
+    modulo.operands.clear();
+    modulo.symbol = state;
+    modulo.hasSideEffect = false;
+
+    auto& backedgeBlock = function.blocks[static_cast<std::size_t>(backedge)];
+    ir::Instruction stateLoad;
+    stateLoad.kind = ir::InstructionKind::LoadLocal;
+    stateLoad.symbol = state;
+    stateLoad.dst = ir::Value{function.nextValue++};
+    backedgeBlock.instructions.push_back(stateLoad);
+    const std::int32_t delta = static_cast<std::int32_t>(expression.inductionCoeff * *inductionStep);
+    const ir::Operand next = appendBinary(
+        function,
+        backedgeBlock.instructions,
+        ir::BinaryOpcode::Add,
+        ir::Operand::ref(stateLoad.dst),
+        ir::Operand::imm(delta));
+    const ir::Operand wraps = appendBinary(
+        function,
+        backedgeBlock.instructions,
+        ir::BinaryOpcode::GreaterEqual,
+        next,
+        ir::Operand::imm(modulus));
+
+    const ir::Operand wrapAmount = appendBinary(
+        function,
+        backedgeBlock.instructions,
+        ir::BinaryOpcode::Mul,
+        wraps,
+        ir::Operand::imm(modulus));
+    const ir::Operand wrapped = appendBinary(
+        function,
+        backedgeBlock.instructions,
+        ir::BinaryOpcode::Sub,
+        next,
+        wrapAmount);
+    ir::Instruction stateStore;
+    stateStore.kind = ir::InstructionKind::StoreLocal;
+    stateStore.symbol = state;
+    stateStore.operands = {wrapped};
+    backedgeBlock.instructions.push_back(stateStore);
+    return true;
+}
+
 // Increment poly of a single-accumulation branch block: `acc = acc + poly(ind)`
 // and nothing else observable. Returns Poly{0} for a branch that leaves acc
 // untouched (e.g. an empty else). The accumulator is modelled as base "__acc__".
@@ -2357,7 +2707,8 @@ public:
         bool changed = false;
         for (ir::Function& function : module.functions) {
             for (int i = 0; i < static_cast<int>(function.blocks.size()); ++i) {
-                if (runOnLoop(function, i)
+                if (tryModuloStrengthReduction(function, i)
+                    || runOnLoop(function, i)
                     || tryModuloAccumulationLoop(function, i)
                     || tryPeriodicConditionalAccumulationLoop(function, i)
                     || tryConditionalAccumulationLoop(function, i)) {

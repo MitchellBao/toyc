@@ -80,6 +80,72 @@ void rewriteAsCopy(ir::Instruction& inst, ir::Value value)
     inst.hasSideEffect = false;
 }
 
+struct ScaledValue {
+    ir::Operand base;
+    std::int32_t factor = 1;
+};
+
+bool cancelExactMulDiv(ir::Function& function)
+{
+    bool changed = false;
+    for (ir::BasicBlock& block : function.blocks) {
+        std::unordered_map<int, ScaledValue> scaledValues;
+        for (ir::Instruction& inst : block.instructions) {
+            if (inst.dst.id >= 0) {
+                scaledValues.erase(inst.dst.id);
+            }
+
+            if (inst.kind == ir::InstructionKind::Copy
+                && inst.dst.id >= 0
+                && inst.operands.size() == 1
+                && !inst.operands[0].isImmediate) {
+                if (const auto found = scaledValues.find(inst.operands[0].value.id); found != scaledValues.end()) {
+                    scaledValues[inst.dst.id] = found->second;
+                }
+                continue;
+            }
+
+            if (inst.kind == ir::InstructionKind::Binary
+                && inst.binaryOp == ir::BinaryOpcode::Mul
+                && inst.dst.id >= 0
+                && inst.operands.size() == 2) {
+                if (inst.operands[1].isImmediate) {
+                    scaledValues[inst.dst.id] = ScaledValue{inst.operands[0], inst.operands[1].immediate};
+                } else if (inst.operands[0].isImmediate) {
+                    scaledValues[inst.dst.id] = ScaledValue{inst.operands[1], inst.operands[0].immediate};
+                }
+                continue;
+            }
+
+            if (inst.kind != ir::InstructionKind::Binary
+                || (inst.binaryOp != ir::BinaryOpcode::Div && inst.binaryOp != ir::BinaryOpcode::Mod)
+                || inst.dst.id < 0
+                || inst.operands.size() != 2
+                || inst.operands[0].isImmediate
+                || !inst.operands[1].isImmediate
+                || inst.operands[1].immediate == 0) {
+                continue;
+            }
+            const auto found = scaledValues.find(inst.operands[0].value.id);
+            if (found == scaledValues.end() || found->second.factor != inst.operands[1].immediate) {
+                continue;
+            }
+
+            if (inst.binaryOp == ir::BinaryOpcode::Div) {
+                inst.kind = ir::InstructionKind::Copy;
+                inst.operands = {found->second.base};
+            } else {
+                inst.kind = ir::InstructionKind::Const;
+                inst.operands = {ir::Operand::imm(0)};
+            }
+            inst.symbol.clear();
+            inst.hasSideEffect = false;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 struct AddConstExpr {
     ir::Operand base;
     std::int32_t constant = 0;
@@ -428,6 +494,7 @@ public:
     {
         bool changed = false;
         for (ir::Function& function : module.functions) {
+            changed = cancelExactMulDiv(function) || changed;
             const std::unordered_map<int, int> uses = computeUseCount(function);
             for (ir::BasicBlock& block : function.blocks) {
                 std::unordered_map<int, std::int32_t> constants;

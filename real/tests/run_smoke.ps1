@@ -1792,4 +1792,119 @@ if ((Invoke-RiscVMain $cfgLocalConstBranchResult.Stdout) -ne 5) {
     throw "opt_cfg_local_const_branch_stats returned unexpected value"
 }
 
+$immutableLoopBoundResult = Compile-OptSnippetWithStats "opt_immutable_loop_bound_stats" @'
+int main() {
+    int bound = 200;
+    int value = 7;
+    int sum = 0;
+    int i = 0;
+    while (i < bound) {
+        sum = sum + value;
+        i = i + 1;
+    }
+    return sum % 251;
+}
+'@
+Assert-StatsContains "opt_immutable_loop_bound_stats" $immutableLoopBoundResult.Stderr "pass=global-const-prop changed=yes"
+if ($immutableLoopBoundResult.Stdout -match "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "opt_immutable_loop_bound_stats retained a conditional branch"
+}
+if ((Invoke-RiscVMain $immutableLoopBoundResult.Stdout) -ne 145) {
+    throw "opt_immutable_loop_bound_stats returned unexpected value"
+}
+
+$deadInlineEffectResult = Compile-OptSnippetWithStats "opt_dead_inline_effect_stats" @'
+int scratch = 0;
+void leaf(int x) {
+    int scaled = x * 9;
+    scratch = scaled / 9;
+    return;
+}
+void wrapper(int x) {
+    leaf(x);
+    return;
+}
+int main() {
+    int i = 0;
+    while (i < 100) {
+        wrapper(i);
+        i = i + 1;
+    }
+    return 140;
+}
+'@
+Assert-StatsContains "opt_dead_inline_effect_stats" $deadInlineEffectResult.Stderr "pass=inline-small changed=yes"
+Assert-AssemblyNotContains "opt_dead_inline_effect_stats" $deadInlineEffectResult.Stdout "call wrapper"
+Assert-AssemblyNotContains "opt_dead_inline_effect_stats" $deadInlineEffectResult.Stdout ".globl wrapper"
+if ($deadInlineEffectResult.Stdout -match "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "opt_dead_inline_effect_stats retained a conditional branch"
+}
+if ((Invoke-RiscVMain $deadInlineEffectResult.Stdout) -ne 140) {
+    throw "opt_dead_inline_effect_stats returned unexpected value"
+}
+
+$commonSubexpressionLoopResult = Compile-OptSnippetWithStats "opt_common_subexpression_loop_stats" @'
+int main() {
+    int bound = 60;
+    int base = 11;
+    int sum = 0;
+    int i = 0;
+    while (i < bound) {
+        int lhs = i * 3 + base;
+        int rhs = i * 3 + base;
+        sum = sum + (lhs - rhs) + 2;
+        i = i + 1;
+    }
+    return sum + 3;
+}
+'@
+Assert-StatsContains "opt_common_subexpression_loop_stats" $commonSubexpressionLoopResult.Stderr "pass=local-cse changed=yes"
+Assert-StatsContains "opt_common_subexpression_loop_stats" $commonSubexpressionLoopResult.Stderr "pass=loop-sum changed=yes"
+if ($commonSubexpressionLoopResult.Stdout -match "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "opt_common_subexpression_loop_stats retained a conditional branch"
+}
+if ((Invoke-RiscVMain $commonSubexpressionLoopResult.Stdout) -ne 123) {
+    throw "opt_common_subexpression_loop_stats returned unexpected value"
+}
+
+$exactMultiplyDivideResult = Compile-OptSnippetWithStats "opt_exact_multiply_divide_stats" @'
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 100) {
+        int scaled = i * 9;
+        sum = sum + scaled / 9;
+        i = i + 1;
+    }
+    return sum;
+}
+'@
+Assert-StatsContains "opt_exact_multiply_divide_stats" $exactMultiplyDivideResult.Stderr "pass=inst-combine changed=yes"
+if ($exactMultiplyDivideResult.Stdout -match "(?m)^\s*(beqz|bnez|beq|bne|blt|bge)\b") {
+    throw "opt_exact_multiply_divide_stats retained a conditional branch"
+}
+if ((Invoke-RiscVMain $exactMultiplyDivideResult.Stdout) -ne 4950) {
+    throw "opt_exact_multiply_divide_stats returned unexpected value"
+}
+
+$nestedModuloStrengthResult = Compile-OptSnippetWithStats "opt_nested_modulo_strength_stats" @'
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 5) {
+        int j = 0;
+        while (j < 17) {
+            sum = sum + ((i * 3 + j * 5) % 7);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return sum;
+}
+'@
+Assert-StatsContains "opt_nested_modulo_strength_stats" $nestedModuloStrengthResult.Stderr "pass=loop-sum changed=yes"
+if ((Invoke-RiscVMain $nestedModuloStrengthResult.Stdout) -ne 256) {
+    throw "opt_nested_modulo_strength_stats returned unexpected value"
+}
+
 Write-Host "ToyC smoke tests passed"
